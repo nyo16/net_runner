@@ -1,5 +1,12 @@
 defmodule NetRunner.Stream do
-  @moduledoc false
+  @moduledoc """
+  Stream-based interface for incremental I/O with OS processes.
+
+  Uses `Stream.resource/3` to provide lazy, demand-driven reads from stdout.
+  Input is written via a background `Task` to avoid deadlock.
+
+  Typically used through `NetRunner.stream!/2` or `NetRunner.stream/2`.
+  """
 
   alias NetRunner.Process, as: Proc
 

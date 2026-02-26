@@ -13,5 +13,6 @@ defmodule NetRunner.Process.Nif do
   def nif_close(_resource), do: :erlang.nif_error(:not_loaded)
   def nif_kill(_os_pid, _signal), do: :erlang.nif_error(:not_loaded)
   def nif_is_os_pid_alive(_os_pid), do: :erlang.nif_error(:not_loaded)
+  def nif_dup_fd(_fd), do: :erlang.nif_error(:not_loaded)
   def nif_signal_number(_signal_atom), do: :erlang.nif_error(:not_loaded)
 end

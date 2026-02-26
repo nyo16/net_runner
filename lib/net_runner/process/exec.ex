@@ -1,7 +1,7 @@
 defmodule NetRunner.Process.Exec do
   @moduledoc false
 
-  alias NetRunner.Process.{Pipe, State}
+  alias NetRunner.Process.{Nif, Pipe, State}
 
   @accept_timeout 10_000
   @msg_child_started 0x80
@@ -23,25 +23,24 @@ defmodule NetRunner.Process.Exec do
   def spawn_process(cmd, args, opts) do
     owner = self()
     uds_path = uds_socket_path()
+    pty_mode = Keyword.get(opts, :pty, false)
 
     with {:ok, listen_socket} <- create_uds_listener(uds_path),
-         shepherd_port <- open_shepherd(uds_path, cmd, args),
+         shepherd_port <- open_shepherd(uds_path, cmd, args, opts),
          {:ok, conn_socket} <- accept_connection(listen_socket),
          :ok <- cleanup_listener(listen_socket, uds_path),
-         {:ok, {stdin_fd, stdout_fd, stderr_fd}, iov_rest} <- receive_fds(conn_socket),
+         {:ok, fds, iov_rest} <- receive_fds(conn_socket, pty_mode),
          {:ok, os_pid} <- extract_child_started(conn_socket, iov_rest),
-         {:ok, stdin} <- Pipe.new(stdin_fd, owner, :stdin),
-         {:ok, stdout} <- Pipe.new(stdout_fd, owner, :stdout),
-         {:ok, stderr} <- Pipe.new(stderr_fd, owner, :stderr) do
-      stderr_mode = Keyword.get(opts, :stderr, :consume)
+         {:ok, pipes} <- wrap_fds(fds, owner, pty_mode) do
+      stderr_mode = if pty_mode, do: :disabled, else: Keyword.get(opts, :stderr, :consume)
 
       {:ok,
        %State{
          shepherd_port: shepherd_port,
          uds_socket: conn_socket,
-         stdin: stdin,
-         stdout: stdout,
-         stderr: stderr,
+         stdin: pipes.stdin,
+         stdout: pipes.stdout,
+         stderr: pipes.stderr,
          os_pid: os_pid,
          cmd: cmd,
          args: args,
@@ -80,9 +79,22 @@ defmodule NetRunner.Process.Exec do
     end
   end
 
-  defp open_shepherd(uds_path, cmd, args) do
+  defp open_shepherd(uds_path, cmd, args, opts) do
     shepherd = shepherd_executable()
-    port_args = [uds_path, cmd | args]
+    kill_timeout = Keyword.get(opts, :kill_timeout, 5000)
+    pty_mode = Keyword.get(opts, :pty, false)
+
+    cgroup_path = Keyword.get(opts, :cgroup_path, nil)
+
+    shepherd_flags = ["--kill-timeout", to_string(kill_timeout)]
+    shepherd_flags = if pty_mode, do: shepherd_flags ++ ["--pty"], else: shepherd_flags
+
+    shepherd_flags =
+      if cgroup_path,
+        do: shepherd_flags ++ ["--cgroup-path", to_string(cgroup_path)],
+        else: shepherd_flags
+
+    port_args = [uds_path | shepherd_flags] ++ [cmd | args]
 
     Port.open({:spawn_executable, shepherd}, [
       :nouse_stdio,
@@ -112,17 +124,17 @@ defmodule NetRunner.Process.Exec do
   end
 
   @doc """
-  Receives 3 file descriptors (stdin_w, stdout_r, stderr_r) via SCM_RIGHTS.
+  Receives file descriptors via SCM_RIGHTS.
 
-  Returns `{:ok, {stdin_fd, stdout_fd, stderr_fd}, iov_rest}` where `iov_rest`
-  is any protocol data that arrived in the same recvmsg (e.g. MSG_CHILD_STARTED).
+  In pipe mode: 3 FDs (stdin_w, stdout_r, stderr_r).
+  In PTY mode: 1 FD (bidirectional master).
+
+  Returns `{:ok, fds, iov_rest}`.
   """
-  def receive_fds(socket) do
+  def receive_fds(socket, pty_mode \\ false) do
     case :socket.recvmsg(socket, 0, 0, [], @accept_timeout) do
       {:ok, %{ctrl: ctrl, iov: iov}} ->
         fds = extract_fds_from_ctrl(ctrl)
-        # iov contains the dummy byte from sendmsg, plus any protocol data
-        # that was queued before we read. Strip the leading dummy byte.
         iov_data = IO.iodata_to_binary(iov)
 
         iov_rest =
@@ -130,16 +142,34 @@ defmodule NetRunner.Process.Exec do
             do: binary_part(iov_data, 1, byte_size(iov_data) - 1),
             else: <<>>
 
-        case fds do
-          [stdin_fd, stdout_fd, stderr_fd] ->
-            {:ok, {stdin_fd, stdout_fd, stderr_fd}, iov_rest}
+        expected = if pty_mode, do: 1, else: 3
 
-          _ ->
-            {:error, {:unexpected_fd_count, length(fds)}}
+        if length(fds) == expected do
+          {:ok, fds, iov_rest}
+        else
+          {:error, {:unexpected_fd_count, length(fds)}}
         end
 
       {:error, reason} ->
         {:error, {:recvmsg_failed, reason}}
+    end
+  end
+
+  defp wrap_fds([stdin_fd, stdout_fd, stderr_fd], owner, false) do
+    with {:ok, stdin} <- Pipe.new(stdin_fd, owner, :stdin),
+         {:ok, stdout} <- Pipe.new(stdout_fd, owner, :stdout),
+         {:ok, stderr} <- Pipe.new(stderr_fd, owner, :stderr) do
+      {:ok, %{stdin: stdin, stdout: stdout, stderr: stderr}}
+    end
+  end
+
+  defp wrap_fds([master_fd], owner, true) do
+    # PTY: single bidirectional FD. Dup it so stdin and stdout
+    # have independent NIF resources that can be closed separately.
+    with {:ok, write_fd} <- Nif.nif_dup_fd(master_fd),
+         {:ok, stdout} <- Pipe.new(master_fd, owner, :stdout),
+         {:ok, stdin} <- Pipe.new(write_fd, owner, :stdin) do
+      {:ok, %{stdin: stdin, stdout: stdout, stderr: nil}}
     end
   end
 

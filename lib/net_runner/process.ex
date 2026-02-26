@@ -8,7 +8,7 @@ defmodule NetRunner.Process do
 
   use GenServer
 
-  alias NetRunner.Process.{Exec, Nif, Operations, Pipe}
+  alias NetRunner.Process.{Exec, Nif, Operations, Pipe, Stats}
   alias NetRunner.Signal
 
   @default_read_size 65_535
@@ -65,12 +65,23 @@ defmodule NetRunner.Process do
     GenServer.call(process, :alive?)
   end
 
+  @doc "Get accumulated stats."
+  def stats(process) do
+    GenServer.call(process, :stats)
+  end
+
+  @doc "Set PTY window size (rows, cols). Only works in PTY mode."
+  def set_window_size(process, rows, cols) do
+    GenServer.call(process, {:set_window_size, rows, cols})
+  end
+
   # --- GenServer Callbacks ---
 
   @impl true
   def init({cmd, args, opts}) do
     case Exec.spawn_process(cmd, args, opts) do
       {:ok, state} ->
+        state = %{state | stats: Stats.new()}
         # Register with watcher for belt-and-suspenders cleanup
         NetRunner.Watcher.watch(self(), state.os_pid)
         # Start reading stderr in :consume mode
@@ -94,7 +105,8 @@ defmodule NetRunner.Process do
     else
       case Pipe.read(pipe, max_bytes) do
         {:ok, data} ->
-          {:reply, {:ok, data}, state}
+          stats = Stats.record_read(state.stats, byte_size(data))
+          {:reply, {:ok, data}, %{state | stats: stats}}
 
         :eof ->
           {:reply, :eof, state}
@@ -136,8 +148,11 @@ defmodule NetRunner.Process do
     case Signal.resolve(signal) do
       {:ok, sig_num} ->
         if state.os_pid do
-          result = Nif.nif_kill(state.os_pid, sig_num)
-          {:reply, result, %{state | status: :exiting}}
+          # Send through shepherd protocol for process group kill
+          send_shepherd_command(state, <<0x01, sig_num::8>>)
+          # Also direct NIF kill as belt-and-suspenders
+          Nif.nif_kill(state.os_pid, sig_num)
+          {:reply, :ok, %{state | status: :exiting}}
         else
           {:reply, {:error, :no_pid}, state}
         end
@@ -161,6 +176,15 @@ defmodule NetRunner.Process do
 
   def handle_call(:alive?, _from, state) do
     {:reply, state.status in [:starting, :running, :exiting], state}
+  end
+
+  def handle_call(:stats, _from, state) do
+    {:reply, state.stats, state}
+  end
+
+  def handle_call({:set_window_size, rows, cols}, _from, state) do
+    send_shepherd_command(state, <<0x03, rows::big-16, cols::big-16>>)
+    {:reply, :ok, state}
   end
 
   # --- enif_select notifications ---
@@ -230,6 +254,8 @@ defmodule NetRunner.Process do
   defp write_loop(data, from, state) do
     case Pipe.write(state.stdin, data) do
       {:ok, bytes_written} ->
+        stats = Stats.record_write(state.stats, bytes_written)
+        state = %{state | stats: stats}
         total = byte_size(data)
 
         if bytes_written >= total do
@@ -272,7 +298,8 @@ defmodule NetRunner.Process do
             {:ok, data} ->
               GenServer.reply(from, {:ok, data})
               {_, ops} = Operations.pop(acc.operations, ref)
-              %{acc | operations: ops}
+              stats = Stats.record_read(acc.stats, byte_size(data))
+              %{acc | operations: ops, stats: stats}
 
             :eof ->
               GenServer.reply(from, :eof)
@@ -316,6 +343,8 @@ defmodule NetRunner.Process do
   defp retry_write_loop(ref, from, data, state) do
     case Pipe.write(state.stdin, data) do
       {:ok, bytes_written} ->
+        stats = Stats.record_write(state.stats, bytes_written)
+        state = %{state | stats: stats}
         total = byte_size(data)
 
         if bytes_written >= total do
@@ -323,7 +352,6 @@ defmodule NetRunner.Process do
           {_, ops} = Operations.pop(state.operations, ref)
           %{state | operations: ops}
         else
-          # Partial — retry immediately to hit EAGAIN or complete
           remaining = binary_part(data, bytes_written, total - bytes_written)
           retry_write_loop(ref, from, remaining, state)
         end
@@ -364,7 +392,8 @@ defmodule NetRunner.Process do
   defp consume_stderr(state) do
     case Pipe.read(state.stderr) do
       {:ok, data} ->
-        consume_stderr(%{state | stderr_buffer: [data | state.stderr_buffer]})
+        stats = Stats.record_read_stderr(state.stats, byte_size(data))
+        consume_stderr(%{state | stderr_buffer: [data | state.stderr_buffer], stats: stats})
 
       :eof ->
         state
@@ -406,6 +435,8 @@ defmodule NetRunner.Process do
   end
 
   defp finish_exit(state, exit_status) do
+    stats = Stats.finalize(state.stats, exit_status)
+
     # Reply to all awaiting callers
     Enum.each(state.awaiting_exit, fn from ->
       GenServer.reply(from, {:ok, exit_status})
@@ -419,7 +450,8 @@ defmodule NetRunner.Process do
       | exit_status: exit_status,
         status: :exited,
         awaiting_exit: [],
-        operations: %Operations{}
+        operations: %Operations{},
+        stats: stats
     }
   end
 end

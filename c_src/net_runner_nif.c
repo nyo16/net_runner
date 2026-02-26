@@ -335,6 +335,30 @@ static ERL_NIF_TERM nif_close(ErlNifEnv *env, int argc,
 }
 
 /*
+ * nif_dup_fd(fd_int) -> {:ok, new_fd} | {:error, reason}
+ *
+ * Duplicates a raw FD. Used for PTY mode where the same master FD
+ * needs separate NIF resources for read and write.
+ */
+static ERL_NIF_TERM nif_dup_fd(ErlNifEnv *env, int argc,
+                               const ERL_NIF_TERM argv[]) {
+    ASSERT_ARGC(env, argc, 1);
+
+    int fd;
+    if (!enif_get_int(env, argv[0], &fd)) {
+        return enif_make_badarg(env);
+    }
+
+    int new_fd = dup(fd);
+    if (new_fd < 0) {
+        return enif_make_tuple2(env, atom_error,
+                                MAKE_ATOM(env, errno_to_atom(errno)));
+    }
+
+    return enif_make_tuple2(env, atom_ok, enif_make_int(env, new_fd));
+}
+
+/*
  * nif_kill(os_pid, signal) -> :ok | {:error, reason}
  *
  * Sends a signal to an OS process.
@@ -445,6 +469,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_read", 2, nif_read, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_write", 2, nif_write, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_close", 1, nif_close, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_dup_fd", 1, nif_dup_fd, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_kill", 2, nif_kill, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_is_os_pid_alive", 1, nif_is_os_pid_alive, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_signal_number", 1, nif_signal_number, 0}

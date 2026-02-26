@@ -1,7 +1,7 @@
 defmodule NetRunner.Process.State do
   @moduledoc false
 
-  alias NetRunner.Process.{Operations, Pipe}
+  alias NetRunner.Process.{Operations, Pipe, Stats}
 
   defstruct [
     :shepherd_port,
@@ -17,7 +17,8 @@ defmodule NetRunner.Process.State do
     awaiting_exit: [],
     stderr_mode: :consume,
     stderr_buffer: [],
-    status: :starting
+    status: :starting,
+    stats: %Stats{}
   ]
 
   @type status :: :starting | :running | :exiting | :exited

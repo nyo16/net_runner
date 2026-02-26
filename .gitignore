@@ -27,3 +27,9 @@ priv/*.so
 priv/*.dylib
 priv/shepherd
 c_src/*.o
+
+# Dialyzer
+/priv/plts/
+
+# Local .tool-versions
+.tool-versions

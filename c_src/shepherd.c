@@ -24,10 +24,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+/* PTY headers — platform-specific */
+#ifdef __APPLE__
+#include <util.h>
+#else
+#include <pty.h>
+#endif
 
 #include "protocol.h"
 #include "utils.h"
@@ -142,28 +150,105 @@ static int send_error(int uds_fd, const char *msg) {
     return 0;
 }
 
+/* Configurable kill escalation timeout (set from CLI arg) */
+static int kill_timeout_ms = DEFAULT_KILL_TIMEOUT_MS;
+
+/* PTY mode: master FD kept for WINSIZE ioctls */
+static int pty_mode = MODE_PIPE;
+static int pty_master_fd = -1;
+
+/* cgroup v2 support (Linux only) */
+static char cgroup_path[CGROUP_PATH_MAX] = {0};
+
+#ifdef __linux__
+#include <dirent.h>
+
+static int cgroup_setup(pid_t child_pid) {
+    if (cgroup_path[0] == '\0') return 0;
+
+    char full_path[512];
+    char procs_path[576];
+
+    /* Create cgroup directory */
+    snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s", cgroup_path);
+    mkdir(full_path, 0755); /* ignore error if exists */
+
+    /* Move child to cgroup */
+    snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs", full_path);
+    FILE *f = fopen(procs_path, "w");
+    if (!f) {
+        ERROR_LOG("failed to open %s: %s", procs_path, strerror(errno));
+        return -1;
+    }
+    fprintf(f, "%d\n", child_pid);
+    fclose(f);
+    return 0;
+}
+
+static void cgroup_cleanup(void) {
+    if (cgroup_path[0] == '\0') return;
+
+    char full_path[512];
+    char procs_path[576];
+    char kill_path[576];
+
+    snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s", cgroup_path);
+
+    /* Kill all processes in the cgroup via cgroup.kill (cgroup v2) */
+    snprintf(kill_path, sizeof(kill_path), "%s/cgroup.kill", full_path);
+    FILE *f = fopen(kill_path, "w");
+    if (f) {
+        fprintf(f, "1\n");
+        fclose(f);
+    }
+
+    /* Wait briefly for processes to die */
+    usleep(100000);
+
+    /* Remove cgroup directory */
+    rmdir(full_path);
+}
+#else
+static int cgroup_setup(pid_t child_pid) {
+    (void)child_pid;
+    return 0;
+}
+static void cgroup_cleanup(void) {}
+#endif
+
 /*
- * Kill child process, with escalation from SIGTERM to SIGKILL.
+ * Kill child process group, with escalation from SIGTERM to SIGKILL.
+ * The child called setpgid(0,0) so its pgid == child_pid.
+ * Using kill(-pgid, sig) catches grandchildren too.
  */
 static void kill_child(pid_t child_pid) {
     if (child_pid <= 0) return;
 
-    /* First try SIGTERM */
-    if (kill(child_pid, SIGTERM) != 0) {
-        if (errno == ESRCH) return; /* Already dead */
+    /* First try SIGTERM to the whole process group */
+    if (kill(-child_pid, SIGTERM) != 0) {
+        /* Process group may not exist; try direct kill */
+        if (kill(child_pid, SIGTERM) != 0 && errno == ESRCH)
+            return; /* Already dead */
     }
 
-    /* Wait up to 5 seconds for graceful exit */
-    for (int i = 0; i < 50; i++) {
+    /* Wait for graceful exit (configurable, default 5s) */
+    int poll_interval_us = 100000; /* 100ms */
+    int iterations = kill_timeout_ms * 1000 / poll_interval_us;
+    if (iterations < 1) iterations = 1;
+
+    for (int i = 0; i < iterations; i++) {
         int status;
         pid_t ret = waitpid(child_pid, &status, WNOHANG);
         if (ret > 0 || (ret < 0 && errno == ECHILD)) return;
-        usleep(100000); /* 100ms */
+        usleep((unsigned int)poll_interval_us);
     }
 
-    /* Escalate to SIGKILL */
-    kill(child_pid, SIGKILL);
+    /* Escalate to SIGKILL the whole process group */
+    kill(-child_pid, SIGKILL);
     waitpid(child_pid, NULL, 0);
+
+    /* Cleanup cgroup (kills any remaining processes, removes dir) */
+    cgroup_cleanup();
 }
 
 /*
@@ -178,14 +263,27 @@ static void handle_command(int uds_fd, pid_t child_pid, int stdin_w,
     case CMD_KILL:
         if (len >= 2 && child_pid > 0) {
             int sig = buf[1];
-            kill(child_pid, sig);
+            /* Kill the process group (catches grandchildren).
+             * Fall back to direct kill if group doesn't exist. */
+            if (kill(-child_pid, sig) != 0) {
+                kill(child_pid, sig);
+            }
         }
         break;
 
     case CMD_CLOSE_STDIN:
         if (stdin_w >= 0) {
             close(stdin_w);
-            /* Caller should track that stdin is closed */
+        }
+        break;
+
+    case CMD_SET_WINSIZE:
+        if (len >= 5 && pty_master_fd >= 0) {
+            struct winsize ws;
+            memset(&ws, 0, sizeof(ws));
+            ws.ws_row = (unsigned short)((buf[1] << 8) | buf[2]);
+            ws.ws_col = (unsigned short)((buf[3] << 8) | buf[4]);
+            ioctl(pty_master_fd, TIOCSWINSZ, &ws);
         }
         break;
 
@@ -270,27 +368,57 @@ static int event_loop(int uds_fd, pid_t child_pid, int stdin_w) {
         }
     }
 
+    /* Cleanup cgroup on normal exit too */
+    cgroup_cleanup();
+
     /* Notify BEAM of child exit */
     send_child_exited(uds_fd, child_status);
     return child_status;
 }
 
 /*
- * Usage: shepherd <uds_path> <cmd> [args...]
+ * Usage: shepherd <uds_path> [--kill-timeout <ms>] <cmd> [args...]
  *
- *   uds_path: Path to the UDS listener socket created by the BEAM
- *   cmd:      Command to execute
- *   args:     Arguments for the command
+ *   uds_path:       Path to the UDS listener socket created by the BEAM
+ *   --kill-timeout:  SIGTERM->SIGKILL escalation timeout in ms (default 5000)
+ *   cmd:            Command to execute
+ *   args:           Arguments for the command
  */
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "usage: shepherd <uds_path> <cmd> [args...]\n");
+        fprintf(stderr,
+                "usage: shepherd <uds_path> [--kill-timeout <ms>] <cmd> [args...]\n");
         return 1;
     }
 
     const char *uds_path = argv[1];
-    char *cmd = argv[2];
-    char **cmd_args = &argv[2]; /* cmd + args, NULL-terminated by OS */
+    int cmd_idx = 2;
+
+    /* Parse optional flags */
+    while (cmd_idx < argc && argv[cmd_idx][0] == '-') {
+        if (strcmp(argv[cmd_idx], "--kill-timeout") == 0 && cmd_idx + 1 < argc) {
+            kill_timeout_ms = atoi(argv[cmd_idx + 1]);
+            if (kill_timeout_ms < 0) kill_timeout_ms = DEFAULT_KILL_TIMEOUT_MS;
+            cmd_idx += 2;
+        } else if (strcmp(argv[cmd_idx], "--pty") == 0) {
+            pty_mode = MODE_PTY;
+            cmd_idx += 1;
+        } else if (strcmp(argv[cmd_idx], "--cgroup-path") == 0 && cmd_idx + 1 < argc) {
+            strncpy(cgroup_path, argv[cmd_idx + 1], CGROUP_PATH_MAX - 1);
+            cgroup_path[CGROUP_PATH_MAX - 1] = '\0';
+            cmd_idx += 2;
+        } else {
+            break; /* Unknown flag — treat as command */
+        }
+    }
+
+    if (cmd_idx >= argc) {
+        fprintf(stderr, "error: no command specified\n");
+        return 1;
+    }
+
+    char *cmd = argv[cmd_idx];
+    char **cmd_args = &argv[cmd_idx]; /* cmd + args, NULL-terminated by OS */
 
     /* Set up self-pipe for signal handling */
     if (pipe(signal_pipe) != 0) {
@@ -329,87 +457,141 @@ int main(int argc, char *argv[]) {
 
     set_cloexec(uds_fd);
 
-    /* Create pipes for child stdin/stdout/stderr */
-    int stdin_pipe[2];   /* [0]=read (child), [1]=write (beam) */
-    int stdout_pipe[2];  /* [0]=read (beam), [1]=write (child) */
-    int stderr_pipe[2];  /* [0]=read (beam), [1]=write (child) */
+    pid_t child_pid;
+    int shepherd_stdin_w = -1;
 
-    if (pipe(stdin_pipe) != 0 || pipe(stdout_pipe) != 0 ||
-        pipe(stderr_pipe) != 0) {
-        send_error(uds_fd, "failed to create pipes");
-        close(uds_fd);
-        return 1;
-    }
+    if (pty_mode == MODE_PTY) {
+        /* === PTY mode: single bidirectional master FD === */
+        int master_fd, slave_fd;
+        if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) != 0) {
+            send_error(uds_fd, "openpty failed");
+            close(uds_fd);
+            return 1;
+        }
 
-    /* Fork child process */
-    pid_t child_pid = fork();
-    if (child_pid < 0) {
-        send_error(uds_fd, "fork failed");
-        close(uds_fd);
-        return 1;
-    }
+        child_pid = fork();
+        if (child_pid < 0) {
+            send_error(uds_fd, "fork failed");
+            close(uds_fd);
+            return 1;
+        }
 
-    if (child_pid == 0) {
-        /* === Child process === */
+        if (child_pid == 0) {
+            /* === Child process (PTY) === */
+            close(uds_fd);
+            close(signal_pipe[0]);
+            close(signal_pipe[1]);
+            close(master_fd);
 
-        /* Close shepherd-side FDs */
-        close(uds_fd);
-        close(signal_pipe[0]);
-        close(signal_pipe[1]);
-        close(stdin_pipe[1]);  /* Close write end of stdin */
-        close(stdout_pipe[0]); /* Close read end of stdout */
-        close(stderr_pipe[0]); /* Close read end of stderr */
+            /* Create new session and set controlling terminal */
+            setsid();
+            ioctl(slave_fd, TIOCSCTTY, 0);
 
-        /* Redirect stdio */
-        dup2(stdin_pipe[0], STDIN_FILENO);
-        dup2(stdout_pipe[1], STDOUT_FILENO);
-        dup2(stderr_pipe[1], STDERR_FILENO);
+            dup2(slave_fd, STDIN_FILENO);
+            dup2(slave_fd, STDOUT_FILENO);
+            dup2(slave_fd, STDERR_FILENO);
+            if (slave_fd > STDERR_FILENO) close(slave_fd);
 
-        /* Close original pipe FDs after dup */
+            setpgid(0, 0);
+            execvp(cmd, cmd_args);
+            fprintf(stderr, "execvp failed: %s: %s\n", cmd, strerror(errno));
+            _exit(127);
+        }
+
+        /* === Shepherd (PTY) === */
+        close(slave_fd);
+        pty_master_fd = master_fd;
+
+        /* Move child to cgroup (Linux only, no-op elsewhere) */
+        cgroup_setup(child_pid);
+
+        /* Send single master FD to BEAM (used for both read and write) */
+        int fds_to_send[1] = {master_fd};
+        if (send_fds(uds_fd, fds_to_send, 1) != 0) {
+            send_error(uds_fd, "failed to send PTY FD");
+            kill_child(child_pid);
+            close(uds_fd);
+            return 1;
+        }
+
+        if (send_child_started(uds_fd, child_pid) != 0) {
+            kill_child(child_pid);
+            close(uds_fd);
+            return 1;
+        }
+
+        /* No stdin_w to keep — master FD is bidirectional */
+        shepherd_stdin_w = -1;
+
+    } else {
+        /* === Pipe mode (default) === */
+        int stdin_pipe[2];   /* [0]=read (child), [1]=write (beam) */
+        int stdout_pipe[2];  /* [0]=read (beam), [1]=write (child) */
+        int stderr_pipe[2];  /* [0]=read (beam), [1]=write (child) */
+
+        if (pipe(stdin_pipe) != 0 || pipe(stdout_pipe) != 0 ||
+            pipe(stderr_pipe) != 0) {
+            send_error(uds_fd, "failed to create pipes");
+            close(uds_fd);
+            return 1;
+        }
+
+        child_pid = fork();
+        if (child_pid < 0) {
+            send_error(uds_fd, "fork failed");
+            close(uds_fd);
+            return 1;
+        }
+
+        if (child_pid == 0) {
+            /* === Child process (pipe) === */
+            close(uds_fd);
+            close(signal_pipe[0]);
+            close(signal_pipe[1]);
+            close(stdin_pipe[1]);
+            close(stdout_pipe[0]);
+            close(stderr_pipe[0]);
+
+            dup2(stdin_pipe[0], STDIN_FILENO);
+            dup2(stdout_pipe[1], STDOUT_FILENO);
+            dup2(stderr_pipe[1], STDERR_FILENO);
+
+            close(stdin_pipe[0]);
+            close(stdout_pipe[1]);
+            close(stderr_pipe[1]);
+
+            setpgid(0, 0);
+            execvp(cmd, cmd_args);
+            fprintf(stderr, "execvp failed: %s: %s\n", cmd, strerror(errno));
+            _exit(127);
+        }
+
+        /* === Shepherd (pipe) === */
         close(stdin_pipe[0]);
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
 
-        /* Create new process group */
-        setpgid(0, 0);
+        /* Move child to cgroup (Linux only, no-op elsewhere) */
+        cgroup_setup(child_pid);
 
-        /* Execute command */
-        execvp(cmd, cmd_args);
+        int fds_to_send[3] = {stdin_pipe[1], stdout_pipe[0], stderr_pipe[0]};
+        if (send_fds(uds_fd, fds_to_send, 3) != 0) {
+            send_error(uds_fd, "failed to send FDs");
+            kill_child(child_pid);
+            close(uds_fd);
+            return 1;
+        }
 
-        /* If execvp returns, it failed */
-        fprintf(stderr, "execvp failed: %s: %s\n", cmd, strerror(errno));
-        _exit(127);
+        if (send_child_started(uds_fd, child_pid) != 0) {
+            kill_child(child_pid);
+            close(uds_fd);
+            return 1;
+        }
+
+        shepherd_stdin_w = stdin_pipe[1];
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
     }
-
-    /* === Shepherd process === */
-
-    /* Close child-side FDs */
-    close(stdin_pipe[0]);  /* Close read end of stdin */
-    close(stdout_pipe[1]); /* Close write end of stdout */
-    close(stderr_pipe[1]); /* Close write end of stderr */
-
-    /* Send pipe FDs to BEAM via SCM_RIGHTS: stdin_w, stdout_r, stderr_r */
-    int fds_to_send[3] = {stdin_pipe[1], stdout_pipe[0], stderr_pipe[0]};
-    if (send_fds(uds_fd, fds_to_send, 3) != 0) {
-        send_error(uds_fd, "failed to send FDs");
-        kill_child(child_pid);
-        close(uds_fd);
-        return 1;
-    }
-
-    /* Notify BEAM that child has started */
-    if (send_child_started(uds_fd, child_pid) != 0) {
-        kill_child(child_pid);
-        close(uds_fd);
-        return 1;
-    }
-
-    /* Keep a copy of stdin_w for CMD_CLOSE_STDIN.
-     * Also close our copy of the FDs that BEAM now owns,
-     * EXCEPT stdin_w which we keep for close-stdin support. */
-    int shepherd_stdin_w = stdin_pipe[1];
-    close(stdout_pipe[0]);
-    close(stderr_pipe[0]);
 
     /* Enter event loop */
     int result = event_loop(uds_fd, child_pid, shepherd_stdin_w);
