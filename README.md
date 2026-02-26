@@ -256,4 +256,4 @@ See [docs/architecture.md](docs/architecture.md) for detailed diagrams and [docs
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE).

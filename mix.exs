@@ -14,12 +14,10 @@ defmodule NetRunner.MixProject do
       compilers: [:elixir_make] ++ Mix.compilers(),
       make_targets: ["all"],
       make_clean: ["clean"],
-      # Hex
       description: description(),
       package: package(),
-      # Docs
-      name: "NetRunner",
       docs: docs(),
+      name: "NetRunner",
       source_url: @source_url
     ]
   end
@@ -33,29 +31,44 @@ defmodule NetRunner.MixProject do
 
   defp deps do
     [
+      # Production dependencies
       {:elixir_make, "~> 0.9", runtime: false},
+
+      # Development dependencies
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 
   defp description do
-    "Safe OS process execution for Elixir. Zero zombie processes, NIF-based backpressure, PTY support, cgroup isolation."
+    """
+    Safe OS process execution for Elixir, powered by a persistent C shepherd binary.
+    Features include NIF-based backpressure, zero zombie processes, PTY support, and cgroup isolation.
+    """
   end
 
   defp package do
     [
-      licenses: ["MIT"],
-      links: %{"GitHub" => @source_url},
+      name: "net_runner",
       files:
-        ~w(lib c_src/*.c c_src/*.h priv/.gitkeep Makefile mix.exs README.md CHANGELOG.md LICENSE)
+        ~w(lib c_src/*.c c_src/*.h priv/.gitkeep Makefile mix.exs README.md CHANGELOG.md LICENSE),
+      licenses: ["Apache-2.0"],
+      links: %{
+        "GitHub" => @source_url,
+        "Changelog" => "#{@source_url}/blob/master/CHANGELOG.md"
+      },
+      maintainers: ["Niko"]
     ]
   end
 
   defp docs do
     [
       main: "NetRunner",
+      source_ref: "v#{@version}",
+      source_url: @source_url,
       extras: [
+        "README.md",
+        "LICENSE",
         "CHANGELOG.md",
         "docs/architecture.md",
         "docs/protocol.md",
