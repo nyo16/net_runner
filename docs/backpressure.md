@@ -39,7 +39,7 @@ sequenceDiagram
 
 ### Read Path
 
-1. `Process.read/2` calls `GenServer.call(pid, {:read, :stdout, max_bytes}, :infinity)`
+1. `NetRunner.Process.read/2` calls `GenServer.call(pid, {:read, :stdout, max_bytes}, :infinity)`
 2. GenServer tries `Pipe.read(pipe, max_bytes)` → calls `Nif.nif_read(resource, max_bytes)`
 3. NIF runs on dirty IO scheduler:
    - Calls `read(fd, buf, max_bytes)`
@@ -52,7 +52,7 @@ sequenceDiagram
 
 ### Write Path
 
-1. `Process.write/2` calls `GenServer.call(pid, {:write, data}, :infinity)`
+1. `NetRunner.Process.write/2` calls `GenServer.call(pid, {:write, data}, :infinity)`
 2. GenServer enters `write_loop`:
    - `Pipe.write(pipe, data)` → `Nif.nif_write(resource, data)`
    - If fully written: returns `:ok`

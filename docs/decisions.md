@@ -98,7 +98,7 @@
 
 **Consequences**:
 - (+) Zero allocation cost — just integer addition on each read/write
-- (+) Always available via `Process.stats/1`
+- (+) Always available via `NetRunner.Process.stats/1`
 - (+) Finalized on exit with duration and exit status
 - (-) Not distributed (each GenServer has its own stats)
 - (-) Lost if GenServer crashes before stats are read

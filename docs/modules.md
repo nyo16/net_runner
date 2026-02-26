@@ -46,20 +46,20 @@ graph TD
 | `NetRunner.Process` | GenServer managing a single OS process lifecycle |
 | `NetRunner.Stream` | `Stream.resource` wrapper for incremental I/O |
 | `NetRunner.Daemon` | Supervised long-running process for supervision trees |
-| `NetRunner.Signal` | Signal atom → platform-specific number resolution |
+| NetRunner.Signal | Signal atom → platform-specific number resolution |
 
 ### Internal Modules
 
 | Module | Purpose |
 |--------|---------|
-| `NetRunner.Process.Exec` | Process spawning: UDS, Port.open, SCM_RIGHTS, FD wrapping |
-| `NetRunner.Process.Nif` | NIF function stubs (`@on_load :load_nifs`) |
-| `NetRunner.Process.Pipe` | Pipe struct wrapping a NIF FD resource |
-| `NetRunner.Process.State` | GenServer state struct |
-| `NetRunner.Process.Operations` | Pending operation queue (park on EAGAIN, retry on ready) |
-| `NetRunner.Process.Stats` | I/O statistics accumulator |
-| `NetRunner.Watcher` | DynamicSupervisor child that kills OS process on GenServer death |
-| `NetRunner.Application` | OTP application: starts WatcherSupervisor |
+| NetRunner.Process.Exec | Process spawning: UDS, Port.open, SCM\_RIGHTS, FD wrapping |
+| NetRunner.Process.Nif | NIF function stubs (@on\_load :load\_nifs) |
+| NetRunner.Process.Pipe | Pipe struct wrapping a NIF FD resource |
+| NetRunner.Process.State | GenServer state struct |
+| NetRunner.Process.Operations | Pending operation queue (park on EAGAIN, retry on ready) |
+| NetRunner.Process.Stats | I/O statistics accumulator |
+| NetRunner.Watcher | DynamicSupervisor child that kills OS process on GenServer death |
+| NetRunner.Application | OTP application: starts WatcherSupervisor |
 
 ### C Components
 

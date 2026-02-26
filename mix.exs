@@ -48,7 +48,7 @@ defmodule NetRunner.MixProject do
     [
       name: "net_runner",
       files:
-        ~w(lib c_src/*.c c_src/*.h priv/.gitkeep Makefile mix.exs README.md CHANGELOG.md LICENSE),
+        ~w(lib c_src/*.c c_src/*.h docs priv/.gitkeep Makefile mix.exs README.md CHANGELOG.md LICENSE),
       licenses: ["Apache-2.0"],
       links: %{
         "GitHub" => @source_url,
