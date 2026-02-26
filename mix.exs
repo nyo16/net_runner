@@ -41,10 +41,7 @@ defmodule NetRunner.MixProject do
   end
 
   defp description do
-    """
-    Safe OS process execution for Elixir, powered by a persistent C shepherd binary.
-    Features include NIF-based backpressure, zero zombie processes, PTY support, and cgroup isolation.
-    """
+    "Safe OS process execution for Elixir with NIF-based backpressure, zero zombie processes, PTY support, and cgroup isolation."
   end
 
   defp package do
