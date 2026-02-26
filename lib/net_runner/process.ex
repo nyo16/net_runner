@@ -4,6 +4,19 @@ defmodule NetRunner.Process do
 
   Handles read/write on pipes, graceful shutdown, and exit status tracking.
   Uses NIF-backed async I/O with `enif_select` for backpressure.
+
+  ## PTY mode
+
+  Pass `pty: true` to get a pseudo-terminal. This is for **interactive and
+  long-running programs** (shells, REPLs, curses apps). Key differences from
+  pipe mode:
+
+    * No independent stdin close — the PTY is a single bidirectional FD.
+      Use `kill/2` to terminate the process.
+    * The terminal echoes input back, so reads include what you wrote.
+    * Fast-exiting commands may lose output if you don't read immediately —
+      the PTY buffer is torn down when the slave side closes.
+    * For simple commands, use pipe mode (the default).
   """
 
   use GenServer
