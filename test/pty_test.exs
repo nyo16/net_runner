@@ -18,13 +18,12 @@ defmodule NetRunner.PtyTest do
     end
 
     test "PTY provides terminal-like behavior" do
-      # tty should report a device path, not "not a tty"
+      # tty prints device path and exits immediately
       {:ok, pid} = Proc.start("tty", [], pty: true)
       {:ok, data} = Proc.read(pid)
       refute data =~ "not a tty"
       assert data =~ "/dev/"
-      Proc.kill(pid, :sigkill)
-      Proc.await_exit(pid, 5_000)
+      {:ok, _status} = Proc.await_exit(pid, 5_000)
     end
 
     test "set_window_size does not crash" do
