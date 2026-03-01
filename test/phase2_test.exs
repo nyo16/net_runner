@@ -1,6 +1,8 @@
 defmodule NetRunner.Phase2Test do
   use ExUnit.Case, async: true
 
+  alias NetRunner.Process.Nif
+
   describe "run/2 timeout" do
     test "kills process on timeout" do
       result = NetRunner.run(~w(sleep 100), timeout: 200)
@@ -41,7 +43,7 @@ defmodule NetRunner.Phase2Test do
       Process.sleep(500)
 
       # The process group leader should be dead
-      assert NetRunner.Process.Nif.nif_is_os_pid_alive(os_pid) == false
+      assert Nif.nif_is_os_pid_alive(os_pid) == false
     end
   end
 

@@ -296,39 +296,8 @@ defmodule NetRunner.Process do
 
     state =
       Enum.reduce(pending ++ stderr_pending, state, fn {ref, {type, from, max_bytes}}, acc ->
-        {_pipe_name, pipe} =
-          case type do
-            {:read, :stdout} -> {:stdout, acc.stdout}
-            {:read, :stderr} -> {:stderr, acc.stderr}
-          end
-
-        if is_nil(pipe) do
-          GenServer.reply(from, {:error, :closed})
-          {_, ops} = Operations.pop(acc.operations, ref)
-          %{acc | operations: ops}
-        else
-          case Pipe.read(pipe, max_bytes) do
-            {:ok, data} ->
-              GenServer.reply(from, {:ok, data})
-              {_, ops} = Operations.pop(acc.operations, ref)
-              stats = Stats.record_read(acc.stats, byte_size(data))
-              %{acc | operations: ops, stats: stats}
-
-            :eof ->
-              GenServer.reply(from, :eof)
-              {_, ops} = Operations.pop(acc.operations, ref)
-              %{acc | operations: ops}
-
-            {:error, :eagain} ->
-              # Still not ready, keep parked
-              acc
-
-            {:error, _} = error ->
-              GenServer.reply(from, error)
-              {_, ops} = Operations.pop(acc.operations, ref)
-              %{acc | operations: ops}
-          end
-        end
+        pipe = pipe_for_type(acc, type)
+        retry_single_read(acc, ref, pipe, from, max_bytes)
       end)
 
     # Also handle internal stderr consumption
@@ -336,6 +305,38 @@ defmodule NetRunner.Process do
       consume_stderr(state)
     else
       state
+    end
+  end
+
+  defp pipe_for_type(state, {:read, :stdout}), do: state.stdout
+  defp pipe_for_type(state, {:read, :stderr}), do: state.stderr
+
+  defp retry_single_read(state, ref, nil, from, _max_bytes) do
+    GenServer.reply(from, {:error, :closed})
+    {_, ops} = Operations.pop(state.operations, ref)
+    %{state | operations: ops}
+  end
+
+  defp retry_single_read(state, ref, pipe, from, max_bytes) do
+    case Pipe.read(pipe, max_bytes) do
+      {:ok, data} ->
+        GenServer.reply(from, {:ok, data})
+        {_, ops} = Operations.pop(state.operations, ref)
+        stats = Stats.record_read(state.stats, byte_size(data))
+        %{state | operations: ops, stats: stats}
+
+      :eof ->
+        GenServer.reply(from, :eof)
+        {_, ops} = Operations.pop(state.operations, ref)
+        %{state | operations: ops}
+
+      {:error, :eagain} ->
+        state
+
+      {:error, _} = error ->
+        GenServer.reply(from, error)
+        {_, ops} = Operations.pop(state.operations, ref)
+        %{state | operations: ops}
     end
   end
 

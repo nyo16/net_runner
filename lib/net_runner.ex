@@ -59,24 +59,7 @@ defmodule NetRunner do
 
     {:ok, pid} = Proc.start(cmd, args, process_opts)
 
-    # Run I/O in a task so we can enforce timeout via Task.yield
-    task =
-      Task.async(fn ->
-        if input do
-          write_all_input(pid, input)
-        else
-          Proc.close_stdin(pid)
-        end
-
-        case read_all_with_limits(pid, max_output_size) do
-          {:ok, output} ->
-            {:ok, exit_status} = Proc.await_exit(pid)
-            {output, exit_status}
-
-          {:error, _} = error ->
-            error
-        end
-      end)
+    task = Task.async(fn -> run_io(pid, input, max_output_size) end)
 
     effective_timeout = timeout || :infinity
 
@@ -167,6 +150,23 @@ defmodule NetRunner do
 
       {:error, _} ->
         {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary()}
+    end
+  end
+
+  defp run_io(pid, input, max_output_size) do
+    if input do
+      write_all_input(pid, input)
+    else
+      Proc.close_stdin(pid)
+    end
+
+    case read_all_with_limits(pid, max_output_size) do
+      {:ok, output} ->
+        {:ok, exit_status} = Proc.await_exit(pid)
+        {output, exit_status}
+
+      {:error, _} = error ->
+        error
     end
   end
 
