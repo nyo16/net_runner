@@ -25,7 +25,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -189,7 +191,6 @@ static void cgroup_cleanup(void) {
     if (cgroup_path[0] == '\0') return;
 
     char full_path[512];
-    char procs_path[576];
     char kill_path[576];
 
     snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s", cgroup_path);

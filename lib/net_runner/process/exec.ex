@@ -58,24 +58,15 @@ defmodule NetRunner.Process.Exec do
   end
 
   defp create_uds_listener(path) do
-    with {:ok, socket} <- :socket.open(:local, :stream, :default) do
-      addr = %{family: :local, path: path}
+    addr = %{family: :local, path: path}
 
-      case :socket.bind(socket, addr) do
-        :ok ->
-          case :socket.listen(socket) do
-            :ok ->
-              {:ok, socket}
-
-            error ->
-              :socket.close(socket)
-              error
-          end
-
-        error ->
-          :socket.close(socket)
-          error
-      end
+    with {:ok, socket} <- :socket.open(:local, :stream, :default),
+         :ok <- :socket.bind(socket, addr),
+         :ok <- :socket.listen(socket) do
+      {:ok, socket}
+    else
+      {:error, _} = error ->
+        error
     end
   end
 
