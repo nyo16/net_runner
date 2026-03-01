@@ -324,11 +324,17 @@ static ERL_NIF_TERM nif_close(ErlNifEnv *env, int argc,
         res->monitor_active = 0;
     }
 
+    /* Close FD inside critical section to prevent TOCTOU race:
+     * a concurrent nif_read/nif_write on a dirty scheduler could copy the FD
+     * under lock then use it after we release the lock but before close(). */
+    int close_ret = close(fd);
+    int close_errno = errno;
+
     enif_mutex_unlock(res->lock);
 
-    if (close(fd) != 0) {
+    if (close_ret != 0 && close_errno != EINTR) {
         return enif_make_tuple2(env, atom_error,
-                                MAKE_ATOM(env, errno_to_atom(errno)));
+                                MAKE_ATOM(env, errno_to_atom(close_errno)));
     }
 
     return atom_ok;

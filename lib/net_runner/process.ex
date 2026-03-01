@@ -222,7 +222,21 @@ defmodule NetRunner.Process do
       when port == state.shepherd_port do
     # Shepherd died. Read exit status from UDS if we haven't already.
     state = maybe_read_exit_status(state)
+
+    # If we still haven't received exit status, schedule a forced timeout
+    if state.status != :exited do
+      Process.send_after(self(), :force_exit_timeout, 5_000)
+    end
+
     {:noreply, state}
+  end
+
+  def handle_info(:force_exit_timeout, state) do
+    if state.status != :exited do
+      {:noreply, finish_exit(state, 137)}
+    else
+      {:noreply, state}
+    end
   end
 
   # UDS message from shepherd (via active socket)

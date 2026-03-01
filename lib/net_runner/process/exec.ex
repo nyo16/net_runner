@@ -25,11 +25,20 @@ defmodule NetRunner.Process.Exec do
     uds_path = uds_socket_path()
     pty_mode = Keyword.get(opts, :pty, false)
 
-    with {:ok, listen_socket} <- create_uds_listener(uds_path),
+    with :ok <- validate_cgroup_path(Keyword.get(opts, :cgroup_path, nil)),
+         {:ok, listen_socket} <- create_uds_listener(uds_path),
          shepherd_port <- open_shepherd(uds_path, cmd, args, opts),
          {:ok, conn_socket} <- accept_connection(listen_socket),
-         :ok <- cleanup_listener(listen_socket, uds_path),
-         {:ok, fds, iov_rest} <- receive_fds(conn_socket, pty_mode),
+         :ok <- cleanup_listener(listen_socket, uds_path) do
+      # conn_socket and shepherd_port are now live — clean up on any failure
+      setup_after_connection(conn_socket, shepherd_port, owner, cmd, args, opts, pty_mode)
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp setup_after_connection(conn_socket, shepherd_port, owner, cmd, args, opts, pty_mode) do
+    with {:ok, fds, iov_rest} <- receive_fds(conn_socket, pty_mode),
          {:ok, os_pid} <- extract_child_started(conn_socket, iov_rest),
          {:ok, pipes} <- wrap_fds(fds, owner, pty_mode) do
       stderr_mode = if pty_mode, do: :disabled, else: Keyword.get(opts, :stderr, :consume)
@@ -48,7 +57,41 @@ defmodule NetRunner.Process.Exec do
          status: :running
        }}
     else
-      {:error, reason} -> {:error, reason}
+      {:error, reason} ->
+        safe_close_socket(conn_socket)
+        safe_port_close(shepherd_port)
+        {:error, reason}
+    end
+  end
+
+  defp safe_port_close(port) when is_port(port) do
+    Port.close(port)
+  catch
+    _, _ -> :ok
+  end
+
+  defp safe_port_close(_), do: :ok
+
+  defp safe_close_socket(socket) do
+    :socket.close(socket)
+  catch
+    _, _ -> :ok
+  end
+
+  defp validate_cgroup_path(nil), do: :ok
+
+  defp validate_cgroup_path(path) do
+    path_str = to_string(path)
+
+    cond do
+      String.starts_with?(path_str, "/") ->
+        {:error, {:invalid_cgroup_path, "must be relative, got: #{path_str}"}}
+
+      String.contains?(path_str, "..") ->
+        {:error, {:invalid_cgroup_path, "cannot contain '..', got: #{path_str}"}}
+
+      true ->
+        :ok
     end
   end
 
