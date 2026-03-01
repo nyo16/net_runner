@@ -48,8 +48,8 @@ static int signal_pipe[2] = {-1, -1};
 static void sigchld_handler(int sig) {
     (void)sig;
     int saved_errno = errno;
-    /* Write a single byte to wake up poll() */
-    (void)write(signal_pipe[1], "C", 1);
+    /* Write a single byte to wake up poll() — ignore failure in signal handler */
+    if (write(signal_pipe[1], "C", 1) < 0) { /* nothing to do */ }
     errno = saved_errno;
 }
 
