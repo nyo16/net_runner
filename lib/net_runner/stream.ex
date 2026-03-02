@@ -53,7 +53,10 @@ defmodule NetRunner.Stream do
     Stream.resource(
       fn -> start_writer(pid, input) end,
       fn acc -> read_next(pid, acc) end,
-      fn _acc -> cleanup(pid) end
+      fn
+        {:error, _pid, _reason} = err -> cleanup(err)
+        _acc -> cleanup(pid)
+      end
     )
   end
 
@@ -98,7 +101,7 @@ defmodule NetRunner.Stream do
     # Check if writer is done, but don't block
     case Task.yield(writer, 0) do
       {:ok, _} -> read_next(pid, :reading)
-      {:exit, reason} -> raise "writer task crashed: #{inspect(reason)}"
+      {:exit, reason} -> {:halt, {:error, pid, reason}}
       nil -> do_read(pid, acc)
     end
   end
@@ -123,7 +126,25 @@ defmodule NetRunner.Stream do
     end
   end
 
-  defp cleanup(pid) do
+  defp cleanup({:error, pid, reason}) do
+    # Writer task crashed — clean up process first, then re-raise
+    cleanup_process(pid)
+    raise "writer task crashed: #{inspect(reason)}"
+  end
+
+  defp cleanup(pid) when is_pid(pid) do
+    cleanup_process(pid)
+  end
+
+  defp cleanup({:writing, _writer}) do
+    :ok
+  end
+
+  defp cleanup(:reading) do
+    :ok
+  end
+
+  defp cleanup_process(pid) do
     if Process.alive?(pid) do
       Proc.close_stdin(pid)
 

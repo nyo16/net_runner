@@ -16,16 +16,18 @@ ERL_INTERFACE_LIB_DIR ?= $(shell erl -noshell -eval "io:format(\"~ts\", [code:li
 UNAME_S := $(shell uname -s)
 
 CC ?= cc
-CFLAGS_BASE = -O2 -Wall -Wextra -Werror -std=c99
+CFLAGS_BASE = -O2 -Wall -Wextra -Werror -std=c99 -fstack-protector-strong -D_FORTIFY_SOURCE=2
 
 ifeq ($(UNAME_S),Darwin)
 	# macOS needs _DARWIN_C_SOURCE for SCM_RIGHTS, CMSG_SPACE, etc.
 	CFLAGS = $(CFLAGS_BASE) -D_DARWIN_C_SOURCE
 	NIF_LDFLAGS = -dynamiclib -undefined dynamic_lookup
+	SHEPHERD_LDFLAGS = -fPIE
 	NIF_EXT = .so
 else
 	CFLAGS = $(CFLAGS_BASE) -D_GNU_SOURCE
-	NIF_LDFLAGS = -shared
+	NIF_LDFLAGS = -shared -Wl,-z,relro,-z,now -Wl,-z,noexecstack
+	SHEPHERD_LDFLAGS = -fPIE -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 	NIF_EXT = .so
 endif
 
@@ -52,7 +54,7 @@ $(PRIV_DIR):
 
 # Shepherd binary
 $(SHEPHERD): $(SHEPHERD_OBJ)
-	$(CC) -o $@ $<
+	$(CC) $(SHEPHERD_LDFLAGS) -o $@ $<
 
 $(SHEPHERD_OBJ): $(SHEPHERD_SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -I$(C_SRC_DIR) -c -o $@ $<

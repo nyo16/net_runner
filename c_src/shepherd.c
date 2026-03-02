@@ -84,6 +84,10 @@ static int send_fds(int uds_fd, int *fds, int nfds) {
     msg.msg_controllen = cmsg_space;
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg) {
+        free(cmsg_buf);
+        return -1;
+    }
     cmsg->cmsg_level = SOL_SOCKET;
     cmsg->cmsg_type = SCM_RIGHTS;
     cmsg->cmsg_len = CMSG_LEN((size_t)nfds * sizeof(int));
@@ -234,7 +238,7 @@ static void kill_child(pid_t child_pid) {
 
     /* Wait for graceful exit (configurable, default 5s) */
     int poll_interval_us = 100000; /* 100ms */
-    int iterations = kill_timeout_ms * 1000 / poll_interval_us;
+    int iterations = (int)((long)kill_timeout_ms * 1000 / poll_interval_us);
     if (iterations < 1) iterations = 1;
 
     for (int i = 0; i < iterations; i++) {
@@ -264,6 +268,8 @@ static void handle_command(int uds_fd, pid_t child_pid, int stdin_w,
     case CMD_KILL:
         if (len >= 2 && child_pid > 0) {
             int sig = buf[1];
+            /* Validate signal is in POSIX range */
+            if (sig < 1 || sig > 31) break;
             /* Kill the process group (catches grandchildren).
              * Fall back to direct kill if group doesn't exist. */
             if (kill(-child_pid, sig) != 0) {
@@ -398,14 +404,25 @@ int main(int argc, char *argv[]) {
     /* Parse optional flags */
     while (cmd_idx < argc && argv[cmd_idx][0] == '-') {
         if (strcmp(argv[cmd_idx], "--kill-timeout") == 0 && cmd_idx + 1 < argc) {
-            kill_timeout_ms = atoi(argv[cmd_idx + 1]);
-            if (kill_timeout_ms < 0) kill_timeout_ms = DEFAULT_KILL_TIMEOUT_MS;
+            char *endptr;
+            long val = strtol(argv[cmd_idx + 1], &endptr, 10);
+            if (*endptr != '\0' || endptr == argv[cmd_idx + 1] || val <= 0 || val > 60000) {
+                fprintf(stderr, "error: --kill-timeout must be 1-60000 ms\n");
+                return 1;
+            }
+            kill_timeout_ms = (int)val;
             cmd_idx += 2;
         } else if (strcmp(argv[cmd_idx], "--pty") == 0) {
             pty_mode = MODE_PTY;
             cmd_idx += 1;
         } else if (strcmp(argv[cmd_idx], "--cgroup-path") == 0 && cmd_idx + 1 < argc) {
-            strncpy(cgroup_path, argv[cmd_idx + 1], CGROUP_PATH_MAX - 1);
+            const char *path = argv[cmd_idx + 1];
+            /* Reject path traversal: no ".." components, no leading "/" */
+            if (path[0] == '/' || strstr(path, "..") != NULL) {
+                fprintf(stderr, "error: invalid cgroup path (must be relative, no '..')\n");
+                return 1;
+            }
+            strncpy(cgroup_path, path, CGROUP_PATH_MAX - 1);
             cgroup_path[CGROUP_PATH_MAX - 1] = '\0';
             cmd_idx += 2;
         } else {
@@ -436,7 +453,10 @@ int main(int argc, char *argv[]) {
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigchld_handler;
     sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    sigaction(SIGCHLD, &sa, NULL);
+    if (sigaction(SIGCHLD, &sa, NULL) != 0) {
+        perror("sigaction");
+        return 1;
+    }
 
     /* Connect to BEAM's UDS listener */
     int uds_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -473,6 +493,8 @@ int main(int argc, char *argv[]) {
         child_pid = fork();
         if (child_pid < 0) {
             send_error(uds_fd, "fork failed");
+            close(master_fd);
+            close(slave_fd);
             close(uds_fd);
             return 1;
         }
@@ -511,12 +533,14 @@ int main(int argc, char *argv[]) {
         if (send_fds(uds_fd, fds_to_send, 1) != 0) {
             send_error(uds_fd, "failed to send PTY FD");
             kill_child(child_pid);
+            close(master_fd);
             close(uds_fd);
             return 1;
         }
 
         if (send_child_started(uds_fd, child_pid) != 0) {
             kill_child(child_pid);
+            close(master_fd);
             close(uds_fd);
             return 1;
         }
@@ -526,20 +550,54 @@ int main(int argc, char *argv[]) {
 
     } else {
         /* === Pipe mode (default) === */
-        int stdin_pipe[2];   /* [0]=read (child), [1]=write (beam) */
-        int stdout_pipe[2];  /* [0]=read (beam), [1]=write (child) */
-        int stderr_pipe[2];  /* [0]=read (beam), [1]=write (child) */
+        int stdin_pipe[2] = {-1, -1};
+        int stdout_pipe[2] = {-1, -1};
+        int stderr_pipe[2] = {-1, -1};
 
-        if (pipe(stdin_pipe) != 0 || pipe(stdout_pipe) != 0 ||
-            pipe(stderr_pipe) != 0) {
+#ifdef __linux__
+        /* Use pipe2 with O_CLOEXEC to atomically set close-on-exec */
+        if (pipe2(stdin_pipe, O_CLOEXEC) != 0) {
+#else
+        if (pipe(stdin_pipe) != 0) {
+#endif
             send_error(uds_fd, "failed to create pipes");
             close(uds_fd);
             return 1;
         }
+#ifdef __linux__
+        if (pipe2(stdout_pipe, O_CLOEXEC) != 0) {
+#else
+        if (pipe(stdout_pipe) != 0) {
+#endif
+            send_error(uds_fd, "failed to create pipes");
+            close(stdin_pipe[0]); close(stdin_pipe[1]);
+            close(uds_fd);
+            return 1;
+        }
+#ifdef __linux__
+        if (pipe2(stderr_pipe, O_CLOEXEC) != 0) {
+#else
+        if (pipe(stderr_pipe) != 0) {
+#endif
+            send_error(uds_fd, "failed to create pipes");
+            close(stdin_pipe[0]); close(stdin_pipe[1]);
+            close(stdout_pipe[0]); close(stdout_pipe[1]);
+            close(uds_fd);
+            return 1;
+        }
+#ifndef __linux__
+        /* On macOS, set close-on-exec manually */
+        set_cloexec(stdin_pipe[0]);  set_cloexec(stdin_pipe[1]);
+        set_cloexec(stdout_pipe[0]); set_cloexec(stdout_pipe[1]);
+        set_cloexec(stderr_pipe[0]); set_cloexec(stderr_pipe[1]);
+#endif
 
         child_pid = fork();
         if (child_pid < 0) {
             send_error(uds_fd, "fork failed");
+            close(stdin_pipe[0]);  close(stdin_pipe[1]);
+            close(stdout_pipe[0]); close(stdout_pipe[1]);
+            close(stderr_pipe[0]); close(stderr_pipe[1]);
             close(uds_fd);
             return 1;
         }
@@ -579,12 +637,18 @@ int main(int argc, char *argv[]) {
         if (send_fds(uds_fd, fds_to_send, 3) != 0) {
             send_error(uds_fd, "failed to send FDs");
             kill_child(child_pid);
+            close(stdin_pipe[1]);
+            close(stdout_pipe[0]);
+            close(stderr_pipe[0]);
             close(uds_fd);
             return 1;
         }
 
         if (send_child_started(uds_fd, child_pid) != 0) {
             kill_child(child_pid);
+            close(stdin_pipe[1]);
+            close(stdout_pipe[0]);
+            close(stderr_pipe[0]);
             close(uds_fd);
             return 1;
         }
