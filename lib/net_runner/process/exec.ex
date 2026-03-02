@@ -70,8 +70,6 @@ defmodule NetRunner.Process.Exec do
     _, _ -> :ok
   end
 
-  defp safe_port_close(_), do: :ok
-
   defp safe_close_socket(socket) do
     :socket.close(socket)
   catch

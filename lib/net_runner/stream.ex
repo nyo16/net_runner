@@ -54,8 +54,12 @@ defmodule NetRunner.Stream do
       fn -> start_writer(pid, input) end,
       fn acc -> read_next(pid, acc) end,
       fn
-        {:error, _pid, _reason} = err -> cleanup(err)
-        _acc -> cleanup(pid)
+        {:error, proc_pid, reason} ->
+          cleanup_process(proc_pid)
+          raise "writer task crashed: #{inspect(reason)}"
+
+        _acc ->
+          cleanup_process(pid)
       end
     )
   end
@@ -124,24 +128,6 @@ defmodule NetRunner.Stream do
       {:error, reason} ->
         raise "read error: #{inspect(reason)}"
     end
-  end
-
-  defp cleanup({:error, pid, reason}) do
-    # Writer task crashed — clean up process first, then re-raise
-    cleanup_process(pid)
-    raise "writer task crashed: #{inspect(reason)}"
-  end
-
-  defp cleanup(pid) when is_pid(pid) do
-    cleanup_process(pid)
-  end
-
-  defp cleanup({:writing, _writer}) do
-    :ok
-  end
-
-  defp cleanup(:reading) do
-    :ok
   end
 
   defp cleanup_process(pid) do
