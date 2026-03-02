@@ -185,9 +185,14 @@ jobs:
           grep '@version' mix.exs
 
       - run: mix deps.get
+        env:
+          MIX_ENV: dev
       - run: mix compile
+        env:
+          MIX_ENV: dev
 
       - name: Publish to Hex
         run: mix hex.publish --yes
         env:
+          MIX_ENV: dev
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
