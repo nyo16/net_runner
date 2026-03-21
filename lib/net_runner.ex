@@ -27,6 +27,8 @@ defmodule NetRunner do
   @doc """
   Runs a command and collects all output.
 
+  Accepts either a command list `[executable | args]` or a `%NetRunner.Command{}` struct.
+
   Returns `{output, exit_status}` where output is the concatenated stdout.
 
   ## Options
@@ -50,8 +52,25 @@ defmodule NetRunner do
 
       {:error, {:max_output_exceeded, _partial}} =
         NetRunner.run(["sh", "-c", "yes"], max_output_size: 1000)
+
+      # With a Command struct:
+      cmd = NetRunner.Command.new("echo", ["hello"], timeout: 5_000)
+      {output, 0} = NetRunner.run(cmd)
   """
-  def run([cmd | args], opts \\ []) do
+  @spec run(NetRunner.Command.t() | [String.t()], keyword()) ::
+          {binary(), non_neg_integer()} | {:error, term()}
+  def run(command, opts \\ [])
+
+  def run(%NetRunner.Command{} = command, opts) do
+    {cmd, args, merged_opts} = NetRunner.Command.to_cmd_args_opts(command, opts)
+    run_impl(cmd, args, merged_opts)
+  end
+
+  def run([cmd | args], opts) do
+    run_impl(cmd, args, opts)
+  end
+
+  defp run_impl(cmd, args, opts) do
     input = Keyword.get(opts, :input, nil)
     timeout = Keyword.get(opts, :timeout, nil)
     max_output_size = Keyword.get(opts, :max_output_size, nil)
@@ -84,6 +103,8 @@ defmodule NetRunner do
   @doc """
   Creates a stream for incremental I/O with the command.
 
+  Accepts either a command list `[executable | args]` or a `%NetRunner.Command{}` struct.
+
   Returns a `Stream` that yields stdout binary chunks.
   Raises on process start failure.
 
@@ -102,15 +123,38 @@ defmodule NetRunner do
       NetRunner.stream!(~w(tr a-z A-Z), input: "hello")
       |> Enum.join()
       # => "HELLO"
+
+      # With a Command struct:
+      cmd = NetRunner.Command.new("cat", [], input: "hello")
+      NetRunner.stream!(cmd) |> Enum.to_list()
   """
-  def stream!([cmd | args], opts \\ []) do
+  @spec stream!(NetRunner.Command.t() | [String.t()], keyword()) :: Enumerable.t()
+  def stream!(command, opts \\ [])
+
+  def stream!(%NetRunner.Command{} = command, opts) do
+    {cmd, args, merged_opts} = NetRunner.Command.to_cmd_args_opts(command, opts)
+    NRStream.stream!(cmd, args, merged_opts)
+  end
+
+  def stream!([cmd | args], opts) do
     NRStream.stream!(cmd, args, opts)
   end
 
   @doc """
   Like `stream!/2` but returns `{:ok, stream}` or `{:error, reason}`.
+
+  Accepts either a command list `[executable | args]` or a `%NetRunner.Command{}` struct.
   """
-  def stream([cmd | args], opts \\ []) do
+  @spec stream(NetRunner.Command.t() | [String.t()], keyword()) ::
+          {:ok, Enumerable.t()} | {:error, term()}
+  def stream(command, opts \\ [])
+
+  def stream(%NetRunner.Command{} = command, opts) do
+    {cmd, args, merged_opts} = NetRunner.Command.to_cmd_args_opts(command, opts)
+    NRStream.stream(cmd, args, merged_opts)
+  end
+
+  def stream([cmd | args], opts) do
     NRStream.stream(cmd, args, opts)
   end
 
