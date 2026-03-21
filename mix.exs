@@ -76,7 +76,13 @@ defmodule NetRunner.MixProject do
         "docs/modules.md"
       ],
       groups_for_modules: [
-        "Public API": [NetRunner, NetRunner.Process, NetRunner.Stream, NetRunner.Daemon],
+        "Public API": [
+          NetRunner,
+          NetRunner.Command,
+          NetRunner.Process,
+          NetRunner.Stream,
+          NetRunner.Daemon
+        ],
         Internals: [
           NetRunner.Process.Exec,
           NetRunner.Process.Nif,
