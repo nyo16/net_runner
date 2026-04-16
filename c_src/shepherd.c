@@ -285,7 +285,17 @@ static void kill_child(pid_t child_pid) {
 
     /* Escalate to SIGKILL the whole process group */
     kill(-child_pid, SIGKILL);
-    waitpid(child_pid, NULL, 0);
+
+    /* Bounded WNOHANG reap loop — avoid hanging forever if the child is
+     * stuck in uninterruptible kernel sleep (D-state). After the bound
+     * elapses we return anyway; cgroup cleanup + the kernel eventually
+     * reap. */
+    int sigkill_iters = 30; /* ~3s total at 100ms per iteration */
+    for (int i = 0; i < sigkill_iters; i++) {
+        pid_t ret = waitpid(child_pid, NULL, WNOHANG);
+        if (ret > 0 || (ret < 0 && errno == ECHILD)) break;
+        usleep(100000);
+    }
 
     /* Cleanup cgroup (kills any remaining processes, removes dir) */
     cgroup_cleanup();
@@ -447,10 +457,16 @@ static int event_loop(int uds_fd, pid_t child_pid, int stdin_w) {
             char drain[64];
             while (read(signal_pipe[0], drain, sizeof(drain)) > 0) {}
 
-            /* Reap child */
+            /* Reap any and all children that have exited. SIGCHLD is
+             * coalesced by the kernel — multiple pending exits can deliver
+             * as a single SIGCHLD. Loop until no more reapable children
+             * remain. We only flip child_exited when the managed child is
+             * reaped; other reapees (should be none today, future-proof)
+             * are still cleaned up. */
             int status;
-            pid_t ret_pid = waitpid(child_pid, &status, WNOHANG);
-            if (ret_pid > 0) {
+            pid_t ret_pid;
+            while ((ret_pid = waitpid(-1, &status, WNOHANG)) > 0) {
+                if (ret_pid != child_pid) continue;
                 child_exited = 1;
                 if (WIFEXITED(status)) {
                     child_status = WEXITSTATUS(status);
