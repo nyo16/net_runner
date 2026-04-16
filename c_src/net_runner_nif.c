@@ -38,13 +38,17 @@ static ErlNifResourceType *io_resource_type = NULL;
 static void io_resource_dtor(ErlNifEnv *env, void *obj) {
     (void)env;
     io_resource_t *res = (io_resource_t *)obj;
+    /* Close fd even if mutex construction failed — otherwise ENOMEM during
+     * nif_create_fd would leak the underlying FD. */
     if (res->lock) {
         enif_mutex_lock(res->lock);
-        if (!res->closed && res->fd >= 0) {
-            close(res->fd);
-            res->fd = -1;
-            res->closed = 1;
-        }
+    }
+    if (!res->closed && res->fd >= 0) {
+        close(res->fd);
+        res->fd = -1;
+        res->closed = 1;
+    }
+    if (res->lock) {
         enif_mutex_unlock(res->lock);
         enif_mutex_destroy(res->lock);
         res->lock = NULL;
@@ -166,6 +170,13 @@ static ERL_NIF_TERM nif_create_fd(ErlNifEnv *env, int argc,
     res->lock = enif_mutex_create("io_resource");
     res->owner = owner;
     res->monitor_active = 0;
+
+    if (!res->lock) {
+        /* Mutex allocation failed — release resource (dtor will close fd) */
+        enif_release_resource(res);
+        return enif_make_tuple2(env, atom_error,
+                                MAKE_ATOM(env, "mutex_failed"));
+    }
 
     /* Monitor the owner process */
     if (enif_monitor_process(env, res, &owner, &res->monitor) == 0) {
