@@ -210,12 +210,19 @@ static int cgroup_setup(pid_t child_pid) {
     char full_path[512];
     char procs_path[576];
 
-    /* Create cgroup directory */
-    snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s", cgroup_path);
+    int n = snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s",
+                     cgroup_path);
+    if (n < 0 || (size_t)n >= sizeof(full_path)) {
+        ERROR_LOG("cgroup path too long");
+        return -1;
+    }
     mkdir(full_path, 0755); /* ignore error if exists */
 
-    /* Move child to cgroup */
-    snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs", full_path);
+    n = snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs", full_path);
+    if (n < 0 || (size_t)n >= sizeof(procs_path)) {
+        ERROR_LOG("cgroup procs path too long");
+        return -1;
+    }
     FILE *f = fopen(procs_path, "w");
     if (!f) {
         ERROR_LOG("failed to open %s: %s", procs_path, strerror(errno));
@@ -232,21 +239,26 @@ static void cgroup_cleanup(void) {
     char full_path[512];
     char kill_path[576];
 
-    snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s", cgroup_path);
+    int n = snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s",
+                     cgroup_path);
+    if (n < 0 || (size_t)n >= sizeof(full_path)) return;
 
     /* Kill all processes in the cgroup via cgroup.kill (cgroup v2) */
-    snprintf(kill_path, sizeof(kill_path), "%s/cgroup.kill", full_path);
+    n = snprintf(kill_path, sizeof(kill_path), "%s/cgroup.kill", full_path);
+    if (n < 0 || (size_t)n >= sizeof(kill_path)) return;
     FILE *f = fopen(kill_path, "w");
     if (f) {
         fprintf(f, "1\n");
         fclose(f);
     }
 
-    /* Wait briefly for processes to die */
-    usleep(100000);
-
-    /* Remove cgroup directory */
-    rmdir(full_path);
+    /* Poll for rmdir success rather than a fixed sleep — the kernel needs
+     * a moment to reap the killed processes. Bail after ~1s (10 * 100ms). */
+    for (int i = 0; i < 10; i++) {
+        if (rmdir(full_path) == 0) return;
+        if (errno != EBUSY && errno != ENOTEMPTY) return; /* real error */
+        usleep(100000);
+    }
 }
 #else
 static int cgroup_setup(pid_t child_pid) {
@@ -573,6 +585,12 @@ int main(int argc, char *argv[]) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
+    if (strlen(uds_path) >= sizeof(addr.sun_path)) {
+        fprintf(stderr, "error: uds_path too long (max %zu bytes)\n",
+                sizeof(addr.sun_path) - 1);
+        close(uds_fd);
+        return 1;
+    }
     strncpy(addr.sun_path, uds_path, sizeof(addr.sun_path) - 1);
 
     if (connect(uds_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
@@ -630,9 +648,18 @@ int main(int argc, char *argv[]) {
         /* === Shepherd (PTY) === */
         close(slave_fd);
         pty_master_fd = master_fd;
+        set_cloexec(master_fd);
 
-        /* Move child to cgroup (Linux only, no-op elsewhere) */
-        cgroup_setup(child_pid);
+        /* Move child to cgroup (Linux only, no-op elsewhere). If the user
+         * requested a cgroup path and setup failed, isolation is not
+         * available — treat as fatal. */
+        if (cgroup_setup(child_pid) != 0) {
+            send_error(uds_fd, "cgroup setup failed");
+            kill_child(child_pid);
+            close(master_fd);
+            close(uds_fd);
+            return 1;
+        }
 
         /* Send single master FD to BEAM (used for both read and write) */
         int fds_to_send[1] = {master_fd};
@@ -737,8 +764,18 @@ int main(int argc, char *argv[]) {
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
 
-        /* Move child to cgroup (Linux only, no-op elsewhere) */
-        cgroup_setup(child_pid);
+        /* Move child to cgroup (Linux only, no-op elsewhere). If the user
+         * requested a cgroup path and setup failed, isolation is not
+         * available — treat as fatal. */
+        if (cgroup_setup(child_pid) != 0) {
+            send_error(uds_fd, "cgroup setup failed");
+            kill_child(child_pid);
+            close(stdin_pipe[1]);
+            close(stdout_pipe[0]);
+            close(stderr_pipe[0]);
+            close(uds_fd);
+            return 1;
+        }
 
         int fds_to_send[3] = {stdin_pipe[1], stdout_pipe[0], stderr_pipe[0]};
         if (send_fds(uds_fd, fds_to_send, 3) != 0) {
