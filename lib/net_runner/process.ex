@@ -94,7 +94,16 @@ defmodule NetRunner.Process do
   def init({cmd, args, opts}) do
     case Exec.spawn_process(cmd, args, opts) do
       {:ok, state} ->
-        state = %{state | stats: Stats.new()}
+        # Optionally monitor an "owner" process (typically the stream
+        # consumer). If it dies before the OS process exits we kill the
+        # OS process and stop cleanly instead of leaking a GenServer.
+        owner_ref =
+          case Keyword.get(opts, :owner) do
+            pid when is_pid(pid) -> Process.monitor(pid)
+            _ -> nil
+          end
+
+        state = %{state | stats: Stats.new(), owner_ref: owner_ref}
         # Register with watcher for belt-and-suspenders cleanup
         NetRunner.Watcher.watch(self(), state.os_pid)
         # Start reading stderr in :consume mode
@@ -244,6 +253,26 @@ defmodule NetRunner.Process do
       when socket == state.uds_socket do
     state = handle_uds_message(state)
     {:noreply, state}
+  end
+
+  # Owner (e.g. stream consumer) died — kill the OS process and stop.
+  # Without this, a consumer crash would orphan the Process GenServer and
+  # leave the OS process running until Watcher's own DOWN fires (which
+  # doesn't, because Watcher monitors us, not the consumer).
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{owner_ref: ref} = state)
+      when is_reference(ref) do
+    if state.os_pid do
+      case Signal.resolve(:sigkill) do
+        {:ok, sig_num} ->
+          send_shepherd_command(state, <<0x01, sig_num::8>>)
+          Nif.nif_kill(state.os_pid, sig_num)
+
+        _ ->
+          :ok
+      end
+    end
+
+    {:stop, :normal, state}
   end
 
   # Initial stderr chunk from kick_stderr_read in init/1. Without this clause
