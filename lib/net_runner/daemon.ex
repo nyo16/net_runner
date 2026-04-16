@@ -83,7 +83,16 @@ defmodule NetRunner.Daemon do
     {:noreply, state}
   end
 
-  def handle_info({:DOWN, _ref, :process, _pid, _reason}, state) do
+  # Drain task went :DOWN. Normal completion would match the {ref, result}
+  # clause above, so here we expect an abnormal reason (crash, :killed, etc.)
+  # — log a warning so a drain crash does not silently stop draining.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    if ref in [state.drain_ref, state.stderr_drain_ref] and reason != :normal do
+      require Logger
+
+      Logger.warning("[NetRunner.Daemon] drain task crashed: #{inspect(reason)}")
+    end
+
     {:noreply, state}
   end
 
@@ -120,7 +129,7 @@ defmodule NetRunner.Daemon do
   defp drain_loop(reader, proc, on_output) do
     case reader.(proc) do
       {:ok, data} ->
-        handle_output(on_output, data)
+        safe_handle_output(on_output, data)
         drain_loop(reader, proc, on_output)
 
       :eof ->
@@ -129,6 +138,25 @@ defmodule NetRunner.Daemon do
       {:error, _} ->
         :ok
     end
+  rescue
+    # Defensive: if reader.() or caller pattern blows up (e.g. Proc already
+    # terminated while we were mid-call), stop draining without bringing
+    # down the Daemon through the linked Task.
+    e ->
+      require Logger
+      Logger.warning("[NetRunner.Daemon] drain exception: #{inspect(e)}")
+      :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp safe_handle_output(on_output, data) do
+    handle_output(on_output, data)
+  rescue
+    e ->
+      require Logger
+      Logger.warning("[NetRunner.Daemon] on_output raised: #{inspect(e)}")
+      :ok
   end
 
   defp handle_output(:discard, _data), do: :ok
