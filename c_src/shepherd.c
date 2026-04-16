@@ -257,10 +257,23 @@ static void kill_child(pid_t child_pid) {
 }
 
 /*
- * Handle a command received from BEAM over UDS.
+ * Length of a single framed command given its opcode. Returns 0 if the
+ * opcode is unknown (in which case the parser will skip one byte).
+ */
+static size_t command_length(uint8_t opcode) {
+    switch (opcode) {
+    case CMD_KILL:         return 2;
+    case CMD_CLOSE_STDIN:  return 1;
+    case CMD_SET_WINSIZE:  return 5;
+    default:               return 0;
+    }
+}
+
+/*
+ * Handle a single command frame.
  */
 static void handle_command(int uds_fd, pid_t child_pid, int stdin_w,
-                           uint8_t *buf, ssize_t len) {
+                           uint8_t *buf, size_t len) {
     (void)uds_fd;
     if (len < 1) return;
 
@@ -301,6 +314,36 @@ static void handle_command(int uds_fd, pid_t child_pid, int stdin_w,
 }
 
 /*
+ * Parse and dispatch all framed commands present in buf. Returns the number
+ * of bytes consumed (may be less than len if a tail command is truncated).
+ */
+static size_t handle_commands(int uds_fd, pid_t child_pid, int *stdin_w,
+                              uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        size_t clen = command_length(buf[off]);
+        if (clen == 0) {
+            /* Unknown opcode: skip one byte to make progress rather than
+             * stalling the parser on bad input. */
+            DEBUG_LOG("unknown command opcode 0x%02x, skipping", buf[off]);
+            off += 1;
+            continue;
+        }
+        if (off + clen > len) {
+            /* Partial tail — caller must carry this over to the next read. */
+            break;
+        }
+        uint8_t op = buf[off];
+        handle_command(uds_fd, child_pid, *stdin_w, &buf[off], clen);
+        if (op == CMD_CLOSE_STDIN) {
+            *stdin_w = -1;
+        }
+        off += clen;
+    }
+    return off;
+}
+
+/*
  * Main event loop using poll().
  *
  * Watches:
@@ -311,6 +354,11 @@ static int event_loop(int uds_fd, pid_t child_pid, int stdin_w) {
     struct pollfd fds[2];
     int child_status = -1;
     int child_exited = 0;
+
+    /* Carry-over buffer for partially-framed commands across reads. Max
+     * incoming frame is CMD_SET_WINSIZE (5 bytes); keep a little slack. */
+    uint8_t cbuf[64];
+    size_t cbuf_used = 0;
 
     fds[0].fd = uds_fd;
     fds[0].events = POLLIN;
@@ -336,17 +384,23 @@ static int event_loop(int uds_fd, pid_t child_pid, int stdin_w) {
         }
 
         if (fds[0].revents & POLLIN) {
-            uint8_t buf[16];
-            ssize_t n = read(uds_fd, buf, sizeof(buf));
+            ssize_t n = read(uds_fd, cbuf + cbuf_used, sizeof(cbuf) - cbuf_used);
             if (n > 0) {
-                handle_command(uds_fd, child_pid, stdin_w, buf, n);
-                /* If CMD_CLOSE_STDIN was handled, mark stdin as closed */
-                if (buf[0] == CMD_CLOSE_STDIN) {
-                    stdin_w = -1;
+                cbuf_used += (size_t)n;
+                size_t consumed = handle_commands(uds_fd, child_pid, &stdin_w,
+                                                  cbuf, cbuf_used);
+                if (consumed > 0 && consumed < cbuf_used) {
+                    memmove(cbuf, cbuf + consumed, cbuf_used - consumed);
                 }
+                cbuf_used -= consumed;
             } else if (n == 0) {
                 /* BEAM closed the socket */
                 DEBUG_LOG("BEAM closed UDS, killing child %d", child_pid);
+                kill_child(child_pid);
+                return -1;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK &&
+                       errno != EINTR) {
+                ERROR_LOG("read(uds) failed: %s", strerror(errno));
                 kill_child(child_pid);
                 return -1;
             }
