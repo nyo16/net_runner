@@ -45,6 +45,28 @@
 /* Self-pipe for signal handling */
 static int signal_pipe[2] = {-1, -1};
 
+/*
+ * Async-signal-safe post-fork failure path. Between fork() and exec*(),
+ * POSIX allows only async-signal-safe functions, so we cannot call
+ * fprintf / strerror / malloc. This helper uses write(2) on a stack
+ * buffer only.
+ */
+static void child_fail(const char *tag, const char *detail) {
+    if (tag) {
+        size_t i = 0;
+        while (i < 64 && tag[i] != '\0') i++;
+        (void)!write(STDERR_FILENO, tag, i);
+        (void)!write(STDERR_FILENO, ": ", 2);
+    }
+    if (detail) {
+        size_t i = 0;
+        while (i < 256 && detail[i] != '\0') i++;
+        (void)!write(STDERR_FILENO, detail, i);
+    }
+    (void)!write(STDERR_FILENO, "\n", 1);
+    _exit(127);
+}
+
 static void sigchld_handler(int sig) {
     (void)sig;
     int saved_errno = errno;
@@ -75,7 +97,10 @@ static int send_fds(int uds_fd, int *fds, int nfds) {
 
     size_t cmsg_space = CMSG_SPACE((size_t)nfds * sizeof(int));
     char *cmsg_buf = calloc(1, cmsg_space);
-    if (!cmsg_buf) return -1;
+    if (!cmsg_buf) {
+        ERROR_LOG("send_fds: calloc(%zu) failed", cmsg_space);
+        return -1;
+    }
 
     struct msghdr msg = {0};
     msg.msg_iov = &iov;
@@ -85,6 +110,7 @@ static int send_fds(int uds_fd, int *fds, int nfds) {
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     if (!cmsg) {
+        ERROR_LOG("send_fds: CMSG_FIRSTHDR returned NULL");
         free(cmsg_buf);
         return -1;
     }
@@ -93,9 +119,18 @@ static int send_fds(int uds_fd, int *fds, int nfds) {
     cmsg->cmsg_len = CMSG_LEN((size_t)nfds * sizeof(int));
     memcpy(CMSG_DATA(cmsg), fds, (size_t)nfds * sizeof(int));
 
-    ssize_t ret = sendmsg(uds_fd, &msg, 0);
-    free(cmsg_buf);
-    return ret > 0 ? 0 : -1;
+    /* Retry on EINTR; treat anything other than a full 1-byte send as error. */
+    for (;;) {
+        ssize_t ret = sendmsg(uds_fd, &msg, 0);
+        if (ret == 1) {
+            free(cmsg_buf);
+            return 0;
+        }
+        if (ret < 0 && errno == EINTR) continue;
+        ERROR_LOG("sendmsg failed: ret=%zd errno=%s", ret, strerror(errno));
+        free(cmsg_buf);
+        return -1;
+    }
 }
 
 /*
@@ -560,19 +595,20 @@ int main(int argc, char *argv[]) {
             close(signal_pipe[1]);
             close(master_fd);
 
-            /* Create new session and set controlling terminal */
-            setsid();
-            ioctl(slave_fd, TIOCSCTTY, 0);
+            /* Create new session (required before acquiring controlling tty) */
+            if (setsid() == (pid_t)-1) child_fail("setsid", NULL);
+            if (ioctl(slave_fd, TIOCSCTTY, 0) != 0) child_fail("TIOCSCTTY", NULL);
 
-            dup2(slave_fd, STDIN_FILENO);
-            dup2(slave_fd, STDOUT_FILENO);
-            dup2(slave_fd, STDERR_FILENO);
+            if (dup2(slave_fd, STDIN_FILENO)  != STDIN_FILENO ||
+                dup2(slave_fd, STDOUT_FILENO) != STDOUT_FILENO ||
+                dup2(slave_fd, STDERR_FILENO) != STDERR_FILENO) {
+                child_fail("dup2", NULL);
+            }
             if (slave_fd > STDERR_FILENO) close(slave_fd);
 
             setpgid(0, 0);
             execvp(cmd, cmd_args);
-            fprintf(stderr, "execvp failed: %s: %s\n", cmd, strerror(errno));
-            _exit(127);
+            child_fail("execvp", cmd);
         }
 
         /* === Shepherd (PTY) === */
@@ -665,9 +701,11 @@ int main(int argc, char *argv[]) {
             close(stdout_pipe[0]);
             close(stderr_pipe[0]);
 
-            dup2(stdin_pipe[0], STDIN_FILENO);
-            dup2(stdout_pipe[1], STDOUT_FILENO);
-            dup2(stderr_pipe[1], STDERR_FILENO);
+            if (dup2(stdin_pipe[0],  STDIN_FILENO)  != STDIN_FILENO ||
+                dup2(stdout_pipe[1], STDOUT_FILENO) != STDOUT_FILENO ||
+                dup2(stderr_pipe[1], STDERR_FILENO) != STDERR_FILENO) {
+                child_fail("dup2", NULL);
+            }
 
             close(stdin_pipe[0]);
             close(stdout_pipe[1]);
@@ -675,8 +713,7 @@ int main(int argc, char *argv[]) {
 
             setpgid(0, 0);
             execvp(cmd, cmd_args);
-            fprintf(stderr, "execvp failed: %s: %s\n", cmd, strerror(errno));
-            _exit(127);
+            child_fail("execvp", cmd);
         }
 
         /* === Shepherd (pipe) === */
