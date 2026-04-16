@@ -246,6 +246,15 @@ defmodule NetRunner.Process do
     {:noreply, state}
   end
 
+  # Initial stderr chunk from kick_stderr_read in init/1. Without this clause
+  # the data would be silently dropped by the catch-all below.
+  def handle_info({:stderr_data, data}, state) when is_binary(data) do
+    stats = Stats.record_read_stderr(state.stats, byte_size(data))
+    state = %{state | stderr_buffer: [data | state.stderr_buffer], stats: stats}
+    # Drain anything else buffered and re-arm enif_select on EAGAIN.
+    {:noreply, consume_stderr(state)}
+  end
+
   def handle_info(_msg, state) do
     {:noreply, state}
   end
@@ -399,8 +408,10 @@ defmodule NetRunner.Process do
 
   defp kick_stderr_read(state) do
     if state.stderr do
-      # Do an initial read to get enif_select registered
-      case Pipe.read(state.stderr) do
+      # Do an initial read to get enif_select registered. If data is
+      # immediately available, hand it to handle_info/2 so the GenServer
+      # buffers it (can't update state from init/1 without reshaping it).
+      case Pipe.read(state.stderr, @default_read_size) do
         {:ok, data} ->
           send(self(), {:stderr_data, data})
 
