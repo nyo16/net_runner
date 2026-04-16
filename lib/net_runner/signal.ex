@@ -12,7 +12,9 @@ defmodule NetRunner.Signal do
     Nif.nif_signal_number(signal)
   end
 
-  def resolve(signal) when is_integer(signal), do: {:ok, signal}
+  def resolve(signal) when is_integer(signal) and signal >= 1 and signal <= 31,
+    do: {:ok, signal}
+
   def resolve(_signal), do: {:error, :unknown_signal}
 
   @doc """
