@@ -290,13 +290,22 @@ defmodule NetRunner.Process do
 
   @impl true
   def terminate(_reason, state) do
-    # Best-effort cleanup
+    # Best-effort cleanup. Order: close pipes (lets child see EOF), then
+    # UDS (shepherd detects POLLHUP, kills child), then the shepherd Port.
     if state.stdin, do: Pipe.close(state.stdin)
     if state.stdout, do: Pipe.close(state.stdout)
     if state.stderr, do: Pipe.close(state.stderr)
 
     if state.uds_socket do
       :socket.close(state.uds_socket)
+    end
+
+    if is_port(state.shepherd_port) do
+      try do
+        Port.close(state.shepherd_port)
+      catch
+        _, _ -> :ok
+      end
     end
 
     :ok

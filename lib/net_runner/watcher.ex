@@ -38,35 +38,35 @@ defmodule NetRunner.Watcher do
 
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{monitor_ref: ref} = state) do
-    # GenServer crashed — kill the OS process
-    kill_os_process(state.os_pid)
+    # GenServer crashed — kill the OS process, then schedule a SIGKILL
+    # escalation check instead of Process.sleep (which would wedge this
+    # GenServer unresponsive to any other messages for 5 seconds).
+    case Nif.nif_is_os_pid_alive(state.os_pid) do
+      true ->
+        {:ok, sigterm} = Signal.resolve(:sigterm)
+        Nif.nif_kill(state.os_pid, sigterm)
+        Process.send_after(self(), :escalate_to_sigkill, @kill_timeout)
+        {:noreply, state}
+
+      false ->
+        {:stop, :normal, state}
+    end
+  end
+
+  def handle_info(:escalate_to_sigkill, state) do
+    case Nif.nif_is_os_pid_alive(state.os_pid) do
+      true ->
+        {:ok, sigkill} = Signal.resolve(:sigkill)
+        Nif.nif_kill(state.os_pid, sigkill)
+
+      false ->
+        :ok
+    end
+
     {:stop, :normal, state}
   end
 
   def handle_info(_msg, state) do
     {:noreply, state}
-  end
-
-  defp kill_os_process(os_pid) do
-    case Nif.nif_is_os_pid_alive(os_pid) do
-      true ->
-        {:ok, sigterm} = Signal.resolve(:sigterm)
-        Nif.nif_kill(os_pid, sigterm)
-
-        # Wait briefly, then escalate
-        Process.sleep(@kill_timeout)
-
-        case Nif.nif_is_os_pid_alive(os_pid) do
-          true ->
-            {:ok, sigkill} = Signal.resolve(:sigkill)
-            Nif.nif_kill(os_pid, sigkill)
-
-          false ->
-            :ok
-        end
-
-      false ->
-        :ok
-    end
   end
 end
