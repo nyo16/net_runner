@@ -255,24 +255,23 @@ defmodule NetRunner.Process do
     {:noreply, state}
   end
 
-  # Owner (e.g. stream consumer) died — kill the OS process and stop.
-  # Without this, a consumer crash would orphan the Process GenServer and
-  # leave the OS process running until Watcher's own DOWN fires (which
-  # doesn't, because Watcher monitors us, not the consumer).
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{owner_ref: ref} = state)
+  # A parked caller (read/write) died — drop its entry silently instead of
+  # letting it linger until process exit. The owner case is handled first.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state)
       when is_reference(ref) do
-    if state.os_pid do
-      case Signal.resolve(:sigkill) do
-        {:ok, sig_num} ->
-          send_shepherd_command(state, <<0x01, sig_num::8>>)
-          Nif.nif_kill(state.os_pid, sig_num)
+    cond do
+      ref == state.owner_ref ->
+        on_owner_down(state)
 
-        _ ->
-          :ok
-      end
+      true ->
+        case Operations.pop_by_monitor(state.operations, ref) do
+          {nil, _ops} ->
+            {:noreply, state}
+
+          {_op, ops} ->
+            {:noreply, %{state | operations: ops}}
+        end
     end
-
-    {:stop, :normal, state}
   end
 
   # Initial stderr chunk from kick_stderr_read in init/1. Without this clause
@@ -286,6 +285,21 @@ defmodule NetRunner.Process do
 
   def handle_info(_msg, state) do
     {:noreply, state}
+  end
+
+  defp on_owner_down(state) do
+    if state.os_pid do
+      case Signal.resolve(:sigkill) do
+        {:ok, sig_num} ->
+          send_shepherd_command(state, <<0x01, sig_num::8>>)
+          Nif.nif_kill(state.os_pid, sig_num)
+
+        _ ->
+          :ok
+      end
+    end
+
+    {:stop, :normal, state}
   end
 
   @impl true
