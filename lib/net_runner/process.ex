@@ -283,25 +283,30 @@ defmodule NetRunner.Process do
     write_loop(data, from, state)
   end
 
-  # Writes data in a loop: partial writes retry immediately until EAGAIN
-  # (which registers enif_select) or completion.
+  # Writes data once per call: on a successful partial write we park the
+  # caller and let :ready_output drive the remainder. This avoids (a) a
+  # spin loop if the kernel ever returns {:ok, 0} on a non-empty write and
+  # (b) starving other handle_call messages on large buffers.
   defp write_loop(<<>>, _from, state), do: {:reply, :ok, state}
 
   defp write_loop(data, from, state) do
     case Pipe.write(state.stdin, data) do
-      {:ok, bytes_written} ->
+      {:ok, bytes_written} when bytes_written == byte_size(data) ->
         stats = Stats.record_write(state.stats, bytes_written)
-        state = %{state | stats: stats}
-        total = byte_size(data)
+        {:reply, :ok, %{state | stats: stats}}
 
-        if bytes_written >= total do
-          {:reply, :ok, state}
-        else
-          # Partial write — retry remainder immediately to either complete
-          # or hit EAGAIN (which registers enif_select for readiness notification)
-          remaining = binary_part(data, bytes_written, total - bytes_written)
-          write_loop(remaining, from, state)
-        end
+      {:ok, bytes_written} when bytes_written > 0 ->
+        stats = Stats.record_write(state.stats, bytes_written)
+        remaining = binary_part(data, bytes_written, byte_size(data) - bytes_written)
+        # Park the caller with the remaining data; :ready_output will drive it.
+        {ops, _ref} = Operations.park(state.operations, :write, from, remaining)
+        {:noreply, %{state | operations: ops, stats: stats}}
+
+      {:ok, 0} ->
+        # write(2) can legally return 0 on a non-empty buffer; treat the
+        # same as EAGAIN to avoid spinning on the dirty scheduler.
+        {ops, _ref} = Operations.park(state.operations, :write, from, data)
+        {:noreply, %{state | operations: ops}}
 
       {:error, :eagain} ->
         # enif_select is now registered for write readiness
@@ -379,25 +384,26 @@ defmodule NetRunner.Process do
 
   defp retry_write_loop(ref, from, data, state) do
     case Pipe.write(state.stdin, data) do
-      {:ok, bytes_written} ->
+      {:ok, bytes_written} when bytes_written == byte_size(data) ->
         stats = Stats.record_write(state.stats, bytes_written)
-        state = %{state | stats: stats}
-        total = byte_size(data)
+        GenServer.reply(from, :ok)
+        {_, ops} = Operations.pop(state.operations, ref)
+        %{state | operations: ops, stats: stats}
 
-        if bytes_written >= total do
-          GenServer.reply(from, :ok)
-          {_, ops} = Operations.pop(state.operations, ref)
-          %{state | operations: ops}
-        else
-          remaining = binary_part(data, bytes_written, total - bytes_written)
-          retry_write_loop(ref, from, remaining, state)
-        end
+      {:ok, bytes_written} when bytes_written > 0 ->
+        stats = Stats.record_write(state.stats, bytes_written)
+        remaining = binary_part(data, bytes_written, byte_size(data) - bytes_written)
+        {_, ops} = Operations.pop(state.operations, ref)
+        {ops, _new_ref} = Operations.park(ops, :write, from, remaining)
+        %{state | operations: ops, stats: stats}
+
+      {:ok, 0} ->
+        # Zero-byte write on non-empty data — wait for the next :ready_output
+        # (ops entry still valid with full data).
+        state
 
       {:error, :eagain} ->
-        # Still parked, update data (enif_select already registered)
-        {_, ops} = Operations.pop(state.operations, ref)
-        {ops, _new_ref} = Operations.park(ops, :write, from, data)
-        %{state | operations: ops}
+        state
 
       {:error, _} = error ->
         GenServer.reply(from, error)
