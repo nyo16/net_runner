@@ -516,11 +516,33 @@ defmodule NetRunner.Process do
   defp maybe_read_exit_status(%{status: :exited} = state), do: state
 
   defp maybe_read_exit_status(state) do
+    # Shepherd has exited. The UDS may or may not have delivered
+    # MSG_CHILD_EXITED yet — on slow CI runners (notably macOS) the
+    # buffer can trail the Port's {:exit_status, _} notification.
+    # Retry a few times on timeout; bail immediately on :closed so
+    # the 5 s force_exit_timeout can apply a synthetic 137.
+    drain_uds_for_exit(state, _tries_left = 5)
+  end
+
+  defp drain_uds_for_exit(state, 0), do: state
+
+  defp drain_uds_for_exit(state, tries_left) do
     case Exec.read_uds_message(state.uds_socket) do
       {:child_exited, status} ->
         finish_exit(state, status)
 
-      _ ->
+      {:error, reason} when reason in [:closed, :econnreset, :enotconn] ->
+        # Peer closed without delivering an exit message; fall through to
+        # force_exit_timeout which will apply status 137.
+        state
+
+      {:error, :no_message} ->
+        # Read timed out (data not yet buffered). Give the kernel another
+        # chance — read_uds_message already waited 500 ms per attempt.
+        drain_uds_for_exit(state, tries_left - 1)
+
+      _other ->
+        # Unexpected shape — stop draining to avoid spinning on bad data.
         state
     end
   end
