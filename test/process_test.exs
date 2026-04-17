@@ -81,6 +81,17 @@ defmodule NetRunner.ProcessTest do
     end
   end
 
+  describe "binary data" do
+    test "round-trips output containing NUL bytes" do
+      {:ok, pid} = Proc.start("sh", ["-c", ~S|printf 'a\0b\0c'|], [])
+
+      data = read_all(pid)
+      assert data == "a\0b\0c"
+      assert byte_size(data) == 5
+      assert {:ok, 0} = Proc.await_exit(pid)
+    end
+  end
+
   describe "os_pid" do
     test "returns the OS pid" do
       {:ok, pid} = Proc.start("sleep", ["100"])
