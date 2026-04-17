@@ -83,6 +83,45 @@ Enum.to_list(stream)
 NetRunner.run(~w(my_server), kill_timeout: 2000, timeout: 10_000)
 ```
 
+## Input Validation and Error Returns
+
+`run/2` and `stream/2` return tagged errors for bad input instead of
+crashing. NUL bytes inside `cmd` or `args` are rejected early (they
+are undefined in `argv` on the C side).
+
+```elixir
+# Empty executable
+{:error, {:invalid_cmd, _}} = NetRunner.run([""])
+
+# NUL byte in an argument
+{:error, {:invalid_args, _}} = NetRunner.run(["echo", "he\0llo"])
+
+# Same behaviour for streaming
+{:error, {:invalid_args, _}} = NetRunner.stream(["echo", "he\0llo"])
+
+# Unknown signal atoms come back as tagged errors, not raises
+{:error, :unknown_signal} = NetRunner.Signal.resolve(:sigwhatever)
+{:error, :unknown_signal} = NetRunner.Signal.resolve(99)
+```
+
+## Working with Binary Output
+
+stdout is delivered as a BEAM binary, not a String. It is safe to pass
+bytes containing NUL, high-bit, or anything else through the pipeline.
+
+```elixir
+# NUL bytes round-trip unchanged
+{out, 0} = NetRunner.run(["sh", "-c", ~S|printf 'a\0b\0c'|])
+byte_size(out)          # => 5
+out == "a\0b\0c"        # => true
+
+# UTF-8 boundaries straddle chunks fine — just concatenate and then
+# decode.
+"héllo\n" =
+  NetRunner.stream!(~w(echo héllo))
+  |> Enum.join()
+```
+
 ## Process API
 
 For fine-grained control over the OS process lifecycle:
@@ -164,10 +203,43 @@ Proc.await_exit(pid)
 stats = Proc.stats(pid)
 stats.bytes_in     # => 5       (bytes written to stdin)
 stats.bytes_out    # => 5       (bytes read from stdout)
+stats.bytes_err    # => 0       (bytes read from stderr, :consume mode)
 stats.read_count   # => 1       (number of read calls)
 stats.write_count  # => 1       (number of write calls)
 stats.duration_ms  # => 3       (wall-clock time)
 stats.exit_status  # => 0       (exit code)
+```
+
+### Tying an OS process to an owner
+
+If the calling process crashes, the OS process it launched should go
+with it. Pass `:owner` to have the Process GenServer monitor a pid;
+on `:DOWN` it SIGKILLs the child and stops cleanly. `NetRunner.stream/2`
+does this automatically with `self()`.
+
+```elixir
+# Spawn a long-lived command tied to the caller
+parent = self()
+
+spawn(fn ->
+  {:ok, pid} = Proc.start("sleep", ["30"], owner: self())
+  send(parent, {:os_pid, Proc.os_pid(pid)})
+  exit(:boom)   # caller dies → Process SIGKILLs sleep, stops itself
+end)
+```
+
+### Per-call kill timeout
+
+Tune the SIGTERM→SIGKILL escalation window per-process. Useful when a
+command has its own graceful shutdown hook you want to honour, or when
+you need a fast hard-kill.
+
+```elixir
+# Give my_server 10s to drain on SIGTERM before SIGKILL
+{:ok, pid} = Proc.start("my_server", [], kill_timeout: 10_000)
+
+# Or make it effectively immediate for tests
+{:ok, pid} = Proc.start("sleep", ["100"], kill_timeout: 100)
 ```
 
 ## PTY Mode
@@ -267,6 +339,59 @@ Isolate child processes in a cgroup v2 hierarchy for resource control:
 ```
 
 The shepherd creates the cgroup directory, moves the child into it, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the directory). No-op on macOS.
+
+## Command DSL
+
+Bundle an executable, default args, and default options into a reusable
+`%NetRunner.Command{}`. Both `run/2` and `stream/2` accept it, and
+call-site options override the defaults.
+
+```elixir
+alias NetRunner.Command
+
+# Inline construction
+cmd = Command.new("curl", ["-sS"], timeout: 30_000)
+{body, 0} = NetRunner.run(cmd, args: ["https://example.com"])
+
+# Extend at call time (args append; opts merge with runtime winning)
+listing = Command.new("ls", ["-la"])
+{out, 0} = NetRunner.run(listing, args: ["/tmp"])
+
+# `defcommand` in your own module captures a reusable template:
+defmodule MyCmds do
+  use NetRunner.Command
+
+  defcommand :curl, "curl", ["-sS", "--max-time", "30"]
+  defcommand :echo, "echo"
+end
+
+{out, 0} = NetRunner.run(MyCmds.echo(["hi"]))
+{:ok, stream} = NetRunner.stream(MyCmds.curl(["https://example.com"]))
+```
+
+## Error Handling Cheatsheet
+
+```elixir
+case NetRunner.run(["my_tool", arg], timeout: 5_000) do
+  {output, 0} ->
+    {:ok, output}
+
+  {_partial, status} when status != 0 ->
+    {:error, {:nonzero_exit, status}}
+
+  {:error, :timeout} ->
+    {:error, :took_too_long}
+
+  {:error, {:max_output_exceeded, partial}} ->
+    {:error, {:too_much_output, byte_size(partial)}}
+
+  {:error, {:invalid_cmd, msg}} ->
+    {:error, {:bad_cmd, msg}}
+
+  {:error, {:invalid_args, msg}} ->
+    {:error, {:bad_args, msg}}
+end
+```
 
 ## Parallel Execution
 

@@ -60,4 +60,49 @@ defmodule NetRunnerTest do
       assert output == "hello\n"
     end
   end
+
+  describe "input validation" do
+    # Regression: run/2 used to pattern-match {:ok, pid} on Proc.start
+    # which raised MatchError when validation failed. Now it returns the
+    # error tuple directly.
+    test "run surfaces NUL-byte validation error cleanly" do
+      assert {:error, {:invalid_args, _}} = NetRunner.run(["echo", "bad\0arg"])
+    end
+
+    test "stream surfaces NUL-byte validation error cleanly" do
+      assert {:error, {:invalid_args, _}} = NetRunner.stream(["echo", "bad\0arg"])
+    end
+
+    test "run rejects empty executable" do
+      assert {:error, {:invalid_cmd, _}} = NetRunner.run([""])
+    end
+  end
+
+  describe "timeout path cleanup" do
+    # Regression / sanity: on timeout, the OS process must be killed and
+    # the GenServer stopped — no zombies left behind.
+    test "timeout returns :timeout and cleans up" do
+      start_count = count_sleep_processes()
+
+      for _ <- 1..5 do
+        assert {:error, :timeout} =
+                 NetRunner.run(["sleep", "30"], timeout: 100)
+      end
+
+      # Give the shepherd + watcher a moment to reap
+      Process.sleep(300)
+
+      end_count = count_sleep_processes()
+      # Allow a tolerance for concurrent tests spawning sleeps
+      assert end_count <= start_count + 1,
+             "expected sleeps to be reaped; start=#{start_count} end=#{end_count}"
+    end
+  end
+
+  defp count_sleep_processes do
+    case System.cmd("pgrep", ["-x", "sleep"], stderr_to_stdout: true) do
+      {out, 0} -> out |> String.split("\n", trim: true) |> length()
+      _ -> 0
+    end
+  end
 end

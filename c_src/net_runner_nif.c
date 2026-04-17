@@ -38,13 +38,17 @@ static ErlNifResourceType *io_resource_type = NULL;
 static void io_resource_dtor(ErlNifEnv *env, void *obj) {
     (void)env;
     io_resource_t *res = (io_resource_t *)obj;
+    /* Close fd even if mutex construction failed — otherwise ENOMEM during
+     * nif_create_fd would leak the underlying FD. */
     if (res->lock) {
         enif_mutex_lock(res->lock);
-        if (!res->closed && res->fd >= 0) {
-            close(res->fd);
-            res->fd = -1;
-            res->closed = 1;
-        }
+    }
+    if (!res->closed && res->fd >= 0) {
+        close(res->fd);
+        res->fd = -1;
+        res->closed = 1;
+    }
+    if (res->lock) {
         enif_mutex_unlock(res->lock);
         enif_mutex_destroy(res->lock);
         res->lock = NULL;
@@ -55,29 +59,35 @@ static void io_resource_stop(ErlNifEnv *env, void *obj, ErlNifEvent event,
                              int is_direct_call) {
     (void)env;
     (void)obj;
-    (void)event;
     (void)is_direct_call;
-    /* enif_select stop callback - FD is being deselected */
+    /* BEAM guarantees no further use of this event by the NIF is in flight
+     * when this callback runs. Safe to close the underlying fd here. */
+    if ((int)event >= 0) {
+        close((int)event);
+    }
 }
 
 static void io_resource_down(ErlNifEnv *env, void *obj, ErlNifPid *pid,
                              ErlNifMonitor *mon) {
-    (void)env;
     (void)pid;
     (void)mon;
     io_resource_t *res = (io_resource_t *)obj;
-    /* Owner process died - close the FD */
+    int fd_to_stop = -1;
     if (res->lock) {
         enif_mutex_lock(res->lock);
         if (!res->closed && res->fd >= 0) {
-            enif_select(env, (ErlNifEvent)res->fd, ERL_NIF_SELECT_STOP,
-                        obj, NULL, enif_make_atom(env, "undefined"));
-            close(res->fd);
+            fd_to_stop = res->fd;
             res->fd = -1;
             res->closed = 1;
         }
         res->monitor_active = 0;
         enif_mutex_unlock(res->lock);
+    }
+    if (fd_to_stop >= 0) {
+        /* Hand fd off to the stop callback — it will close it after any
+         * in-flight enif_select completes. */
+        enif_select(env, (ErlNifEvent)fd_to_stop, ERL_NIF_SELECT_STOP,
+                    obj, NULL, enif_make_atom(env, "undefined"));
     }
 }
 
@@ -167,6 +177,13 @@ static ERL_NIF_TERM nif_create_fd(ErlNifEnv *env, int argc,
     res->owner = owner;
     res->monitor_active = 0;
 
+    if (!res->lock) {
+        /* Mutex allocation failed — release resource (dtor will close fd) */
+        enif_release_resource(res);
+        return enif_make_tuple2(env, atom_error,
+                                MAKE_ATOM(env, "mutex_failed"));
+    }
+
     /* Monitor the owner process */
     if (enif_monitor_process(env, res, &owner, &res->monitor) == 0) {
         res->monitor_active = 1;
@@ -199,42 +216,51 @@ static ERL_NIF_TERM nif_read(ErlNifEnv *env, int argc,
     }
     if (max_bytes > 1048576) max_bytes = 1048576; /* Cap at 1MB */
 
-    enif_mutex_lock(res->lock);
-    if (res->closed) {
-        enif_mutex_unlock(res->lock);
-        return enif_make_tuple2(env, atom_error, MAKE_ATOM(env, "closed"));
-    }
-    int fd = res->fd;
-    enif_mutex_unlock(res->lock);
-
     ErlNifBinary bin;
     if (!enif_alloc_binary(max_bytes, &bin)) {
         return enif_make_tuple2(env, atom_error, MAKE_ATOM(env, "alloc_failed"));
     }
 
+    /* Hold the lock across read() + enif_select so that a concurrent
+     * nif_close / down callback cannot close the fd mid-syscall. read() is
+     * non-blocking (O_NONBLOCK) so the lock is held only briefly. */
+    enif_mutex_lock(res->lock);
+    if (res->closed || res->fd < 0) {
+        enif_mutex_unlock(res->lock);
+        enif_release_binary(&bin);
+        return enif_make_tuple2(env, atom_error, MAKE_ATOM(env, "closed"));
+    }
+    int fd = res->fd;
+
     ssize_t n = read(fd, bin.data, bin.size);
+    int saved_errno = errno;
+
     if (n > 0) {
+        enif_mutex_unlock(res->lock);
         enif_realloc_binary(&bin, (size_t)n);
         return enif_make_tuple2(env, atom_ok, enif_make_binary(env, &bin));
-    } else if (n == 0) {
+    }
+    if (n == 0) {
+        enif_mutex_unlock(res->lock);
         enif_release_binary(&bin);
         return atom_eof;
-    } else {
-        enif_release_binary(&bin);
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            /* Register for select notification */
-            int sel_ret = enif_select(env, (ErlNifEvent)fd,
-                                      ERL_NIF_SELECT_READ, res, NULL,
-                                      atom_undefined);
-            if (sel_ret < 0) {
-                return enif_make_tuple2(env, atom_error,
-                                        MAKE_ATOM(env, "select_failed"));
-            }
-            return enif_make_tuple2(env, atom_error, atom_eagain);
-        }
-        return enif_make_tuple2(env, atom_error,
-                                MAKE_ATOM(env, errno_to_atom(errno)));
     }
+    if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
+        int sel_ret = enif_select(env, (ErlNifEvent)fd,
+                                  ERL_NIF_SELECT_READ, res, NULL,
+                                  atom_undefined);
+        enif_mutex_unlock(res->lock);
+        enif_release_binary(&bin);
+        if (sel_ret < 0) {
+            return enif_make_tuple2(env, atom_error,
+                                    MAKE_ATOM(env, "select_failed"));
+        }
+        return enif_make_tuple2(env, atom_error, atom_eagain);
+    }
+    enif_mutex_unlock(res->lock);
+    enif_release_binary(&bin);
+    return enif_make_tuple2(env, atom_error,
+                            MAKE_ATOM(env, errno_to_atom(saved_errno)));
 }
 
 /*
@@ -261,34 +287,39 @@ static ERL_NIF_TERM nif_write(ErlNifEnv *env, int argc,
         return enif_make_tuple2(env, atom_ok, enif_make_int(env, 0));
     }
 
+    /* Hold the lock across write() + enif_select so that a concurrent
+     * close cannot reap the fd mid-syscall. */
     enif_mutex_lock(res->lock);
-    if (res->closed) {
+    if (res->closed || res->fd < 0) {
         enif_mutex_unlock(res->lock);
         return enif_make_tuple2(env, atom_error, MAKE_ATOM(env, "closed"));
     }
     int fd = res->fd;
-    enif_mutex_unlock(res->lock);
 
     ssize_t n = write(fd, bin.data, bin.size);
+    int saved_errno = errno;
+
     if (n >= 0) {
+        enif_mutex_unlock(res->lock);
         return enif_make_tuple2(env, atom_ok, enif_make_int64(env, (int64_t)n));
-    } else {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            int sel_ret = enif_select(env, (ErlNifEvent)fd,
-                                      ERL_NIF_SELECT_WRITE, res, NULL,
-                                      atom_undefined);
-            if (sel_ret < 0) {
-                return enif_make_tuple2(env, atom_error,
-                                        MAKE_ATOM(env, "select_failed"));
-            }
-            return enif_make_tuple2(env, atom_error, atom_eagain);
-        }
-        if (errno == EPIPE) {
-            return enif_make_tuple2(env, atom_error, MAKE_ATOM(env, "epipe"));
-        }
-        return enif_make_tuple2(env, atom_error,
-                                MAKE_ATOM(env, errno_to_atom(errno)));
     }
+    if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
+        int sel_ret = enif_select(env, (ErlNifEvent)fd,
+                                  ERL_NIF_SELECT_WRITE, res, NULL,
+                                  atom_undefined);
+        enif_mutex_unlock(res->lock);
+        if (sel_ret < 0) {
+            return enif_make_tuple2(env, atom_error,
+                                    MAKE_ATOM(env, "select_failed"));
+        }
+        return enif_make_tuple2(env, atom_error, atom_eagain);
+    }
+    enif_mutex_unlock(res->lock);
+    if (saved_errno == EPIPE) {
+        return enif_make_tuple2(env, atom_error, MAKE_ATOM(env, "epipe"));
+    }
+    return enif_make_tuple2(env, atom_error,
+                            MAKE_ATOM(env, errno_to_atom(saved_errno)));
 }
 
 /*
@@ -315,27 +346,19 @@ static ERL_NIF_TERM nif_close(ErlNifEnv *env, int argc,
     res->closed = 1;
     res->fd = -1;
 
-    /* Deregister from enif_select before closing */
-    enif_select(env, (ErlNifEvent)fd, ERL_NIF_SELECT_STOP, res, NULL,
-                atom_undefined);
-
     if (res->monitor_active) {
         enif_demonitor_process(env, res, &res->monitor);
         res->monitor_active = 0;
     }
 
-    /* Close FD inside critical section to prevent TOCTOU race:
-     * a concurrent nif_read/nif_write on a dirty scheduler could copy the FD
-     * under lock then use it after we release the lock but before close(). */
-    int close_ret = close(fd);
-    int close_errno = errno;
-
     enif_mutex_unlock(res->lock);
 
-    if (close_ret != 0 && close_errno != EINTR) {
-        return enif_make_tuple2(env, atom_error,
-                                MAKE_ATOM(env, errno_to_atom(close_errno)));
-    }
+    /* Hand fd off to the stop callback — BEAM waits for any in-flight select
+     * registration to drain before calling stop, which then close()s the fd.
+     * Concurrent nif_read/nif_write serialize on res->lock; once they observe
+     * closed==1 they early-out without touching the fd. */
+    enif_select(env, (ErlNifEvent)fd, ERL_NIF_SELECT_STOP, res, NULL,
+                atom_undefined);
 
     return atom_ok;
 }

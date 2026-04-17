@@ -27,7 +27,13 @@ defmodule NetRunner.Stream do
   """
   def stream(cmd, args, opts) do
     input = Keyword.get(opts, :input, nil)
-    process_opts = Keyword.drop(opts, [:input])
+    # Pass the caller as :owner so the Process GenServer stops (and kills
+    # the OS process) if the stream consumer crashes before Stream.resource's
+    # after callback would otherwise run.
+    process_opts =
+      opts
+      |> Keyword.drop([:input])
+      |> Keyword.put_new(:owner, self())
 
     case Proc.start(cmd, args, process_opts) do
       {:ok, pid} ->

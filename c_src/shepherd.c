@@ -45,6 +45,28 @@
 /* Self-pipe for signal handling */
 static int signal_pipe[2] = {-1, -1};
 
+/*
+ * Async-signal-safe post-fork failure path. Between fork() and exec*(),
+ * POSIX allows only async-signal-safe functions, so we cannot call
+ * fprintf / strerror / malloc. This helper uses write(2) on a stack
+ * buffer only.
+ */
+static void child_fail(const char *tag, const char *detail) {
+    if (tag) {
+        size_t i = 0;
+        while (i < 64 && tag[i] != '\0') i++;
+        (void)!write(STDERR_FILENO, tag, i);
+        (void)!write(STDERR_FILENO, ": ", 2);
+    }
+    if (detail) {
+        size_t i = 0;
+        while (i < 256 && detail[i] != '\0') i++;
+        (void)!write(STDERR_FILENO, detail, i);
+    }
+    (void)!write(STDERR_FILENO, "\n", 1);
+    _exit(127);
+}
+
 static void sigchld_handler(int sig) {
     (void)sig;
     int saved_errno = errno;
@@ -75,7 +97,10 @@ static int send_fds(int uds_fd, int *fds, int nfds) {
 
     size_t cmsg_space = CMSG_SPACE((size_t)nfds * sizeof(int));
     char *cmsg_buf = calloc(1, cmsg_space);
-    if (!cmsg_buf) return -1;
+    if (!cmsg_buf) {
+        ERROR_LOG("send_fds: calloc(%zu) failed", cmsg_space);
+        return -1;
+    }
 
     struct msghdr msg = {0};
     msg.msg_iov = &iov;
@@ -85,6 +110,7 @@ static int send_fds(int uds_fd, int *fds, int nfds) {
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     if (!cmsg) {
+        ERROR_LOG("send_fds: CMSG_FIRSTHDR returned NULL");
         free(cmsg_buf);
         return -1;
     }
@@ -93,9 +119,18 @@ static int send_fds(int uds_fd, int *fds, int nfds) {
     cmsg->cmsg_len = CMSG_LEN((size_t)nfds * sizeof(int));
     memcpy(CMSG_DATA(cmsg), fds, (size_t)nfds * sizeof(int));
 
-    ssize_t ret = sendmsg(uds_fd, &msg, 0);
-    free(cmsg_buf);
-    return ret > 0 ? 0 : -1;
+    /* Retry on EINTR; treat anything other than a full 1-byte send as error. */
+    for (;;) {
+        ssize_t ret = sendmsg(uds_fd, &msg, 0);
+        if (ret == 1) {
+            free(cmsg_buf);
+            return 0;
+        }
+        if (ret < 0 && errno == EINTR) continue;
+        ERROR_LOG("sendmsg failed: ret=%zd errno=%s", ret, strerror(errno));
+        free(cmsg_buf);
+        return -1;
+    }
 }
 
 /*
@@ -175,12 +210,19 @@ static int cgroup_setup(pid_t child_pid) {
     char full_path[512];
     char procs_path[576];
 
-    /* Create cgroup directory */
-    snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s", cgroup_path);
+    int n = snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s",
+                     cgroup_path);
+    if (n < 0 || (size_t)n >= sizeof(full_path)) {
+        ERROR_LOG("cgroup path too long");
+        return -1;
+    }
     mkdir(full_path, 0755); /* ignore error if exists */
 
-    /* Move child to cgroup */
-    snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs", full_path);
+    n = snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs", full_path);
+    if (n < 0 || (size_t)n >= sizeof(procs_path)) {
+        ERROR_LOG("cgroup procs path too long");
+        return -1;
+    }
     FILE *f = fopen(procs_path, "w");
     if (!f) {
         ERROR_LOG("failed to open %s: %s", procs_path, strerror(errno));
@@ -197,21 +239,26 @@ static void cgroup_cleanup(void) {
     char full_path[512];
     char kill_path[576];
 
-    snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s", cgroup_path);
+    int n = snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s",
+                     cgroup_path);
+    if (n < 0 || (size_t)n >= sizeof(full_path)) return;
 
     /* Kill all processes in the cgroup via cgroup.kill (cgroup v2) */
-    snprintf(kill_path, sizeof(kill_path), "%s/cgroup.kill", full_path);
+    n = snprintf(kill_path, sizeof(kill_path), "%s/cgroup.kill", full_path);
+    if (n < 0 || (size_t)n >= sizeof(kill_path)) return;
     FILE *f = fopen(kill_path, "w");
     if (f) {
         fprintf(f, "1\n");
         fclose(f);
     }
 
-    /* Wait briefly for processes to die */
-    usleep(100000);
-
-    /* Remove cgroup directory */
-    rmdir(full_path);
+    /* Poll for rmdir success rather than a fixed sleep — the kernel needs
+     * a moment to reap the killed processes. Bail after ~1s (10 * 100ms). */
+    for (int i = 0; i < 10; i++) {
+        if (rmdir(full_path) == 0) return;
+        if (errno != EBUSY && errno != ENOTEMPTY) return; /* real error */
+        usleep(100000);
+    }
 }
 #else
 static int cgroup_setup(pid_t child_pid) {
@@ -250,17 +297,40 @@ static void kill_child(pid_t child_pid) {
 
     /* Escalate to SIGKILL the whole process group */
     kill(-child_pid, SIGKILL);
-    waitpid(child_pid, NULL, 0);
+
+    /* Bounded WNOHANG reap loop — avoid hanging forever if the child is
+     * stuck in uninterruptible kernel sleep (D-state). After the bound
+     * elapses we return anyway; cgroup cleanup + the kernel eventually
+     * reap. */
+    int sigkill_iters = 30; /* ~3s total at 100ms per iteration */
+    for (int i = 0; i < sigkill_iters; i++) {
+        pid_t ret = waitpid(child_pid, NULL, WNOHANG);
+        if (ret > 0 || (ret < 0 && errno == ECHILD)) break;
+        usleep(100000);
+    }
 
     /* Cleanup cgroup (kills any remaining processes, removes dir) */
     cgroup_cleanup();
 }
 
 /*
- * Handle a command received from BEAM over UDS.
+ * Length of a single framed command given its opcode. Returns 0 if the
+ * opcode is unknown (in which case the parser will skip one byte).
+ */
+static size_t command_length(uint8_t opcode) {
+    switch (opcode) {
+    case CMD_KILL:         return 2;
+    case CMD_CLOSE_STDIN:  return 1;
+    case CMD_SET_WINSIZE:  return 5;
+    default:               return 0;
+    }
+}
+
+/*
+ * Handle a single command frame.
  */
 static void handle_command(int uds_fd, pid_t child_pid, int stdin_w,
-                           uint8_t *buf, ssize_t len) {
+                           uint8_t *buf, size_t len) {
     (void)uds_fd;
     if (len < 1) return;
 
@@ -301,6 +371,36 @@ static void handle_command(int uds_fd, pid_t child_pid, int stdin_w,
 }
 
 /*
+ * Parse and dispatch all framed commands present in buf. Returns the number
+ * of bytes consumed (may be less than len if a tail command is truncated).
+ */
+static size_t handle_commands(int uds_fd, pid_t child_pid, int *stdin_w,
+                              uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        size_t clen = command_length(buf[off]);
+        if (clen == 0) {
+            /* Unknown opcode: skip one byte to make progress rather than
+             * stalling the parser on bad input. */
+            DEBUG_LOG("unknown command opcode 0x%02x, skipping", buf[off]);
+            off += 1;
+            continue;
+        }
+        if (off + clen > len) {
+            /* Partial tail — caller must carry this over to the next read. */
+            break;
+        }
+        uint8_t op = buf[off];
+        handle_command(uds_fd, child_pid, *stdin_w, &buf[off], clen);
+        if (op == CMD_CLOSE_STDIN) {
+            *stdin_w = -1;
+        }
+        off += clen;
+    }
+    return off;
+}
+
+/*
  * Main event loop using poll().
  *
  * Watches:
@@ -311,6 +411,11 @@ static int event_loop(int uds_fd, pid_t child_pid, int stdin_w) {
     struct pollfd fds[2];
     int child_status = -1;
     int child_exited = 0;
+
+    /* Carry-over buffer for partially-framed commands across reads. Max
+     * incoming frame is CMD_SET_WINSIZE (5 bytes); keep a little slack. */
+    uint8_t cbuf[64];
+    size_t cbuf_used = 0;
 
     fds[0].fd = uds_fd;
     fds[0].events = POLLIN;
@@ -336,17 +441,23 @@ static int event_loop(int uds_fd, pid_t child_pid, int stdin_w) {
         }
 
         if (fds[0].revents & POLLIN) {
-            uint8_t buf[16];
-            ssize_t n = read(uds_fd, buf, sizeof(buf));
+            ssize_t n = read(uds_fd, cbuf + cbuf_used, sizeof(cbuf) - cbuf_used);
             if (n > 0) {
-                handle_command(uds_fd, child_pid, stdin_w, buf, n);
-                /* If CMD_CLOSE_STDIN was handled, mark stdin as closed */
-                if (buf[0] == CMD_CLOSE_STDIN) {
-                    stdin_w = -1;
+                cbuf_used += (size_t)n;
+                size_t consumed = handle_commands(uds_fd, child_pid, &stdin_w,
+                                                  cbuf, cbuf_used);
+                if (consumed > 0 && consumed < cbuf_used) {
+                    memmove(cbuf, cbuf + consumed, cbuf_used - consumed);
                 }
+                cbuf_used -= consumed;
             } else if (n == 0) {
                 /* BEAM closed the socket */
                 DEBUG_LOG("BEAM closed UDS, killing child %d", child_pid);
+                kill_child(child_pid);
+                return -1;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK &&
+                       errno != EINTR) {
+                ERROR_LOG("read(uds) failed: %s", strerror(errno));
                 kill_child(child_pid);
                 return -1;
             }
@@ -358,10 +469,16 @@ static int event_loop(int uds_fd, pid_t child_pid, int stdin_w) {
             char drain[64];
             while (read(signal_pipe[0], drain, sizeof(drain)) > 0) {}
 
-            /* Reap child */
+            /* Reap any and all children that have exited. SIGCHLD is
+             * coalesced by the kernel — multiple pending exits can deliver
+             * as a single SIGCHLD. Loop until no more reapable children
+             * remain. We only flip child_exited when the managed child is
+             * reaped; other reapees (should be none today, future-proof)
+             * are still cleaned up. */
             int status;
-            pid_t ret_pid = waitpid(child_pid, &status, WNOHANG);
-            if (ret_pid > 0) {
+            pid_t ret_pid;
+            while ((ret_pid = waitpid(-1, &status, WNOHANG)) > 0) {
+                if (ret_pid != child_pid) continue;
                 child_exited = 1;
                 if (WIFEXITED(status)) {
                     child_status = WEXITSTATUS(status);
@@ -468,6 +585,12 @@ int main(int argc, char *argv[]) {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
+    if (strlen(uds_path) >= sizeof(addr.sun_path)) {
+        fprintf(stderr, "error: uds_path too long (max %zu bytes)\n",
+                sizeof(addr.sun_path) - 1);
+        close(uds_fd);
+        return 1;
+    }
     strncpy(addr.sun_path, uds_path, sizeof(addr.sun_path) - 1);
 
     if (connect(uds_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
@@ -506,27 +629,37 @@ int main(int argc, char *argv[]) {
             close(signal_pipe[1]);
             close(master_fd);
 
-            /* Create new session and set controlling terminal */
-            setsid();
-            ioctl(slave_fd, TIOCSCTTY, 0);
+            /* Create new session (required before acquiring controlling tty) */
+            if (setsid() == (pid_t)-1) child_fail("setsid", NULL);
+            if (ioctl(slave_fd, TIOCSCTTY, 0) != 0) child_fail("TIOCSCTTY", NULL);
 
-            dup2(slave_fd, STDIN_FILENO);
-            dup2(slave_fd, STDOUT_FILENO);
-            dup2(slave_fd, STDERR_FILENO);
+            if (dup2(slave_fd, STDIN_FILENO)  != STDIN_FILENO ||
+                dup2(slave_fd, STDOUT_FILENO) != STDOUT_FILENO ||
+                dup2(slave_fd, STDERR_FILENO) != STDERR_FILENO) {
+                child_fail("dup2", NULL);
+            }
             if (slave_fd > STDERR_FILENO) close(slave_fd);
 
             setpgid(0, 0);
             execvp(cmd, cmd_args);
-            fprintf(stderr, "execvp failed: %s: %s\n", cmd, strerror(errno));
-            _exit(127);
+            child_fail("execvp", cmd);
         }
 
         /* === Shepherd (PTY) === */
         close(slave_fd);
         pty_master_fd = master_fd;
+        set_cloexec(master_fd);
 
-        /* Move child to cgroup (Linux only, no-op elsewhere) */
-        cgroup_setup(child_pid);
+        /* Move child to cgroup (Linux only, no-op elsewhere). If the user
+         * requested a cgroup path and setup failed, isolation is not
+         * available — treat as fatal. */
+        if (cgroup_setup(child_pid) != 0) {
+            send_error(uds_fd, "cgroup setup failed");
+            kill_child(child_pid);
+            close(master_fd);
+            close(uds_fd);
+            return 1;
+        }
 
         /* Send single master FD to BEAM (used for both read and write) */
         int fds_to_send[1] = {master_fd};
@@ -611,9 +744,11 @@ int main(int argc, char *argv[]) {
             close(stdout_pipe[0]);
             close(stderr_pipe[0]);
 
-            dup2(stdin_pipe[0], STDIN_FILENO);
-            dup2(stdout_pipe[1], STDOUT_FILENO);
-            dup2(stderr_pipe[1], STDERR_FILENO);
+            if (dup2(stdin_pipe[0],  STDIN_FILENO)  != STDIN_FILENO ||
+                dup2(stdout_pipe[1], STDOUT_FILENO) != STDOUT_FILENO ||
+                dup2(stderr_pipe[1], STDERR_FILENO) != STDERR_FILENO) {
+                child_fail("dup2", NULL);
+            }
 
             close(stdin_pipe[0]);
             close(stdout_pipe[1]);
@@ -621,8 +756,7 @@ int main(int argc, char *argv[]) {
 
             setpgid(0, 0);
             execvp(cmd, cmd_args);
-            fprintf(stderr, "execvp failed: %s: %s\n", cmd, strerror(errno));
-            _exit(127);
+            child_fail("execvp", cmd);
         }
 
         /* === Shepherd (pipe) === */
@@ -630,8 +764,18 @@ int main(int argc, char *argv[]) {
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
 
-        /* Move child to cgroup (Linux only, no-op elsewhere) */
-        cgroup_setup(child_pid);
+        /* Move child to cgroup (Linux only, no-op elsewhere). If the user
+         * requested a cgroup path and setup failed, isolation is not
+         * available — treat as fatal. */
+        if (cgroup_setup(child_pid) != 0) {
+            send_error(uds_fd, "cgroup setup failed");
+            kill_child(child_pid);
+            close(stdin_pipe[1]);
+            close(stdout_pipe[0]);
+            close(stderr_pipe[0]);
+            close(uds_fd);
+            return 1;
+        }
 
         int fds_to_send[3] = {stdin_pipe[1], stdout_pipe[0], stderr_pipe[0]};
         if (send_fds(uds_fd, fds_to_send, 3) != 0) {

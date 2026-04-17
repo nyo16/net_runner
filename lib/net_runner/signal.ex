@@ -3,16 +3,18 @@ defmodule NetRunner.Signal do
 
   alias NetRunner.Process.Nif
 
-  @signals ~w(sigterm sigkill sigint sighup sigusr1 sigusr2 sigstop sigcont sigquit sigpipe)a
-
   @doc """
   Resolves a signal atom to its platform-specific number.
-  """
-  def resolve(signal) when signal in @signals do
-    Nif.nif_signal_number(signal)
-  end
 
-  def resolve(signal) when is_integer(signal), do: {:ok, signal}
+  The canonical list of supported signal atoms lives in the NIF
+  (`nif_signal_number`); calling it directly keeps Elixir and C from
+  drifting out of sync.
+  """
+  def resolve(signal) when is_atom(signal), do: Nif.nif_signal_number(signal)
+
+  def resolve(signal) when is_integer(signal) and signal >= 1 and signal <= 31,
+    do: {:ok, signal}
+
   def resolve(_signal), do: {:error, :unknown_signal}
 
   @doc """

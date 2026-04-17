@@ -25,7 +25,8 @@ defmodule NetRunner.Process.Exec do
     uds_path = uds_socket_path()
     pty_mode = Keyword.get(opts, :pty, false)
 
-    with :ok <- validate_cgroup_path(Keyword.get(opts, :cgroup_path, nil)),
+    with :ok <- validate_cmd_and_args(cmd, args),
+         :ok <- validate_cgroup_path(Keyword.get(opts, :cgroup_path, nil)),
          {:ok, listen_socket} <- create_uds_listener(uds_path),
          shepherd_port <- open_shepherd(uds_path, cmd, args, opts),
          {:ok, conn_socket} <- accept_connection(listen_socket),
@@ -34,6 +35,30 @@ defmodule NetRunner.Process.Exec do
       setup_after_connection(conn_socket, shepherd_port, owner, cmd, args, opts, pty_mode)
     else
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # Reject NUL bytes in cmd/args early; passing them through Port.open's
+  # args: option is undefined and could truncate a cmd string on the C side.
+  defp validate_cmd_and_args(cmd, args) do
+    cond do
+      not is_binary(cmd) ->
+        {:error, {:invalid_cmd, "must be a binary"}}
+
+      cmd == "" ->
+        {:error, {:invalid_cmd, "must not be empty"}}
+
+      String.contains?(cmd, <<0>>) ->
+        {:error, {:invalid_cmd, "must not contain NUL bytes"}}
+
+      not is_list(args) ->
+        {:error, {:invalid_args, "must be a list of binaries"}}
+
+      Enum.any?(args, fn a -> not is_binary(a) or String.contains?(a, <<0>>) end) ->
+        {:error, {:invalid_args, "each arg must be a binary without NUL bytes"}}
+
+      true ->
+        :ok
     end
   end
 
@@ -151,8 +176,12 @@ defmodule NetRunner.Process.Exec do
 
   defp cleanup_listener(listen_socket, path) do
     :socket.close(listen_socket)
-    File.rm(path)
-    :ok
+
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, {:uds_path_cleanup_failed, reason}}
+    end
   end
 
   @doc """
@@ -266,32 +295,35 @@ defmodule NetRunner.Process.Exec do
 
   @doc """
   Reads a protocol message from the UDS. Used for ongoing communication.
+
+  Structured as: read the 1-byte opcode, then the opcode-specific tail.
+  Avoids the peek-then-recv race where :peek sees the first byte but
+  the recv of the full frame times out because the tail is a moment
+  behind the kernel deliver queue.
   """
   def read_uds_message(socket) do
-    case :socket.recv(socket, 0, [:peek], 0) do
-      {:ok, <<@msg_child_exited, _::binary>>} ->
-        case :socket.recv(socket, 5, [], 100) do
-          {:ok, <<@msg_child_exited, status::big-unsigned-32>>} ->
-            {:child_exited, status}
+    case :socket.recv(socket, 1, [], 500) do
+      {:ok, <<@msg_child_exited>>} -> recv_child_exited(socket)
+      {:ok, <<@msg_error>>} -> recv_error_message(socket)
+      {:ok, _} -> {:error, :unknown_message}
+      {:error, :timeout} -> {:error, :no_message}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
-          other ->
-            {:error, {:unexpected, other}}
-        end
+  defp recv_child_exited(socket) do
+    case :socket.recv(socket, 4, [], 500) do
+      {:ok, <<status::big-unsigned-32>>} -> {:child_exited, status}
+      other -> {:error, {:unexpected, other}}
+    end
+  end
 
-      {:ok, <<@msg_error, _::binary>>} ->
-        case :socket.recv(socket, 0, [], 100) do
-          {:ok, <<@msg_error, len::big-unsigned-16, msg::binary-size(len)>>} ->
-            {:shepherd_error, msg}
-
-          other ->
-            {:error, {:unexpected, other}}
-        end
-
-      {:ok, _other} ->
-        {:error, :unknown_message}
-
-      {:error, reason} ->
-        {:error, reason}
+  defp recv_error_message(socket) do
+    with {:ok, <<len::big-unsigned-16>>} <- :socket.recv(socket, 2, [], 500),
+         {:ok, msg} <- :socket.recv(socket, len, [], 500) do
+      {:shepherd_error, msg}
+    else
+      other -> {:error, {:unexpected, other}}
     end
   end
 end

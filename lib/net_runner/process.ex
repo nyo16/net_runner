@@ -94,7 +94,16 @@ defmodule NetRunner.Process do
   def init({cmd, args, opts}) do
     case Exec.spawn_process(cmd, args, opts) do
       {:ok, state} ->
-        state = %{state | stats: Stats.new()}
+        # Optionally monitor an "owner" process (typically the stream
+        # consumer). If it dies before the OS process exits we kill the
+        # OS process and stop cleanly instead of leaking a GenServer.
+        owner_ref =
+          case Keyword.get(opts, :owner) do
+            pid when is_pid(pid) -> Process.monitor(pid)
+            _ -> nil
+          end
+
+        state = %{state | stats: Stats.new(), owner_ref: owner_ref}
         # Register with watcher for belt-and-suspenders cleanup
         NetRunner.Watcher.watch(self(), state.os_pid)
         # Start reading stderr in :consume mode
@@ -246,19 +255,69 @@ defmodule NetRunner.Process do
     {:noreply, state}
   end
 
+  # A parked caller (read/write) died — drop its entry silently instead of
+  # letting it linger until process exit. The owner case is handled first.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state)
+      when is_reference(ref) do
+    if ref == state.owner_ref do
+      on_owner_down(state)
+    else
+      case Operations.pop_by_monitor(state.operations, ref) do
+        {nil, _ops} ->
+          {:noreply, state}
+
+        {_op, ops} ->
+          {:noreply, %{state | operations: ops}}
+      end
+    end
+  end
+
+  # Initial stderr chunk from kick_stderr_read in init/1. Without this clause
+  # the data would be silently dropped by the catch-all below.
+  def handle_info({:stderr_data, data}, state) when is_binary(data) do
+    stats = Stats.record_read_stderr(state.stats, byte_size(data))
+    state = %{state | stderr_buffer: [data | state.stderr_buffer], stats: stats}
+    # Drain anything else buffered and re-arm enif_select on EAGAIN.
+    {:noreply, consume_stderr(state)}
+  end
+
   def handle_info(_msg, state) do
     {:noreply, state}
   end
 
+  defp on_owner_down(state) do
+    if state.os_pid do
+      case Signal.resolve(:sigkill) do
+        {:ok, sig_num} ->
+          send_shepherd_command(state, <<0x01, sig_num::8>>)
+          Nif.nif_kill(state.os_pid, sig_num)
+
+        _ ->
+          :ok
+      end
+    end
+
+    {:stop, :normal, state}
+  end
+
   @impl true
   def terminate(_reason, state) do
-    # Best-effort cleanup
+    # Best-effort cleanup. Order: close pipes (lets child see EOF), then
+    # UDS (shepherd detects POLLHUP, kills child), then the shepherd Port.
     if state.stdin, do: Pipe.close(state.stdin)
     if state.stdout, do: Pipe.close(state.stdout)
     if state.stderr, do: Pipe.close(state.stderr)
 
     if state.uds_socket do
       :socket.close(state.uds_socket)
+    end
+
+    if is_port(state.shepherd_port) do
+      try do
+        Port.close(state.shepherd_port)
+      catch
+        _, _ -> :ok
+      end
     end
 
     :ok
@@ -275,11 +334,22 @@ defmodule NetRunner.Process do
   end
 
   # Writes data in a loop: partial writes retry immediately until EAGAIN
-  # (which registers enif_select) or completion.
+  # (which registers enif_select) or completion. This keeps enif_select
+  # in charge of readiness notifications; any path that parks the caller
+  # without going through the NIF's EAGAIN path must not be taken here.
   defp write_loop(<<>>, _from, state), do: {:reply, :ok, state}
 
   defp write_loop(data, from, state) do
     case Pipe.write(state.stdin, data) do
+      {:ok, 0} ->
+        # write(2) can legally return 0 on a non-empty buffer. Avoid
+        # spinning by forcing another nif_write — if the kernel still
+        # can't make progress it will return EAGAIN and register select.
+        # In practice this branch is unreachable on pipes/sockets but
+        # guards against the dirty scheduler hang regardless.
+        Process.sleep(1)
+        write_loop(data, from, state)
+
       {:ok, bytes_written} ->
         stats = Stats.record_write(state.stats, bytes_written)
         state = %{state | stats: stats}
@@ -288,8 +358,6 @@ defmodule NetRunner.Process do
         if bytes_written >= total do
           {:reply, :ok, state}
         else
-          # Partial write — retry remainder immediately to either complete
-          # or hit EAGAIN (which registers enif_select for readiness notification)
           remaining = binary_part(data, bytes_written, total - bytes_written)
           write_loop(remaining, from, state)
         end
@@ -370,6 +438,11 @@ defmodule NetRunner.Process do
 
   defp retry_write_loop(ref, from, data, state) do
     case Pipe.write(state.stdin, data) do
+      {:ok, 0} ->
+        # Unreachable on pipes/sockets in practice; ops entry still valid
+        # with full data. A subsequent :ready_output will drive the retry.
+        state
+
       {:ok, bytes_written} ->
         stats = Stats.record_write(state.stats, bytes_written)
         state = %{state | stats: stats}
@@ -385,10 +458,8 @@ defmodule NetRunner.Process do
         end
 
       {:error, :eagain} ->
-        # Still parked, update data (enif_select already registered)
-        {_, ops} = Operations.pop(state.operations, ref)
-        {ops, _new_ref} = Operations.park(ops, :write, from, data)
-        %{state | operations: ops}
+        # Still parked, enif_select already re-registered
+        state
 
       {:error, _} = error ->
         GenServer.reply(from, error)
@@ -399,8 +470,10 @@ defmodule NetRunner.Process do
 
   defp kick_stderr_read(state) do
     if state.stderr do
-      # Do an initial read to get enif_select registered
-      case Pipe.read(state.stderr) do
+      # Do an initial read to get enif_select registered. If data is
+      # immediately available, hand it to handle_info/2 so the GenServer
+      # buffers it (can't update state from init/1 without reshaping it).
+      case Pipe.read(state.stderr, @default_read_size) do
         {:ok, data} ->
           send(self(), {:stderr_data, data})
 
