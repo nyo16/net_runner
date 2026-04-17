@@ -76,8 +76,16 @@ defmodule NetRunner do
     max_output_size = Keyword.get(opts, :max_output_size, nil)
     process_opts = Keyword.drop(opts, [:input, :timeout, :max_output_size])
 
-    {:ok, pid} = Proc.start(cmd, args, process_opts)
+    case Proc.start(cmd, args, process_opts) do
+      {:ok, pid} ->
+        run_with_pid(pid, input, timeout, max_output_size)
 
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp run_with_pid(pid, input, timeout, max_output_size) do
     task = Task.async(fn -> run_io(pid, input, max_output_size) end)
 
     effective_timeout = timeout || :infinity
