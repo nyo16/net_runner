@@ -16,7 +16,21 @@ ERL_INTERFACE_LIB_DIR ?= $(shell erl -noshell -eval "io:format(\"~ts\", [code:li
 UNAME_S := $(shell uname -s)
 
 CC ?= cc
-CFLAGS_BASE = -O2 -Wall -Wextra -Werror -std=c99 -fstack-protector-strong -D_FORTIFY_SOURCE=2
+
+# Opt-in sanitizer build. Usage:
+#   make clean && SANITIZE=1 make all
+#   mix test (from Elixir — the NIF and shepherd are rebuilt with ASan/UBSan)
+#
+# Requires LD_PRELOAD of libasan at runtime on Linux when the BEAM isn't
+# built with sanitizers; see ci.yml for the invocation.
+ifeq ($(SANITIZE),1)
+	# _FORTIFY_SOURCE is incompatible with ASan (ASan already intercepts
+	# memcpy/etc.). Disable optimisation to -O1 and skip FORTIFY.
+	SAN_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer -g
+	CFLAGS_BASE = -O1 -Wall -Wextra -Werror -std=c99 -fstack-protector-strong $(SAN_FLAGS)
+else
+	CFLAGS_BASE = -O2 -Wall -Wextra -Werror -std=c99 -fstack-protector-strong -D_FORTIFY_SOURCE=2
+endif
 
 ifeq ($(UNAME_S),Darwin)
 	# macOS needs _DARWIN_C_SOURCE for SCM_RIGHTS, CMSG_SPACE, etc.
@@ -29,6 +43,11 @@ else
 	NIF_LDFLAGS = -shared -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 	SHEPHERD_LDFLAGS = -fPIE -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 	NIF_EXT = .so
+endif
+
+ifeq ($(SANITIZE),1)
+	NIF_LDFLAGS += $(SAN_FLAGS)
+	SHEPHERD_LDFLAGS += $(SAN_FLAGS)
 endif
 
 NIF_CFLAGS = $(CFLAGS) -I$(ERTS_INCLUDE_DIR) -I$(C_SRC_DIR) -fPIC
@@ -45,9 +64,14 @@ NIF_OBJ = $(C_SRC_DIR)/net_runner_nif.o
 
 HEADERS = $(C_SRC_DIR)/protocol.h $(C_SRC_DIR)/utils.h
 
-.PHONY: all clean
+.PHONY: all clean asan
 
 all: $(PRIV_DIR) $(SHEPHERD) $(NIF_LIB)
+
+# Convenience: force a sanitizer rebuild. Same as SANITIZE=1 make clean all.
+asan:
+	$(MAKE) clean
+	$(MAKE) SANITIZE=1 all
 
 $(PRIV_DIR):
 	mkdir -p $(PRIV_DIR)
