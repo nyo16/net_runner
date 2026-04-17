@@ -259,18 +259,16 @@ defmodule NetRunner.Process do
   # letting it linger until process exit. The owner case is handled first.
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state)
       when is_reference(ref) do
-    cond do
-      ref == state.owner_ref ->
-        on_owner_down(state)
+    if ref == state.owner_ref do
+      on_owner_down(state)
+    else
+      case Operations.pop_by_monitor(state.operations, ref) do
+        {nil, _ops} ->
+          {:noreply, state}
 
-      true ->
-        case Operations.pop_by_monitor(state.operations, ref) do
-          {nil, _ops} ->
-            {:noreply, state}
-
-          {_op, ops} ->
-            {:noreply, %{state | operations: ops}}
-        end
+        {_op, ops} ->
+          {:noreply, %{state | operations: ops}}
+      end
     end
   end
 
