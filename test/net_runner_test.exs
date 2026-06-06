@@ -82,25 +82,25 @@ defmodule NetRunnerTest do
     # Regression / sanity: on timeout, the OS process must be killed and
     # the GenServer stopped — no zombies left behind.
     test "timeout returns :timeout and cleans up" do
-      start_count = count_sleep_processes()
+      # Use a unique sleep duration so the count is isolated from other
+      # async tests that spawn `sleep` — pgrep -f matches the full argv.
+      marker = "47"
 
       for _ <- 1..5 do
         assert {:error, :timeout} =
-                 NetRunner.run(["sleep", "30"], timeout: 100)
+                 NetRunner.run(["sleep", marker], timeout: 100)
       end
 
       # Give the shepherd + watcher a moment to reap
       Process.sleep(300)
 
-      end_count = count_sleep_processes()
-      # Allow a tolerance for concurrent tests spawning sleeps
-      assert end_count <= start_count + 1,
-             "expected sleeps to be reaped; start=#{start_count} end=#{end_count}"
+      assert count_sleep_processes(marker) == 0,
+             "expected all `sleep #{marker}` processes to be reaped"
     end
   end
 
-  defp count_sleep_processes do
-    case System.cmd("pgrep", ["-x", "sleep"], stderr_to_stdout: true) do
+  defp count_sleep_processes(marker) do
+    case System.cmd("pgrep", ["-f", "sleep #{marker}"], stderr_to_stdout: true) do
       {out, 0} -> out |> String.split("\n", trim: true) |> length()
       _ -> 0
     end

@@ -38,8 +38,8 @@ defmodule NetRunner.SignalTest do
     end
 
     test "raises for invalid signals" do
-      assert_raise ArgumentError, fn -> Signal.resolve!(:bogus) end
-      assert_raise ArgumentError, fn -> Signal.resolve!(99) end
+      assert_raise ArgumentError, ~r/unknown signal/, fn -> Signal.resolve!(:bogus) end
+      assert_raise ArgumentError, ~r/unknown signal/, fn -> Signal.resolve!(99) end
     end
   end
 end

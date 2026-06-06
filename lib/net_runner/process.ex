@@ -337,19 +337,12 @@ defmodule NetRunner.Process do
   # (which registers enif_select) or completion. This keeps enif_select
   # in charge of readiness notifications; any path that parks the caller
   # without going through the NIF's EAGAIN path must not be taken here.
+  # A zero-byte write on a non-empty buffer is mapped to :eagain inside the
+  # NIF (which registers select), so it can never reach this loop.
   defp write_loop(<<>>, _from, state), do: {:reply, :ok, state}
 
   defp write_loop(data, from, state) do
     case Pipe.write(state.stdin, data) do
-      {:ok, 0} ->
-        # write(2) can legally return 0 on a non-empty buffer. Avoid
-        # spinning by forcing another nif_write — if the kernel still
-        # can't make progress it will return EAGAIN and register select.
-        # In practice this branch is unreachable on pipes/sockets but
-        # guards against the dirty scheduler hang regardless.
-        Process.sleep(1)
-        write_loop(data, from, state)
-
       {:ok, bytes_written} ->
         stats = Stats.record_write(state.stats, bytes_written)
         state = %{state | stats: stats}
@@ -438,11 +431,6 @@ defmodule NetRunner.Process do
 
   defp retry_write_loop(ref, from, data, state) do
     case Pipe.write(state.stdin, data) do
-      {:ok, 0} ->
-        # Unreachable on pipes/sockets in practice; ops entry still valid
-        # with full data. A subsequent :ready_output will drive the retry.
-        state
-
       {:ok, bytes_written} ->
         stats = Stats.record_write(state.stats, bytes_written)
         state = %{state | stats: stats}
@@ -551,6 +539,12 @@ defmodule NetRunner.Process do
     case Exec.read_uds_message(state.uds_socket) do
       {:child_exited, status} ->
         finish_exit(state, status)
+
+      {:shepherd_error, msg} ->
+        require Logger
+
+        Logger.warning("[NetRunner] shepherd reported error: #{inspect(msg)}")
+        state
 
       _ ->
         state

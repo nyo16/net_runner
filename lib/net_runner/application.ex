@@ -6,7 +6,8 @@ defmodule NetRunner.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      {DynamicSupervisor, name: NetRunner.WatcherSupervisor, strategy: :one_for_one}
+      {DynamicSupervisor, name: NetRunner.WatcherSupervisor, strategy: :one_for_one},
+      {Task.Supervisor, name: NetRunner.TaskSupervisor}
     ]
 
     opts = [strategy: :one_for_one, name: NetRunner.Supervisor]

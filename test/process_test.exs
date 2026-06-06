@@ -182,12 +182,33 @@ defmodule NetRunner.ProcessTest do
 
       _ = consumer
 
-      # Wait for the Process GenServer to detect the DOWN, SIGKILL the
-      # child, reap it, and stop.
-      Process.sleep(500)
+      # Poll until the Process GenServer detects the DOWN, SIGKILLs the
+      # child, reaps it, and stops. Avoids a fixed sleep that flakes on
+      # loaded CI runners.
+      assert eventually(fn ->
+               not Process.alive?(proc_pid) and not os_pid_alive?(os_pid)
+             end),
+             "Process GenServer should have stopped and OS process should be killed"
+    end
+  end
 
-      refute Process.alive?(proc_pid), "Process GenServer should have stopped"
-      refute os_pid_alive?(os_pid), "OS process should be killed"
+  # Polls `fun` every 50 ms until it returns true or `timeout` elapses.
+  defp eventually(fun, timeout \\ 3_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_eventually(fun, deadline)
+  end
+
+  defp do_eventually(fun, deadline) do
+    cond do
+      fun.() ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        false
+
+      true ->
+        Process.sleep(50)
+        do_eventually(fun, deadline)
     end
   end
 

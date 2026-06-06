@@ -36,7 +36,7 @@ defmodule NetRunner.Process.State do
           owner_ref: reference() | nil,
           operations: Operations.t(),
           awaiting_exit: [GenServer.from()],
-          stderr_mode: :consume | :redirect | :disabled,
+          stderr_mode: :consume | :disabled,
           stderr_buffer: [binary()],
           status: status()
         }

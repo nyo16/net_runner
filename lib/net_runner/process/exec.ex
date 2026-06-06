@@ -25,17 +25,36 @@ defmodule NetRunner.Process.Exec do
     uds_path = uds_socket_path()
     pty_mode = Keyword.get(opts, :pty, false)
 
-    with :ok <- validate_cmd_and_args(cmd, args),
-         :ok <- validate_cgroup_path(Keyword.get(opts, :cgroup_path, nil)),
-         {:ok, listen_socket} <- create_uds_listener(uds_path),
-         shepherd_port <- open_shepherd(uds_path, cmd, args, opts),
-         {:ok, conn_socket} <- accept_connection(listen_socket),
-         :ok <- cleanup_listener(listen_socket, uds_path) do
-      # conn_socket and shepherd_port are now live — clean up on any failure
-      setup_after_connection(conn_socket, shepherd_port, owner, cmd, args, opts, pty_mode)
-    else
-      {:error, reason} -> {:error, reason}
+    result =
+      with :ok <- validate_cmd_and_args(cmd, args),
+           :ok <- validate_stderr_mode(Keyword.get(opts, :stderr, :consume), pty_mode),
+           :ok <- validate_cgroup_path(Keyword.get(opts, :cgroup_path, nil)),
+           {:ok, listen_socket} <- create_uds_listener(uds_path),
+           shepherd_port <- open_shepherd(uds_path, cmd, args, opts),
+           {:ok, conn_socket} <- accept_connection(listen_socket),
+           :ok <- cleanup_listener(listen_socket, uds_path) do
+        # conn_socket and shepherd_port are now live — clean up on any failure
+        setup_after_connection(conn_socket, shepherd_port, owner, cmd, args, opts, pty_mode)
+      end
+
+    # On the happy path cleanup_listener removed the socket file and its
+    # per-spawn dir. On any failure (validation, accept timeout, ...) the dir
+    # may still exist — remove it so spawns don't leak empty 0700 dirs.
+    case result do
+      {:ok, _} = ok -> ok
+      {:error, _} = err -> cleanup_uds_dir_passthrough(uds_path, err)
     end
+  end
+
+  defp cleanup_uds_dir(uds_path) do
+    _ = File.rm(uds_path)
+    _ = File.rmdir(Path.dirname(uds_path))
+    :ok
+  end
+
+  defp cleanup_uds_dir_passthrough(uds_path, err) do
+    cleanup_uds_dir(uds_path)
+    err
   end
 
   # Reject NUL bytes in cmd/args early; passing them through Port.open's
@@ -101,6 +120,16 @@ defmodule NetRunner.Process.Exec do
     _, _ -> :ok
   end
 
+  # In PTY mode stderr is folded into the bidirectional master FD, so the
+  # :stderr option is ignored. In pipe mode only :consume (drained internally
+  # to avoid blocking the child on a full pipe) and :disabled are supported.
+  defp validate_stderr_mode(_mode, true), do: :ok
+  defp validate_stderr_mode(mode, false) when mode in [:consume, :disabled], do: :ok
+
+  defp validate_stderr_mode(mode, false) do
+    {:error, {:invalid_stderr, "must be :consume or :disabled, got: #{inspect(mode)}"}}
+  end
+
   defp validate_cgroup_path(nil), do: :ok
 
   defp validate_cgroup_path(path) do
@@ -118,9 +147,18 @@ defmodule NetRunner.Process.Exec do
     end
   end
 
+  # Place the socket inside a per-spawn 0700 directory so only the current
+  # user can traverse to it. Without this the socket lives directly in the
+  # world-traversable tmp dir, and a same-host attacker who wins the accept
+  # race against the real shepherd would receive the child's pipe FDs via
+  # SCM_RIGHTS. The 0700 dir reduces the threat to same-uid processes (which
+  # are already inside our trust domain).
   defp uds_socket_path do
     random = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
-    Path.join(System.tmp_dir!(), "net_runner_#{random}.sock")
+    dir = Path.join(System.tmp_dir!(), "net_runner_#{random}")
+    File.mkdir_p!(dir)
+    File.chmod!(dir, 0o700)
+    Path.join(dir, "shepherd.sock")
   end
 
   defp create_uds_listener(path) do
@@ -178,9 +216,14 @@ defmodule NetRunner.Process.Exec do
     :socket.close(listen_socket)
 
     case File.rm(path) do
-      :ok -> :ok
-      {:error, :enoent} -> :ok
-      {:error, reason} -> {:error, {:uds_path_cleanup_failed, reason}}
+      result when result in [:ok, {:error, :enoent}] ->
+        # Best-effort removal of the per-spawn 0700 dir created in
+        # uds_socket_path/0; it is empty once the socket file is gone.
+        _ = File.rmdir(Path.dirname(path))
+        :ok
+
+      {:error, reason} ->
+        {:error, {:uds_path_cleanup_failed, reason}}
     end
   end
 
