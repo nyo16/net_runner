@@ -55,16 +55,19 @@ defmodule NetRunner.Command do
       %NetRunner.Command{executable: "curl", args: ["-s"], opts: [timeout: 10_000]}
   """
   @spec new(String.t(), [String.t()], keyword()) :: t()
-  def new(executable, args \\ [], opts \\ []) do
-    unless is_binary(executable) do
-      raise ArgumentError, "executable must be a string, got: #{inspect(executable)}"
-    end
+  def new(executable, args \\ [], opts \\ [])
 
-    unless is_list(args) do
-      raise ArgumentError, "args must be a list, got: #{inspect(args)}"
-    end
-
+  def new(executable, args, opts)
+      when is_binary(executable) and is_list(args) and is_list(opts) do
     %__MODULE__{executable: executable, args: args, opts: opts}
+  end
+
+  def new(executable, _args, _opts) when not is_binary(executable) do
+    raise ArgumentError, "executable must be a string, got: #{inspect(executable)}"
+  end
+
+  def new(_executable, args, _opts) when not is_list(args) do
+    raise ArgumentError, "args must be a list, got: #{inspect(args)}"
   end
 
   @doc """

@@ -33,8 +33,8 @@ defmodule NetRunner do
 
   ## Options
 
-    * `:stderr` - `:consume` (default, captured internally), `:redirect` (merged with stdout),
-      or `:disabled`
+    * `:stderr` - `:consume` (default, drained internally so the child never
+      blocks on a full stderr pipe) or `:disabled`
     * `:input` - data to write to stdin (binary or enumerable)
     * `:timeout` - maximum wall-clock time in milliseconds. Sends SIGTERM then SIGKILL
       on timeout. Returns `{:error, :timeout}` instead of `{output, exit_status}`.
@@ -119,7 +119,7 @@ defmodule NetRunner do
   ## Options
 
     * `:input` - data to write to stdin (binary, list, or Stream)
-    * `:stderr` - `:consume` (default), `:redirect`, or `:disabled`
+    * `:stderr` - `:consume` (default) or `:disabled`
 
   ## Examples
 

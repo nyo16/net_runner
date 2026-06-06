@@ -44,6 +44,23 @@ defmodule NetRunner.DaemonTest do
       GenServer.stop(daemon)
     end
 
+    test "a crashing on_output callback does not bring the Daemon down" do
+      # The drain task runs under Task.Supervisor.async_nolink, so an
+      # uncaught error in the callback must not take the Daemon with it.
+      {:ok, daemon} =
+        Daemon.start_link(cmd: "cat", args: [], on_output: fn _ -> raise "boom" end)
+
+      assert :ok = Daemon.write(daemon, "trigger\n")
+
+      # Give the drain task time to read the chunk and raise.
+      Process.sleep(200)
+
+      assert Process.alive?(daemon)
+      assert Daemon.alive?(daemon)
+
+      GenServer.stop(daemon)
+    end
+
     test "daemon cleans up on crash" do
       Process.flag(:trap_exit, true)
       {:ok, daemon} = Daemon.start_link(cmd: "sleep", args: ["100"])

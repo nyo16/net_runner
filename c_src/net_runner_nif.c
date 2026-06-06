@@ -299,11 +299,14 @@ static ERL_NIF_TERM nif_write(ErlNifEnv *env, int argc,
     ssize_t n = write(fd, bin.data, bin.size);
     int saved_errno = errno;
 
-    if (n >= 0) {
+    if (n > 0) {
         enif_mutex_unlock(res->lock);
         return enif_make_tuple2(env, atom_ok, enif_make_int64(env, (int64_t)n));
     }
-    if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
+    /* write() returning 0 on a non-empty buffer (bin.size > 0 here) is rare
+     * but legal. Treat it like EAGAIN: register for write readiness and let
+     * the caller re-arm via :ready_output, rather than spinning. */
+    if (n == 0 || saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
         int sel_ret = enif_select(env, (ErlNifEvent)fd,
                                   ERL_NIF_SELECT_WRITE, res, NULL,
                                   atom_undefined);
@@ -403,6 +406,11 @@ static ERL_NIF_TERM nif_kill(ErlNifEnv *env, int argc,
 
     int sig;
     if (!enif_get_int(env, argv[1], &sig)) {
+        return enif_make_badarg(env);
+    }
+    /* Reject signals outside the POSIX range, mirroring shepherd.c's
+     * CMD_KILL validation. Bounds the blast radius of a stray nif_kill. */
+    if (sig < 1 || sig > 31) {
         return enif_make_badarg(env);
     }
 

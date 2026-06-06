@@ -118,8 +118,12 @@ defmodule NetRunner.Daemon do
   defp start_drain(proc, pipe, on_output) do
     reader = if pipe == :stdout, do: &Proc.read/1, else: &Proc.read_stderr/1
 
+    # async_nolink (not async): the drain task is unlinked from the Daemon,
+    # so a task crash cannot take the Daemon down. Completion arrives as
+    # {ref, result} and abnormal exit as {:DOWN, ref, ...}, both handled in
+    # handle_info/2.
     task =
-      Task.async(fn ->
+      Task.Supervisor.async_nolink(NetRunner.TaskSupervisor, fn ->
         drain_loop(reader, proc, on_output)
       end)
 

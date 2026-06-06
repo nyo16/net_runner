@@ -4,11 +4,12 @@ defmodule NetRunner.Process.Operations do
   @type op_type :: :read | :write | {:read, :stdout | :stderr}
   @type pending_op :: {op_type(), GenServer.from(), term()}
 
-  defstruct pending: %{}, monitors: %{}
+  defstruct pending: %{}, monitors: %{}, op_monitors: %{}
 
   @type t :: %__MODULE__{
           pending: %{reference() => pending_op()},
-          monitors: %{reference() => reference()}
+          monitors: %{reference() => reference()},
+          op_monitors: %{reference() => reference()}
         }
 
   @doc """
@@ -16,28 +17,35 @@ defmodule NetRunner.Process.Operations do
   can be reclaimed if the caller crashes or times out before the GenServer
   can reply. Returns updated ops and a ref for matching.
   """
-  def park(%__MODULE__{pending: pending, monitors: monitors} = ops, type, from, context \\ nil) do
+  def park(%__MODULE__{} = ops, type, from, context \\ nil) do
     ref = make_ref()
     op = {type, from, context}
 
     {caller_pid, _} = from
     mref = Process.monitor(caller_pid)
 
-    {%{ops | pending: Map.put(pending, ref, op), monitors: Map.put(monitors, mref, ref)}, ref}
+    new_ops = %{
+      ops
+      | pending: Map.put(ops.pending, ref, op),
+        monitors: Map.put(ops.monitors, mref, ref),
+        op_monitors: Map.put(ops.op_monitors, ref, mref)
+    }
+
+    {new_ops, ref}
   end
 
   @doc """
   Retrieves and removes a pending operation by ref. Demonitors the caller
   we established in park/4.
   """
-  def pop(%__MODULE__{pending: pending, monitors: monitors} = ops, ref) do
+  def pop(%__MODULE__{pending: pending} = ops, ref) do
     case Map.pop(pending, ref) do
       {nil, _} ->
         {nil, ops}
 
       {op, rest} ->
-        monitors = demonitor_for_op(monitors, ref)
-        {op, %{ops | pending: rest, monitors: monitors}}
+        ops = demonitor_for_op(%{ops | pending: rest}, ref)
+        {op, ops}
     end
   end
 
@@ -45,14 +53,24 @@ defmodule NetRunner.Process.Operations do
   Removes the pending op whose caller-monitor ref matches `mref` (invoked
   from the GenServer's :DOWN handler). Returns {op_or_nil, new_ops}.
   """
-  def pop_by_monitor(%__MODULE__{pending: pending, monitors: monitors} = ops, mref) do
+  def pop_by_monitor(
+        %__MODULE__{pending: pending, monitors: monitors, op_monitors: op_monitors} = ops,
+        mref
+      ) do
     case Map.pop(monitors, mref) do
       {nil, _} ->
         {nil, ops}
 
       {op_ref, monitors_rest} ->
         {op, pending_rest} = Map.pop(pending, op_ref)
-        {op, %{ops | pending: pending_rest, monitors: monitors_rest}}
+
+        {op,
+         %{
+           ops
+           | pending: pending_rest,
+             monitors: monitors_rest,
+             op_monitors: Map.delete(op_monitors, op_ref)
+         }}
     end
   end
 
@@ -74,19 +92,20 @@ defmodule NetRunner.Process.Operations do
 
     Enum.each(monitors, fn {mref, _op_ref} -> Process.demonitor(mref, [:flush]) end)
 
-    %{ops | pending: %{}, monitors: %{}}
+    %{ops | pending: %{}, monitors: %{}, op_monitors: %{}}
   end
 
   def empty?(%__MODULE__{pending: pending}), do: map_size(pending) == 0
 
-  defp demonitor_for_op(monitors, op_ref) do
-    case Enum.find(monitors, fn {_mref, r} -> r == op_ref end) do
-      {mref, _} ->
-        Process.demonitor(mref, [:flush])
-        Map.delete(monitors, mref)
+  # O(1) demonitor via the op_ref -> mref reverse index.
+  defp demonitor_for_op(%__MODULE__{monitors: monitors, op_monitors: op_monitors} = ops, op_ref) do
+    case Map.pop(op_monitors, op_ref) do
+      {nil, _} ->
+        ops
 
-      nil ->
-        monitors
+      {mref, op_monitors_rest} ->
+        Process.demonitor(mref, [:flush])
+        %{ops | monitors: Map.delete(monitors, mref), op_monitors: op_monitors_rest}
     end
   end
 end

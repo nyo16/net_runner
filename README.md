@@ -439,7 +439,7 @@ end, max_concurrency: 20)
 | `:input` | binary \| list | `nil` | Data to write to stdin |
 | `:timeout` | integer | `nil` | Wall-clock timeout in ms |
 | `:max_output_size` | integer | `nil` | Max bytes to collect |
-| `:stderr` | atom | `:consume` | `:consume`, `:redirect`, or `:disabled` |
+| `:stderr` | atom | `:consume` | `:consume` (drained internally) or `:disabled` |
 | `:pty` | boolean | `false` | Use pseudo-terminal |
 | `:kill_timeout` | integer | `5000` | SIGTERM→SIGKILL escalation timeout in ms |
 | `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only) |

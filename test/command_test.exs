@@ -65,9 +65,9 @@ defmodule NetRunner.CommandTest do
     end
 
     test "preserves multiple opts" do
-      cmd = Command.new("cmd", [], timeout: 5_000, stderr: :redirect, pty: true)
+      cmd = Command.new("cmd", [], timeout: 5_000, stderr: :disabled, pty: true)
 
-      assert cmd.opts == [timeout: 5_000, stderr: :redirect, pty: true]
+      assert cmd.opts == [timeout: 5_000, stderr: :disabled, pty: true]
     end
 
     test "raises on non-binary executable" do
