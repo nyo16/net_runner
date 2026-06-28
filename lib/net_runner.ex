@@ -34,7 +34,12 @@ defmodule NetRunner do
   ## Options
 
     * `:stderr` - `:consume` (default, drained internally so the child never
-      blocks on a full stderr pipe) or `:disabled`
+      blocks on a full stderr pipe) or `:disabled`. In `:consume` mode only the
+      most-recent `:stderr_tail_bytes` of stderr are retained (see
+      `NetRunner.Process.stderr_tail/1`); the rest is drained and dropped.
+    * `:stderr_tail_bytes` - cap (bytes) on the retained stderr tail. Default
+      `8192`. `0` retains nothing. The tail is raw bytes and may begin
+      mid-character, so treat it as diagnostic text, not valid UTF-8.
     * `:input` - data to write to stdin (binary or enumerable)
     * `:timeout` - maximum wall-clock time in milliseconds. Sends SIGTERM then SIGKILL
       on timeout. Returns `{:error, :timeout}` instead of `{output, exit_status}`.

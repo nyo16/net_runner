@@ -3,7 +3,10 @@ defmodule NetRunner.Daemon do
   A supervised long-running OS process.
 
   Wraps `NetRunner.Process` for integration into a supervision tree.
-  Automatically drains stdout/stderr to prevent pipe blocking.
+  Automatically drains stdout/stderr to prevent pipe blocking. Both streams
+  are delivered to the `:on_output` callback; stderr is owned by the Daemon's
+  own drain task (the underlying process runs with `stderr: :disabled`), so
+  `:on_output` sees the complete stderr stream in order.
 
   ## Usage
 
@@ -42,7 +45,15 @@ defmodule NetRunner.Daemon do
     cmd = Keyword.fetch!(opts, :cmd)
     args = Keyword.get(opts, :args, [])
     on_output = Keyword.get(opts, :on_output, :discard)
-    process_opts = Keyword.get(opts, :process_opts, [])
+
+    # Force stderr: :disabled so the underlying Process does NOT start its own
+    # internal stderr consumer. The Daemon's own drain task (below) is then the
+    # sole reader of the stderr pipe, so on_output receives the full stream in
+    # order rather than racing the internal consumer for chunks.
+    process_opts =
+      opts
+      |> Keyword.get(:process_opts, [])
+      |> Keyword.put(:stderr, :disabled)
 
     case Proc.start_link(cmd, args, process_opts) do
       {:ok, proc} ->

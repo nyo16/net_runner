@@ -83,6 +83,23 @@ defmodule NetRunner.Process do
     GenServer.call(process, :stats)
   end
 
+  @doc """
+  Returns the retained tail of consumed stderr.
+
+  In the default `:consume` stderr mode, stderr is drained to keep the child
+  from blocking on a full pipe; only the most-recent `:stderr_tail_bytes`
+  bytes (default 8 KB) are retained and returned here. Useful for diagnosing
+  why a command failed.
+
+  The tail is raw bytes and may begin mid-character if stderr was truncated,
+  so treat it as diagnostic text rather than guaranteed-valid UTF-8. Returns
+  `""` in `:disabled` mode.
+  """
+  @spec stderr_tail(GenServer.server()) :: binary()
+  def stderr_tail(process) do
+    GenServer.call(process, :stderr_tail)
+  end
+
   @doc "Set PTY window size (rows, cols). Only works in PTY mode."
   def set_window_size(process, rows, cols) do
     GenServer.call(process, {:set_window_size, rows, cols})
@@ -204,6 +221,10 @@ defmodule NetRunner.Process do
     {:reply, state.stats, state}
   end
 
+  def handle_call(:stderr_tail, _from, state) do
+    {:reply, state.stderr_tail, state}
+  end
+
   def handle_call({:set_window_size, rows, cols}, _from, state) do
     send_shepherd_command(state, <<0x03, rows::big-16, cols::big-16>>)
     {:reply, :ok, state}
@@ -276,7 +297,7 @@ defmodule NetRunner.Process do
   # the data would be silently dropped by the catch-all below.
   def handle_info({:stderr_data, data}, state) when is_binary(data) do
     stats = Stats.record_read_stderr(state.stats, byte_size(data))
-    state = %{state | stderr_buffer: [data | state.stderr_buffer], stats: stats}
+    state = %{state | stderr_tail: append_stderr_tail(state, data), stats: stats}
     # Drain anything else buffered and re-arm enif_select on EAGAIN.
     {:noreply, consume_stderr(state)}
   end
@@ -478,11 +499,28 @@ defmodule NetRunner.Process do
     end
   end
 
+  # Appends `data` to the retained stderr tail, keeping only the most-recent
+  # `stderr_tail_bytes` bytes. A cap of 0 retains nothing (drain-and-drop);
+  # the pipe is still drained so the child never blocks. All bytes are still
+  # counted in stats — only retention is bounded.
+  defp append_stderr_tail(%{stderr_tail: tail, stderr_tail_bytes: cap}, data) do
+    combined = tail <> data
+    size = byte_size(combined)
+
+    if size > cap do
+      # Keep the last `cap` bytes. For cap == 0 this is
+      # binary_part(combined, size, 0), which is valid and returns <<>>.
+      binary_part(combined, size - cap, cap)
+    else
+      combined
+    end
+  end
+
   defp consume_stderr(state) do
     case Pipe.read(state.stderr) do
       {:ok, data} ->
         stats = Stats.record_read_stderr(state.stats, byte_size(data))
-        consume_stderr(%{state | stderr_buffer: [data | state.stderr_buffer], stats: stats})
+        consume_stderr(%{state | stderr_tail: append_stderr_tail(state, data), stats: stats})
 
       :eof ->
         state
