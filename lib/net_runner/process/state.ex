@@ -17,7 +17,11 @@ defmodule NetRunner.Process.State do
     operations: %Operations{},
     awaiting_exit: [],
     stderr_mode: :consume,
-    stderr_buffer: [],
+    # Bounded tail of consumed stderr: only the most-recent
+    # `stderr_tail_bytes` bytes are retained (the rest is drained and
+    # dropped). Stats still count every byte. Held as a single binary.
+    stderr_tail: <<>>,
+    stderr_tail_bytes: 8_192,
     status: :starting,
     stats: %Stats{}
   ]
@@ -37,7 +41,8 @@ defmodule NetRunner.Process.State do
           operations: Operations.t(),
           awaiting_exit: [GenServer.from()],
           stderr_mode: :consume | :disabled,
-          stderr_buffer: [binary()],
+          stderr_tail: binary(),
+          stderr_tail_bytes: non_neg_integer(),
           status: status()
         }
 end

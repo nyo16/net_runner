@@ -28,6 +28,7 @@ defmodule NetRunner.Process.Exec do
     result =
       with :ok <- validate_cmd_and_args(cmd, args),
            :ok <- validate_stderr_mode(Keyword.get(opts, :stderr, :consume), pty_mode),
+           :ok <- validate_stderr_tail_bytes(Keyword.get(opts, :stderr_tail_bytes, 8_192)),
            :ok <- validate_cgroup_path(Keyword.get(opts, :cgroup_path, nil)),
            {:ok, listen_socket} <- create_uds_listener(uds_path),
            shepherd_port <- open_shepherd(uds_path, cmd, args, opts),
@@ -98,6 +99,7 @@ defmodule NetRunner.Process.Exec do
          cmd: cmd,
          args: args,
          stderr_mode: stderr_mode,
+         stderr_tail_bytes: Keyword.get(opts, :stderr_tail_bytes, 8_192),
          status: :running
        }}
     else
@@ -128,6 +130,15 @@ defmodule NetRunner.Process.Exec do
 
   defp validate_stderr_mode(mode, false) do
     {:error, {:invalid_stderr, "must be :consume or :disabled, got: #{inspect(mode)}"}}
+  end
+
+  # The bounded stderr tail cap. 0 disables retention (drain-and-drop) while
+  # still draining the pipe so the child never blocks.
+  defp validate_stderr_tail_bytes(bytes) when is_integer(bytes) and bytes >= 0, do: :ok
+
+  defp validate_stderr_tail_bytes(bytes) do
+    {:error,
+     {:invalid_stderr_tail_bytes, "must be a non-negative integer, got: #{inspect(bytes)}"}}
   end
 
   defp validate_cgroup_path(nil), do: :ok
