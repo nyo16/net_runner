@@ -26,6 +26,10 @@ defmodule NetRunner.Process do
 
   @default_read_size 65_535
 
+  # Backstop only. Exit status normally arrives over the UDS; this fires when
+  # the shepherd died without delivering one.
+  @force_exit_timeout 5_000
+
   # --- Public API ---
 
   def start_link(cmd, args \\ [], opts \\ []) do
@@ -105,6 +109,19 @@ defmodule NetRunner.Process do
     GenServer.call(process, {:set_window_size, rows, cols})
   end
 
+  @doc """
+  Re-registers the process whose death should tear this OS process down.
+
+  Replaces any previous owner monitor rather than stacking on it.
+  `NetRunner.Stream` uses this to move the monitor from the process that
+  *built* the stream to the one actually consuming it — otherwise the builder
+  finishing first SIGKILLs a child the consumer is still reading.
+  """
+  @spec set_owner(GenServer.server(), pid()) :: :ok
+  def set_owner(process, owner) when is_pid(owner) do
+    GenServer.call(process, {:set_owner, owner})
+  end
+
   # --- GenServer Callbacks ---
 
   @impl true
@@ -127,6 +144,12 @@ defmodule NetRunner.Process do
         if state.stderr_mode == :consume do
           kick_stderr_read(state)
         end
+
+        # A child that exited before spawn_process/3 returned delivered its
+        # exit status in the same recvmsg as MSG_CHILD_STARTED, so parse the
+        # carry before anything else. Then arm the socket so later frames
+        # arrive as messages instead of waiting for the shepherd Port to die.
+        state = arm_uds(state)
 
         {:ok, state}
 
@@ -230,32 +253,38 @@ defmodule NetRunner.Process do
     {:reply, :ok, state}
   end
 
+  def handle_call({:set_owner, owner}, _from, state) do
+    # Replace, don't stack: Stream calls this on top of the spawn-time :owner.
+    if state.owner_ref, do: Process.demonitor(state.owner_ref, [:flush])
+    {:reply, :ok, %{state | owner_ref: Process.monitor(owner)}}
+  end
+
   # --- enif_select notifications ---
   # When a FD becomes ready, enif_select sends:
   #   {:select, resource, ref, :ready_input | :ready_output}
 
   @impl true
-  def handle_info({:select, _resource, _ref, :ready_input}, state) do
-    # A read FD is ready — retry all pending reads
-    state = retry_pending_reads(state)
-    {:noreply, state}
+  def handle_info({:select, resource, _ref, :ready_input}, state) do
+    # enif_select is one-shot per fd and the resource says which pipe woke us.
+    # Servicing both would cost a read(2) plus a select re-arm on the other
+    # pipe for every chunk of this one.
+    {:noreply, handle_ready_input(state, resource)}
   end
 
   def handle_info({:select, _resource, _ref, :ready_output}, state) do
-    # A write FD is ready — retry all pending writes
-    state = retry_pending_writes(state)
-    {:noreply, state}
+    # Only stdin is ever selected for write, so there is nothing to discriminate.
+    {:noreply, retry_pending_writes(state)}
   end
 
-  # Shepherd port exit
+  # Shepherd port exit. Normally the exit status already arrived over the UDS
+  # and this is a no-op; it is the fallback for a shepherd that died without
+  # delivering one.
   def handle_info({port, {:exit_status, _status}}, state)
       when port == state.shepherd_port do
-    # Shepherd died. Read exit status from UDS if we haven't already.
     state = maybe_read_exit_status(state)
 
-    # If we still haven't received exit status, schedule a forced timeout
     if state.status != :exited do
-      Process.send_after(self(), :force_exit_timeout, 5_000)
+      Process.send_after(self(), :force_exit_timeout, @force_exit_timeout)
     end
 
     {:noreply, state}
@@ -263,31 +292,46 @@ defmodule NetRunner.Process do
 
   def handle_info(:force_exit_timeout, state) do
     if state.status != :exited do
+      require Logger
+
+      Logger.warning(
+        "[NetRunner] no exit status from shepherd for #{inspect(state.cmd)} after " <>
+          "#{@force_exit_timeout}ms; synthesising 137. A real status should have " <>
+          "arrived over the UDS — this path losing a genuine exit code is a bug."
+      )
+
       {:noreply, finish_exit(state, 137)}
     else
       {:noreply, state}
     end
   end
 
-  # UDS message from shepherd (via active socket)
+  # UDS readiness from the :nowait recv armed by arm_uds/1. This is how
+  # MSG_CHILD_EXITED and MSG_ERROR normally arrive.
   def handle_info({:"$socket", socket, :select, _info}, state)
       when socket == state.uds_socket do
-    state = handle_uds_message(state)
+    {:noreply, arm_uds(state)}
+  end
+
+  def handle_info({:"$socket", socket, :abort, _info}, state)
+      when socket == state.uds_socket do
+    # Socket torn down — nothing further will arrive. The shepherd Port exit
+    # and the force-exit backstop still cover the exit status.
     {:noreply, state}
   end
 
-  # A parked caller (read/write) died — drop its entry silently instead of
-  # letting it linger until process exit. The owner case is handled first.
+  # A parked caller (read/write) died — drop its entries silently instead of
+  # letting them linger until process exit. The owner case is handled first.
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state)
       when is_reference(ref) do
     if ref == state.owner_ref do
       on_owner_down(state)
     else
       case Operations.pop_by_monitor(state.operations, ref) do
-        {nil, _ops} ->
+        {[], _ops} ->
           {:noreply, state}
 
-        {_op, ops} ->
+        {_ops_removed, ops} ->
           {:noreply, %{state | operations: ops}}
       end
     end
@@ -386,21 +430,44 @@ defmodule NetRunner.Process do
     end
   end
 
-  defp retry_pending_reads(state) do
-    pending = Operations.pending_by_type(state.operations, {:read, :stdout})
-    stderr_pending = Operations.pending_by_type(state.operations, {:read, :stderr})
+  defp handle_ready_input(state, resource) do
+    cond do
+      pipe_matches?(state.stdout, resource) ->
+        retry_reads_for(state, {:read, :stdout})
 
-    state =
-      Enum.reduce(pending ++ stderr_pending, state, fn {ref, {type, from, max_bytes}}, acc ->
-        pipe = pipe_for_type(acc, type)
-        retry_single_read(acc, ref, pipe, from, max_bytes)
-      end)
+      pipe_matches?(state.stderr, resource) ->
+        state
+        |> retry_reads_for({:read, :stderr})
+        |> maybe_consume_stderr()
 
-    # Also handle internal stderr consumption
-    if state.stderr_mode == :consume and state.stderr do
-      consume_stderr(state)
-    else
+      true ->
+        # Unrecognised resource (pipe already closed). Service both rather
+        # than drop a readiness event.
+        state
+        |> retry_reads_for({:read, :stdout})
+        |> retry_reads_for({:read, :stderr})
+        |> maybe_consume_stderr()
+    end
+  end
+
+  defp pipe_matches?(%Pipe{resource: resource}, resource) when not is_nil(resource), do: true
+  defp pipe_matches?(_pipe, _resource), do: false
+
+  defp maybe_consume_stderr(%{stderr_mode: :consume, stderr: stderr} = state)
+       when not is_nil(stderr),
+       do: consume_stderr(state)
+
+  defp maybe_consume_stderr(state), do: state
+
+  defp retry_reads_for(state, type) do
+    # The common case is nothing parked, so skip the map traversal entirely.
+    if Operations.empty?(state.operations) do
       state
+    else
+      Enum.reduce(Operations.pending_by_type(state.operations, type), state, fn
+        {ref, {_type, from, max_bytes}}, acc ->
+          retry_single_read(acc, ref, pipe_for_type(acc, type), from, max_bytes)
+      end)
     end
   end
 
@@ -467,8 +534,13 @@ defmodule NetRunner.Process do
         end
 
       {:error, :eagain} ->
-        # Still parked, enif_select already re-registered
-        state
+        # Persist the remaining bytes. enif_select is already re-registered,
+        # but the parked op must carry forward what is left to write: leaving
+        # the original payload in place restarts the write from offset 0 on
+        # every readiness event, so the child receives the same bytes again and
+        # again and the write never completes. Observed as 5.8 GB written for a
+        # 100 KB payload.
+        %{state | operations: Operations.update_context(state.operations, ref, data)}
 
       {:error, _} = error ->
         GenServer.reply(from, error)
@@ -503,16 +575,28 @@ defmodule NetRunner.Process do
   # `stderr_tail_bytes` bytes. A cap of 0 retains nothing (drain-and-drop);
   # the pipe is still drained so the child never blocks. All bytes are still
   # counted in stats — only retention is bounded.
-  defp append_stderr_tail(%{stderr_tail: tail, stderr_tail_bytes: cap}, data) do
-    combined = tail <> data
-    size = byte_size(combined)
+  #
+  # The `:binary.copy/1` calls are load-bearing: binary_part/3 on a refc
+  # binary returns a sub-binary that pins its parent, so without the copy an
+  # 8 KiB tail would retain the whole ~72 KiB concat for the life of the
+  # process.
+  defp append_stderr_tail(%{stderr_tail_bytes: 0}, _data), do: <<>>
 
-    if size > cap do
-      # Keep the last `cap` bytes. For cap == 0 this is
-      # binary_part(combined, size, 0), which is valid and returns <<>>.
-      binary_part(combined, size - cap, cap)
-    else
-      combined
+  defp append_stderr_tail(%{stderr_tail: tail, stderr_tail_bytes: cap}, data) do
+    size = byte_size(data)
+
+    cond do
+      size >= cap ->
+        # The chunk alone already fills the cap, so concatenating the old tail
+        # would copy bytes the following slice immediately discards.
+        :binary.copy(binary_part(data, size - cap, cap))
+
+      byte_size(tail) + size <= cap ->
+        tail <> data
+
+      true ->
+        combined = tail <> data
+        :binary.copy(binary_part(combined, byte_size(combined) - cap, cap))
     end
   end
 
@@ -542,62 +626,106 @@ defmodule NetRunner.Process do
   defp maybe_read_exit_status(%{status: :exited} = state), do: state
 
   defp maybe_read_exit_status(state) do
-    # Shepherd has exited. The UDS may or may not have delivered
-    # MSG_CHILD_EXITED yet — on slow CI runners (notably macOS) the
-    # buffer can trail the Port's {:exit_status, _} notification.
-    # Retry a few times on timeout; bail immediately on :closed so
-    # the 5 s force_exit_timeout can apply a synthetic 137.
-    drain_uds_for_exit(state, _tries_left = 5)
+    # The shepherd is gone. Whatever it managed to write is either already in
+    # our carry or still sitting in the socket buffer, so one non-blocking
+    # sweep gets it. There is deliberately no retry ladder: a blocking recv
+    # here wedges the GenServer (no calls answered, no readiness serviced, no
+    # stderr drained) and the force-exit backstop already covers a shepherd
+    # that wrote nothing at all.
+    arm_uds(state)
   end
 
-  defp drain_uds_for_exit(state, 0), do: state
+  # Drains every complete frame the socket will give us right now, then leaves
+  # a :nowait select armed so the next frame arrives as a message.
+  defp arm_uds(%{status: :exited} = state), do: state
+  defp arm_uds(%{uds_socket: nil} = state), do: state
 
-  defp drain_uds_for_exit(state, tries_left) do
-    case Exec.read_uds_message(state.uds_socket) do
-      {:child_exited, status} ->
-        finish_exit(state, status)
+  defp arm_uds(state) do
+    state = drain_uds_carry(state)
 
-      {:error, reason} when reason in [:closed, :econnreset, :enotconn] ->
-        # Peer closed without delivering an exit message; fall through to
-        # force_exit_timeout which will apply status 137.
+    if state.status == :exited do
+      state
+    else
+      recv_uds(state)
+    end
+  end
+
+  # One `:socket.recv` per call, then re-enter only on demonstrated progress.
+  # A zero-byte read must terminate the loop: a peer at EOF is permanently
+  # readable, so recursing on it would spin the GenServer forever and starve
+  # every parked caller. Only a non-empty read earns another pass.
+  defp recv_uds(state) do
+    case :socket.recv(state.uds_socket, 0, [], :nowait) do
+      {:ok, data} when byte_size(data) > 0 ->
+        arm_uds(%{state | uds_carry: state.uds_carry <> data})
+
+      {:ok, _empty} ->
+        # Treated as EOF: nothing more will arrive, and re-arming a select on
+        # an EOF socket would produce an endless readiness storm.
+        drain_uds_carry(state)
+
+      {:select, {_info, data}} when is_binary(data) and byte_size(data) > 0 ->
+        # Partial data alongside the select registration — keep the bytes.
+        drain_uds_carry(%{state | uds_carry: state.uds_carry <> data})
+
+      {:select, _info} ->
         state
 
-      {:error, :no_message} ->
-        # Read timed out (data not yet buffered). Give the kernel another
-        # chance — read_uds_message already waited 500 ms per attempt.
-        drain_uds_for_exit(state, tries_left - 1)
+      {:error, {_reason, data}} when is_binary(data) and byte_size(data) > 0 ->
+        drain_uds_carry(%{state | uds_carry: state.uds_carry <> data})
 
-      _other ->
-        # Unexpected shape — stop draining to avoid spinning on bad data.
+      {:error, _reason} ->
+        # Includes :closed (shepherd gone) and :ealready (a select from an
+        # earlier arm is still outstanding and will deliver on its own).
         state
     end
   end
 
-  defp handle_uds_message(state) do
-    case Exec.read_uds_message(state.uds_socket) do
-      {:child_exited, status} ->
-        finish_exit(state, status)
+  # Parses buffered bytes only — never reads the socket, so it cannot block.
+  defp drain_uds_carry(state) do
+    case Exec.parse_uds_message(state.uds_carry) do
+      {:ok, msg, rest} ->
+        drain_uds_carry(apply_uds_message(%{state | uds_carry: rest}, msg))
 
-      {:shepherd_error, msg} ->
-        require Logger
-
-        Logger.warning("[NetRunner] shepherd reported error: #{inspect(msg)}")
+      :incomplete ->
         state
 
-      _ ->
-        state
+      {:error, _reason} ->
+        # Unknown opcode: drop the buffer rather than re-parsing it forever.
+        %{state | uds_carry: <<>>}
     end
+  end
+
+  defp apply_uds_message(state, {:child_exited, status}), do: finish_exit(state, status)
+
+  defp apply_uds_message(state, {:shepherd_error, msg}) do
+    require Logger
+
+    Logger.warning("[NetRunner] shepherd reported error: #{inspect(msg)}")
+    state
   end
 
   defp finish_exit(state, exit_status) do
     stats = Stats.finalize(state.stats, exit_status)
+
+    # Exit status now arrives over the UDS as soon as the shepherd sends it,
+    # which can be while the child's output is still sitting in the pipe. Serve
+    # parked readers from that buffer first — the child's write ends are closed
+    # by now, so a read returns the remaining bytes and then :eof rather than
+    # EAGAIN. Failing them outright here would silently truncate a stream.
+    state =
+      state
+      |> Map.put(:stats, stats)
+      |> retry_reads_for({:read, :stdout})
+      |> retry_reads_for({:read, :stderr})
 
     # Reply to all awaiting callers
     Enum.each(state.awaiting_exit, fn from ->
       GenServer.reply(from, {:ok, exit_status})
     end)
 
-    # Reply to any pending operations with appropriate errors
+    # Anything still parked (writes, or a reader whose pipe is already gone)
+    # can never be satisfied now.
     Operations.reply_all(state.operations, {:error, :process_exited})
 
     %{
@@ -605,8 +733,7 @@ defmodule NetRunner.Process do
       | exit_status: exit_status,
         status: :exited,
         awaiting_exit: [],
-        operations: %Operations{},
-        stats: stats
+        operations: %Operations{}
     }
   end
 end

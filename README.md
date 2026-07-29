@@ -12,7 +12,7 @@ NetRunner combines NIF-based async I/O (`enif_select`) with a persistent **sheph
 ```elixir
 def deps do
   [
-    {:net_runner, "~> 1.0"}
+    {:net_runner, "~> 1.3"}
   ]
 end
 ```
@@ -463,7 +463,7 @@ BEAM Process (NetRunner.Process GenServer)
     |     |-- BEAM dies (POLLHUP) → SIGTERM → SIGKILL child
     |     |-- Child dies (SIGCHLD) → notify BEAM, exit
     |
-    |-- NIF (enif_select on raw FDs, dirty IO schedulers)
+    |-- NIF (enif_select on raw O_NONBLOCK FDs, normal schedulers)
     |     |-- Demand-driven backpressure via OS pipe buffers
     |
     v
@@ -479,9 +479,29 @@ NetRunner.Watcher (belt-and-suspenders with shepherd)
 
 ## Performance
 
-Spawn overhead is ~20-25ms per process (fork + execvp + UDS handshake + FD passing). This is a one-time cost — actual I/O is sub-millisecond. For comparison, `System.cmd` is ~10-15ms (simpler setup, same fork cost).
+Medians on an idle Apple M1 Max (10 cores), OTP 29, default VM flags:
 
-The tradeoff: ~10ms extra spawn time buys you backpressure, zero zombies, and process group kills. For long-running processes or large data streams, the spawn cost is negligible.
+| | |
+|---|---|
+| spawn (fork + execvp + UDS handshake + FD passing) | ~3 ms |
+| stdout throughput, 64 KiB reads | ~650 MiB/s |
+| `NetRunner.run(["/bin/echo", "hi"])` end to end | ~7 ms |
+
+For reference, reading the same producer through a plain Erlang `Port` on the
+same host measures ~420-525 MiB/s, so the backpressured path is not paying for
+its safety in throughput. Spawn is a one-time cost; I/O after that is limited
+by the pipe, not by NetRunner.
+
+Every NIF call is a bounded, non-blocking syscall on a normal scheduler.
+Readiness comes from `enif_select`, integrated with BEAM's epoll/kqueue, so an
+idle process costs nothing. NetRunner used to run these calls on dirty IO
+schedulers; each call then paid a scheduler handoff, which on a machine whose
+dirty schedulers are contended cost milliseconds rather than nanoseconds and
+capped throughput at single-digit MiB/s. See ADR-6 in
+[Decisions](docs/decisions.md).
+
+Absolute numbers are host-specific — re-measure on your own hardware before
+relying on them.
 
 ## Documentation
 

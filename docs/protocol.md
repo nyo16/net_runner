@@ -34,7 +34,27 @@ The iov payload is a single dummy byte (`0x00`). The BEAM receives this via `:so
 
 ## Message Format
 
-All messages are byte-oriented, no framing needed (each message is atomic and small).
+Messages are byte-oriented and fixed-layout: a 1-byte opcode followed by an
+opcode-determined payload.
+
+### Framing is the reader's job
+
+The transport is `SOCK_STREAM`, so **a frame boundary is not a read boundary**.
+A single `read`/`recvmsg` can deliver part of one message, several messages, or
+the tail of the `SCM_RIGHTS` iov byte followed by two whole messages. Both
+sides must therefore buffer:
+
+- The shepherd keeps a carry-over buffer across `poll()` iterations and
+  dispatches per-opcode lengths (`command_length/1` in `shepherd.c`).
+- The BEAM keeps `State.uds_carry` and parses with
+  `NetRunner.Process.Exec.parse_uds_message/1`, retaining any unconsumed tail.
+
+This is not theoretical. For a child that exits before the BEAM's `recvmsg`,
+the iov byte, `MSG_CHILD_STARTED` and `MSG_CHILD_EXITED` all coalesce into one
+11-byte read. An earlier version parsed `MSG_CHILD_STARTED` and discarded the
+remainder, losing the exit status for every fast-exiting command — the caller
+then waited out a 5 s timeout and received a synthetic `137` instead of the
+real status.
 
 ### BEAM → Shepherd Commands
 

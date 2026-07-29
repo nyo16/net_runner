@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* PTY headers — platform-specific */
@@ -268,6 +269,59 @@ static int cgroup_setup(pid_t child_pid) {
 static void cgroup_cleanup(void) {}
 #endif
 
+/* Milliseconds on a monotonic clock, or -1 if the clock is unavailable. */
+static int64_t monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/*
+ * Wait up to timeout_ms for child_pid to be reaped. Returns 1 if it was reaped
+ * (or was already gone), 0 on timeout.
+ *
+ * Blocks in poll() on the SIGCHLD self-pipe rather than sleeping in fixed
+ * slices: a child that died 1 ms after SIGTERM used to cost a full 100 ms
+ * usleep tick, twice over. The deadline comes from a monotonic clock so that
+ * EINTR (SIGCHLD itself interrupts poll) and wakeups for some other child
+ * cannot extend it; if the clock is unavailable the loop collapses to a single
+ * bounded poll, which is still bounded.
+ */
+static int wait_for_child(pid_t child_pid, int timeout_ms) {
+    int64_t now = monotonic_ms();
+    int64_t deadline = (now < 0) ? -1 : now + timeout_ms;
+    int wait_ms = timeout_ms;
+
+    for (;;) {
+        pid_t ret = waitpid(child_pid, NULL, WNOHANG);
+        if (ret > 0 || (ret < 0 && errno == ECHILD)) return 1;
+        if (wait_ms <= 0) return 0;
+
+        struct pollfd pfd;
+        pfd.fd = signal_pipe[0];
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pret = poll(&pfd, 1, wait_ms);
+        if (pret < 0 && errno != EINTR) {
+            /* poll is broken — give up rather than spin on it. */
+            return 0;
+        }
+        if (pret > 0 && (pfd.revents & POLLIN)) {
+            /* Drain the self-pipe. It is non-blocking and the event loop may
+             * have drained it already, so EAGAIN here is expected. */
+            char drain[64];
+            while (read(signal_pipe[0], drain, sizeof(drain)) > 0) {}
+        }
+
+        if (deadline < 0) {
+            wait_ms = 0; /* No clock: one poll, then a final waitpid. */
+        } else {
+            now = monotonic_ms();
+            wait_ms = (now < 0) ? 0 : (int)(deadline - now);
+        }
+    }
+}
+
 /*
  * Kill child process group, with escalation from SIGTERM to SIGKILL.
  * The child called setpgid(0,0) so its pgid == child_pid.
@@ -284,29 +338,14 @@ static void kill_child(pid_t child_pid) {
     }
 
     /* Wait for graceful exit (configurable, default 5s) */
-    int poll_interval_us = 100000; /* 100ms */
-    int iterations = (int)((long)kill_timeout_ms * 1000 / poll_interval_us);
-    if (iterations < 1) iterations = 1;
+    if (!wait_for_child(child_pid, kill_timeout_ms)) {
+        /* Escalate to SIGKILL the whole process group */
+        kill(-child_pid, SIGKILL);
 
-    for (int i = 0; i < iterations; i++) {
-        int status;
-        pid_t ret = waitpid(child_pid, &status, WNOHANG);
-        if (ret > 0 || (ret < 0 && errno == ECHILD)) return;
-        usleep((unsigned int)poll_interval_us);
-    }
-
-    /* Escalate to SIGKILL the whole process group */
-    kill(-child_pid, SIGKILL);
-
-    /* Bounded WNOHANG reap loop — avoid hanging forever if the child is
-     * stuck in uninterruptible kernel sleep (D-state). After the bound
-     * elapses we return anyway; cgroup cleanup + the kernel eventually
-     * reap. */
-    int sigkill_iters = 30; /* ~3s total at 100ms per iteration */
-    for (int i = 0; i < sigkill_iters; i++) {
-        pid_t ret = waitpid(child_pid, NULL, WNOHANG);
-        if (ret > 0 || (ret < 0 && errno == ECHILD)) break;
-        usleep(100000);
+        /* Bounded — a child wedged in uninterruptible kernel sleep (D-state)
+         * never reaps, and we must not hang the shepherd on it. cgroup
+         * cleanup and the kernel take over from there. */
+        (void)wait_for_child(child_pid, 3000);
     }
 
     /* Cleanup cgroup (kills any remaining processes, removes dir) */
@@ -575,6 +614,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Ignore SIGPIPE: a write to a BEAM that has already gone away must fail
+     * with EPIPE — every write loop here checks for a negative return — rather
+     * than killing the shepherd outright and orphaning the child. */
+    struct sigaction sa_pipe;
+    memset(&sa_pipe, 0, sizeof(sa_pipe));
+    sa_pipe.sa_handler = SIG_IGN;
+    if (sigaction(SIGPIPE, &sa_pipe, NULL) != 0) {
+        perror("sigaction(SIGPIPE)");
+        return 1;
+    }
+
     /* Connect to BEAM's UDS listener */
     int uds_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (uds_fd < 0) {
@@ -639,6 +689,10 @@ int main(int argc, char *argv[]) {
                 child_fail("dup2", NULL);
             }
             if (slave_fd > STDERR_FILENO) close(slave_fd);
+
+            /* SIG_IGN survives exec, so restore the default SIGPIPE
+             * disposition the child would have had under a shell. */
+            signal(SIGPIPE, SIG_DFL);
 
             setpgid(0, 0);
             execvp(cmd, cmd_args);
@@ -725,6 +779,19 @@ int main(int argc, char *argv[]) {
         set_cloexec(stderr_pipe[0]); set_cloexec(stderr_pipe[1]);
 #endif
 
+#ifdef __linux__
+        /* Grow the pipe buffers from the default 64 KiB to 1 MiB. Each
+         * buffer-sized chunk costs the BEAM a full read -> EAGAIN ->
+         * enif_select -> message round trip, so a 16x bigger buffer cuts the
+         * round trips per MiB by ~16x. Best effort: the kernel caps the size
+         * via /proc/sys/fs/pipe-max-size and an unprivileged process may not
+         * be permitted to grow it at all, in which case the default stands.
+         * macOS has no equivalent knob. */
+        (void)fcntl(stdout_pipe[0], F_SETPIPE_SZ, 1 << 20);
+        (void)fcntl(stderr_pipe[0], F_SETPIPE_SZ, 1 << 20);
+        (void)fcntl(stdin_pipe[1], F_SETPIPE_SZ, 1 << 20);
+#endif
+
         child_pid = fork();
         if (child_pid < 0) {
             send_error(uds_fd, "fork failed");
@@ -753,6 +820,10 @@ int main(int argc, char *argv[]) {
             close(stdin_pipe[0]);
             close(stdout_pipe[1]);
             close(stderr_pipe[1]);
+
+            /* SIG_IGN survives exec, so restore the default SIGPIPE
+             * disposition the child would have had under a shell. */
+            signal(SIGPIPE, SIG_DFL);
 
             setpgid(0, 0);
             execvp(cmd, cmd_args);

@@ -4,7 +4,200 @@ All notable changes to this project will be documented in this file.
 
 This project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.3.0] - 2026-07-28
+
+Performance and correctness pass driven by measurement. Two defects dominated
+every benchmark: all NIF I/O was routed through dirty IO schedulers, and the
+exit status of any fast-exiting command was silently discarded. Numbers below
+are medians on an Apple M1 Max (10 cores), OTP 29, default VM flags.
+
+### Fixed
+
+- **All NIF I/O moved off dirty IO schedulers** (`~280x` stdout throughput:
+  6.3 -> ~650 MiB/s; `nif_is_os_pid_alive` 670 us -> 1.6 us per call). Every
+  fd is `O_NONBLOCK` and readiness comes from `enif_select`, so no call in the
+  NIF can block — the `ERL_NIF_DIRTY_JOB_IO_BOUND` flag bought nothing and cost
+  a thread handoff on every call, twice per streamed chunk. See ADR-6 in
+  `docs/decisions.md`; do not reintroduce it.
+  - `nif_create_fd` now `fstat`s the fd and rejects anything that is not a
+    FIFO, socket or character device (`{:error, :unsupported_fd_type}`). A
+    regular file ignores `O_NONBLOCK` and would stall a scheduler, so the
+    previously-implicit invariant is now enforced.
+  - `nif_read`/`nif_write` report work via `enif_consume_timeslice`.
+- **Exit status of fast-exiting commands was discarded** — `run(["/bin/echo",
+  "hi"])` took 5.1 s and returned `137` instead of `0`. The UDS is a byte
+  stream: for a child that exits before the BEAM's `recvmsg`, the `SCM_RIGHTS`
+  iov byte, `MSG_CHILD_STARTED` and `MSG_CHILD_EXITED` coalesce into one
+  11-byte read, and `extract_child_started/2` matched the first frame and threw
+  the rest away. The tail is now carried in `State.uds_carry` and parsed by
+  `Exec.parse_uds_message/1`. Same command is now ~7 ms and returns `0`.
+- **The UDS was never watched** — nothing armed a `:socket` select, so the
+  `{:"$socket", …, :select, …}` clause was dead code, `MSG_CHILD_EXITED` could
+  only be read reactively after the shepherd `Port` died, and `MSG_ERROR`
+  frames were invisible. The socket is now armed with a `:nowait` recv and
+  re-armed after each frame. The 5 s `:force_exit_timeout` is demoted to a
+  backstop and logs a warning when it fires.
+- **`drain_uds_for_exit`'s blocking retry ladder removed** — up to 5 x 500 ms of
+  blocking `:socket.recv` inside the GenServer, during which it answered no
+  calls, serviced no readiness and drained no stderr. Replaced with a single
+  non-blocking sweep.
+- **A partially-completed write restarted from offset 0 on every readiness
+  event** — `retry_write_loop/4` advanced through the payload internally but
+  never wrote the remaining bytes back to the parked operation, so each
+  `:ready_output` re-sent the payload from the beginning. The child received the
+  same bytes over and over and the write never completed. Latent before this
+  release and only reachable at particular pipe capacities; enlarging the pipes
+  (below) exposed it as a hang, observed as **5.8 GB written for a 100 KB
+  payload** across 707,801 writes. `Operations.update_context/3` now persists
+  the remainder.
+- **`arm_uds/1` could spin on a zero-byte read** — a peer at EOF is permanently
+  readable, so recursing on `{:ok, <<>>}` would loop the GenServer forever and
+  starve every parked caller. Only a non-empty read now earns another pass, and
+  partial data delivered alongside a `:select` or an error tuple is retained
+  instead of dropped.
+- **`finish_exit/2` could truncate buffered output** — now that the exit status
+  arrives as soon as the shepherd sends it, it can land while the child's output
+  is still in the pipe. Parked readers were failed with
+  `{:error, :process_exited}`, which `NetRunner.Stream` treats as a normal end
+  of stream, silently losing data. Parked reads are now served from the pipe
+  first; only what cannot be satisfied is failed.
+- **Spawn latency recovered** (152 ms -> ~3 ms median): the per-spawn `0700`
+  socket directory added `mkdir`, `chmod` and `rmdir` file syscalls to every
+  spawn. The directory is now created once per VM, with the same traversal
+  barrier.
+- **`NetRunner.Daemon` drain loop leaked stack without bound** — `rescue`/
+  `catch` clauses on `drain_loop/3` wrapped the body in a `try`, taking the
+  recursive call out of tail position and retaining a frame per chunk
+  (~64 KB/s of stack per drain task, two tasks per Daemon). The defensive
+  handling moved into a `safe_read/2` helper.
+- **`Daemon.terminate/2`'s SIGKILL escalation was unreachable** — the 5 s
+  `await_exit` grace equalled the `use GenServer` shutdown budget, so the
+  supervisor brutal-killed the Daemon first. Additionally `await_exit/2` is a
+  `GenServer.call`, so exhausting the grace *exited* the caller and unwound
+  past the escalation. Grace split into 3 s + 1 s with an exit-trapping wrapper.
+- **Early-terminated streams stalled 5 s** — `stream!(~w(yes)) |> Enum.take(1)`
+  waited out the full graceful-exit grace for a child that ignores stdin
+  closure. Natural EOF and consumer-halt are now distinguished; a halt
+  escalates immediately.
+- **`:owner` monitored the wrong process** — it captured whoever *built* the
+  stream, so building in one process and consuming in another SIGKILLed the
+  child mid-consumption. `NetRunner.Process.set_owner/2` re-registers from the
+  consumer.
+- **`append_stderr_tail/2` copied and pinned more than the cap** — `tail <>
+  data` then `binary_part/3` copied up to 8 KiB per chunk (~129x amplification
+  on line-buffered stderr), discarded the whole concat whenever the chunk
+  already exceeded the cap, and returned a sub-binary pinning its ~72 KiB
+  parent. Now slices without concatenating when possible and copies to release
+  the parent.
+- **`:ready_input` ignored which fd fired** — every stdout chunk also issued a
+  wasted `read(2)` plus `enif_select` re-arm on stderr. The select message's
+  resource is now matched against the pipes.
+- **Parked-caller monitors are refcounted per caller pid** — a streaming
+  consumer parks once per chunk, so a `Process.monitor`/`demonitor` pair per
+  operation was a per-chunk cost. `pop_by_monitor/2` now reclaims all of a dead
+  caller's operations at once.
+- **`enif_monitor_process` and `enif_select(STOP)` failures are no longer
+  swallowed** — a resource whose select relation is never dissolved is never
+  destructed, so a silently-failed monitor meant a permanently leaked fd.
+  Surfaced as `{:error, :monitor_failed}` / `{:error, :select_failed}`.
+- **Shepherd: `kill_child` no longer polls `waitpid` with `usleep(100000)`** —
+  a child dying 1 ms after SIGTERM cost up to 100 ms, twice. Now waits on the
+  existing SIGCHLD self-pipe with `poll()` against a `CLOCK_MONOTONIC`
+  deadline.
+- **Shepherd: `SIGPIPE` is ignored** so a write to a departed BEAM returns
+  `EPIPE` instead of killing the shepherd and orphaning the child. The default
+  disposition is restored in the child before `execvp`, since `SIG_IGN`
+  survives exec.
+- **Shepherd: pipe buffers grown to 1 MiB on Linux** (`F_SETPIPE_SZ`,
+  best-effort), cutting readiness round trips per MiB by ~16x.
+
+### Changed
+
+- `-fvisibility=hidden` for the NIF; only `nif_init` needs to be exported.
+- Removed `NetRunner.Stream.AbnormalExit`, which was defined but never raised.
+  Streams do not surface non-zero child exit statuses; the module implied
+  otherwise.
+
+### Added
+
+- `NetRunner.Process.set_owner/2` — re-register the process whose death tears
+  the OS process down. Replaces the previous monitor rather than stacking.
+- `NetRunner.Process.Exec.parse_uds_message/1` — pure framing parser for the
+  shepherd protocol, with tests for coalesced, truncated and unknown frames.
+- Regression tests: `test/exit_status_test.exs` (coalesced-frame exit status,
+  framing, `set_owner/2` semantics) and `test/teardown_test.exs` (drain-task
+  stack bound, Daemon shutdown budget, early-halted stream teardown, fd-type
+  guard).
+
+## [1.2.2] - 2026-06-28
+
+Bounded the stderr buffer and made `Daemon` stderr handling deterministic.
+
+### Added
+
+- **`NetRunner.Process.stderr_tail/1`** — returns the retained tail of consumed
+  stderr, with a `:stderr_tail_bytes` option (default 8 KB) controlling how
+  much is kept. Useful for diagnosing why a command failed.
+
+### Fixed
+
+- **Unbounded `stderr_buffer` growth in `:consume` mode** — stderr was drained
+  to keep the child from blocking on a full pipe, but every chunk was retained
+  for the life of the process. Retention is now capped at
+  `:stderr_tail_bytes`; a cap of 0 drains and drops. Stats still count every
+  byte.
+- **Lost initial stderr chunk in `:consume` mode**
+  — `kick_stderr_read` in `init/1` sent `{:stderr_data, data}` to
+  `self()` but no `handle_info/2` clause matched, so the first (and
+  often only) chunk of stderr for fast-exiting processes was silently
+  dropped. The missing handler now appends to the stderr buffer and
+  drains any remainder.
+- **`Daemon` stderr interleaving** — the Daemon now forces
+  `stderr: :disabled` on its child process so its own drain task is the sole
+  reader, instead of racing the process's internal consumer for chunks.
+
+## [1.2.1] - 2026-06-06
+
+Follow-up review pass: stderr API surface, UDS permissions, signal
+validation, and Daemon drain isolation.
+
+### Fixed
+
+- **UDS socket permissions** — the socket lived directly in the
+  world-traversable tmp dir, so a same-host attacker who won the accept race
+  against the real shepherd would receive the child's pipe FDs via
+  `SCM_RIGHTS`. It now lives inside a per-spawn `0700` directory, reducing the
+  threat to same-uid processes.
+- **`write_loop` spin on `{:ok, 0}`** — if the kernel ever returned
+  0 bytes on a non-empty write, the GenServer would recurse forever.
+  The NIF now maps a zero-byte write on a non-empty buffer to
+  `:eagain` and registers `enif_select` for write readiness.
+- **`nif_kill` signal range** — signals outside POSIX `1..31` are rejected in
+  the NIF as well as in `Signal.resolve`, mirroring `shepherd.c`'s `CMD_KILL`
+  validation and bounding the blast radius of a stray call.
+- **`:stderr` option validation** — reject anything other than `:consume` or
+  `:disabled` at the spawn boundary rather than silently ignoring it.
+- **O(1) demonitor for parked callers** — `Operations` gained an
+  `op_monitors` reverse index so popping a parked operation no longer scans
+  the monitor map.
+- **Daemon drain isolation** — drain tasks moved to
+  `Task.Supervisor.async_nolink/2` under a new `NetRunner.TaskSupervisor`, so
+  a drain-task crash cannot take the Daemon down through a linked task.
+
+## [1.2.0] - 2026-04-17
+
+### Fixed
+
+- **`read_uds_message` race** — replaced the `:peek` + full-recv
+  pattern (which could time out if the payload arrived a moment
+  after the opcode) with an opcode-first read flow and longer
+  timeouts.
+- **Exit status lost on a slow UDS** — on slow CI runners (notably macOS) the
+  socket buffer could trail the shepherd `Port`'s `{:exit_status, _}`
+  notification, so the real status was missed. `drain_uds_for_exit/2` retries
+  the read instead of falling straight through to the forced timeout.
+
+## [1.1.2] - 2026-04-17
 
 Focused code-review pass across the NIF, shepherd, and Elixir layers.
 Correctness-first: closes two real-world race/leak bugs, hardens the
@@ -25,15 +218,6 @@ post-fork child window, and adds an AddressSanitizer + UBSan CI job.
   across the syscall and the subsequent `enif_select` registration;
   the actual `close()` is deferred to the `io_resource_stop` callback
   so BEAM can drain pending selects before the fd is released.
-- **Lost initial stderr chunk in `:consume` mode**
-  — `kick_stderr_read` in `init/1` sent `{:stderr_data, data}` to
-  `self()` but no `handle_info/2` clause matched, so the first (and
-  often only) chunk of stderr for fast-exiting processes was silently
-  dropped. The missing handler now appends to the stderr buffer and
-  drains any remainder.
-- **`write_loop` spin on `{:ok, 0}`** — if the kernel ever returned
-  0 bytes on a non-empty write, the GenServer would recurse forever
-  on the dirty scheduler. Bounded with a 1 ms sleep-retry.
 - **Shepherd UDS command framing** — the event loop parsed only
   `buf[0]`, discarding any coalesced or tail commands (e.g.
   `CMD_CLOSE_STDIN` followed immediately by `CMD_KILL`). Frames are
@@ -72,10 +256,6 @@ post-fork child window, and adds an AddressSanitizer + UBSan CI job.
   EAGAIN are now `Process.monitor/1`-ed; dead callers are pruned on
   `:DOWN` instead of lingering in the pending map until process
   exit.
-- **`read_uds_message` race** — replaced the `:peek` + full-recv
-  pattern (which could time out if the payload arrived a moment
-  after the opcode) with an opcode-first read flow and longer
-  timeouts.
 - **`cmd` / `args` validation** — reject non-binary, empty, or
   NUL-containing cmd and args at the spawn boundary. Passing NUL
   bytes through `Port.open`'s `args:` is undefined on the C side.
@@ -113,6 +293,29 @@ post-fork child window, and adds an AddressSanitizer + UBSan CI job.
   path, stderr-only fast-exit stats, binary-with-NUL round-trip, and
   `NetRunner.run` / `NetRunner.stream` returning validation errors
   cleanly.
+
+## [1.1.0] - 2026-03-21
+
+### Added
+
+- **Command DSL** — `NetRunner.Command` for reusable command templates, with
+  `defcommand` for compile-time definitions. `NetRunner.run/2` and
+  `NetRunner.stream/2` accept a `%NetRunner.Command{}` in place of a
+  `[cmd | args]` list.
+
+## [1.0.4] - 2026-03-01
+
+### Fixed
+
+- Publish pipeline ran with the wrong `MIX_ENV`, so `ex_doc` was unavailable
+  when building docs for Hex.
+
+## [1.0.1] - 2026-03-01
+
+### Fixed
+
+- Security hardening and file-descriptor leak fixes across the NIF and
+  shepherd.
 
 ## [1.0.0] - 2026-02-26
 

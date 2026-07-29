@@ -7,6 +7,7 @@ defmodule NetRunner.Process.Exec do
   @msg_child_started 0x80
   @msg_child_exited 0x81
   @msg_error 0x82
+  @uds_base_dir_key {__MODULE__, :uds_base_dir}
 
   @doc """
   Spawns a new OS process via the shepherd binary.
@@ -38,9 +39,9 @@ defmodule NetRunner.Process.Exec do
         setup_after_connection(conn_socket, shepherd_port, owner, cmd, args, opts, pty_mode)
       end
 
-    # On the happy path cleanup_listener removed the socket file and its
-    # per-spawn dir. On any failure (validation, accept timeout, ...) the dir
-    # may still exist — remove it so spawns don't leak empty 0700 dirs.
+    # On the happy path cleanup_listener removed the socket file. On any
+    # failure (validation, accept timeout, ...) it may still exist — remove it
+    # so spawns don't leak socket files in the shared base dir.
     case result do
       {:ok, _} = ok -> ok
       {:error, _} = err -> cleanup_uds_dir_passthrough(uds_path, err)
@@ -49,7 +50,6 @@ defmodule NetRunner.Process.Exec do
 
   defp cleanup_uds_dir(uds_path) do
     _ = File.rm(uds_path)
-    _ = File.rmdir(Path.dirname(uds_path))
     :ok
   end
 
@@ -84,7 +84,7 @@ defmodule NetRunner.Process.Exec do
 
   defp setup_after_connection(conn_socket, shepherd_port, owner, cmd, args, opts, pty_mode) do
     with {:ok, fds, iov_rest} <- receive_fds(conn_socket, pty_mode),
-         {:ok, os_pid} <- extract_child_started(conn_socket, iov_rest),
+         {:ok, os_pid, carry} <- extract_child_started(conn_socket, iov_rest),
          {:ok, pipes} <- wrap_fds(fds, owner, pty_mode) do
       stderr_mode = if pty_mode, do: :disabled, else: Keyword.get(opts, :stderr, :consume)
 
@@ -100,6 +100,7 @@ defmodule NetRunner.Process.Exec do
          args: args,
          stderr_mode: stderr_mode,
          stderr_tail_bytes: Keyword.get(opts, :stderr_tail_bytes, 8_192),
+         uds_carry: carry,
          status: :running
        }}
     else
@@ -158,18 +159,45 @@ defmodule NetRunner.Process.Exec do
     end
   end
 
-  # Place the socket inside a per-spawn 0700 directory so only the current
-  # user can traverse to it. Without this the socket lives directly in the
+  # Place the socket inside a 0700 directory so only the current user can
+  # traverse to it. Without this the socket lives directly in the
   # world-traversable tmp dir, and a same-host attacker who wins the accept
   # race against the real shepherd would receive the child's pipe FDs via
   # SCM_RIGHTS. The 0700 dir reduces the threat to same-uid processes (which
   # are already inside our trust domain).
+  #
+  # The directory is created once per VM, not once per spawn. mkdir, chmod and
+  # the matching rmdir are file syscalls on a dirty IO scheduler; paying them
+  # per spawn accounted for roughly half of the measured spawn latency. Do NOT
+  # "simplify" this by chmod-ing the socket file instead of using a directory —
+  # that reopens a bind->chmod window in which the socket is world-accessible.
   defp uds_socket_path do
+    random = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+    Path.join(uds_base_dir(), "#{random}.sock")
+  end
+
+  defp uds_base_dir do
+    case :persistent_term.get(@uds_base_dir_key, nil) do
+      dir when is_binary(dir) ->
+        # A tmp reaper can remove the directory under a long-lived VM, so the
+        # memoised path is verified rather than trusted.
+        if File.dir?(dir), do: dir, else: create_uds_base_dir()
+
+      nil ->
+        create_uds_base_dir()
+    end
+  end
+
+  defp create_uds_base_dir do
     random = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
     dir = Path.join(System.tmp_dir!(), "net_runner_#{random}")
     File.mkdir_p!(dir)
     File.chmod!(dir, 0o700)
-    Path.join(dir, "shepherd.sock")
+    # Two concurrent first spawns can both create a directory; the loser's is
+    # left empty and harmless. Writing here once per VM keeps the
+    # persistent_term global GC off the spawn path.
+    :persistent_term.put(@uds_base_dir_key, dir)
+    dir
   end
 
   defp create_uds_listener(path) do
@@ -228,9 +256,6 @@ defmodule NetRunner.Process.Exec do
 
     case File.rm(path) do
       result when result in [:ok, {:error, :enoent}] ->
-        # Best-effort removal of the per-spawn 0700 dir created in
-        # uds_socket_path/0; it is empty once the socket file is gone.
-        _ = File.rmdir(Path.dirname(path))
         :ok
 
       {:error, reason} ->
@@ -309,12 +334,20 @@ defmodule NetRunner.Process.Exec do
   defp decode_native_int32s(<<>>), do: []
 
   @doc """
-  Extracts MSG_CHILD_STARTED from iov_rest, or reads from socket if needed.
+  Extracts MSG_CHILD_STARTED from `iov_rest`, or reads it from the socket.
+
+  Returns `{:ok, os_pid, carry}`, where `carry` is whatever followed the
+  MSG_CHILD_STARTED frame. The UDS is a byte stream, so the shepherd's three
+  writes (the 1-byte SCM_RIGHTS filler, MSG_CHILD_STARTED and later
+  MSG_CHILD_EXITED) can coalesce into a single `recvmsg`. A child that exits
+  before the BEAM reads therefore delivers its exit status *inside* this
+  buffer; discarding the tail loses it permanently and strands the caller on
+  the force-exit timeout with a synthetic status.
   """
   def extract_child_started(socket, iov_rest) do
     case iov_rest do
-      <<@msg_child_started, pid::big-unsigned-32, _rest::binary>> ->
-        {:ok, pid}
+      <<@msg_child_started, pid::big-unsigned-32, rest::binary>> ->
+        {:ok, pid, rest}
 
       <<@msg_error, len::big-unsigned-16, msg::binary-size(len), _::binary>> ->
         {:error, {:shepherd_error, msg}}
@@ -331,7 +364,7 @@ defmodule NetRunner.Process.Exec do
   defp read_child_started_from_socket(socket) do
     case :socket.recv(socket, 5, [], @accept_timeout) do
       {:ok, <<@msg_child_started, pid::big-unsigned-32>>} ->
-        {:ok, pid}
+        {:ok, pid, <<>>}
 
       {:ok, <<@msg_error, rest::binary>>} ->
         {:error, {:shepherd_error, rest}}
@@ -348,36 +381,29 @@ defmodule NetRunner.Process.Exec do
   end
 
   @doc """
-  Reads a protocol message from the UDS. Used for ongoing communication.
+  Parses a single frame out of a buffer without touching the socket.
 
-  Structured as: read the 1-byte opcode, then the opcode-specific tail.
-  Avoids the peek-then-recv race where :peek sees the first byte but
-  the recv of the full frame times out because the tail is a moment
-  behind the kernel deliver queue.
+  Returns `{:ok, result, rest}`, `:incomplete` when more bytes are needed, or
+  `{:error, {:unknown_message, byte}}` for an unrecognised opcode.
   """
-  def read_uds_message(socket) do
-    case :socket.recv(socket, 1, [], 500) do
-      {:ok, <<@msg_child_exited>>} -> recv_child_exited(socket)
-      {:ok, <<@msg_error>>} -> recv_error_message(socket)
-      {:ok, _} -> {:error, :unknown_message}
-      {:error, :timeout} -> {:error, :no_message}
-      {:error, reason} -> {:error, reason}
-    end
+  def parse_uds_message(<<@msg_child_exited, status::big-unsigned-32, rest::binary>>) do
+    {:ok, {:child_exited, status}, rest}
   end
 
-  defp recv_child_exited(socket) do
-    case :socket.recv(socket, 4, [], 500) do
-      {:ok, <<status::big-unsigned-32>>} -> {:child_exited, status}
-      other -> {:error, {:unexpected, other}}
-    end
+  def parse_uds_message(<<@msg_error, len::big-unsigned-16, msg::binary-size(len), rest::binary>>) do
+    {:ok, {:shepherd_error, msg}, rest}
   end
 
-  defp recv_error_message(socket) do
-    with {:ok, <<len::big-unsigned-16>>} <- :socket.recv(socket, 2, [], 500),
-         {:ok, msg} <- :socket.recv(socket, len, [], 500) do
-      {:shepherd_error, msg}
-    else
-      other -> {:error, {:unexpected, other}}
-    end
+  # A second MSG_CHILD_STARTED should never arrive, but skipping it keeps the
+  # parser making progress instead of stalling on a byte it will never consume.
+  def parse_uds_message(<<@msg_child_started, _pid::big-unsigned-32, rest::binary>>) do
+    parse_uds_message(rest)
   end
+
+  def parse_uds_message(<<byte, _::binary>>)
+      when byte not in [@msg_child_started, @msg_child_exited, @msg_error] do
+    {:error, {:unknown_message, byte}}
+  end
+
+  def parse_uds_message(_partial), do: :incomplete
 end
