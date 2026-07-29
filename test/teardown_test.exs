@@ -83,6 +83,43 @@ defmodule NetRunner.TeardownTest do
     end
   end
 
+  describe "partial writes" do
+    # A write larger than the pipe buffer completes across several readiness
+    # events. The parked operation has to carry forward the *remaining* bytes;
+    # keeping the original payload restarts the write at offset 0 every time,
+    # so the child receives the same bytes repeatedly and the write never
+    # finishes. The exact-byte-count assertion is the point of this test — a
+    # size-only check on the output would pass while megabytes of duplicates
+    # were being pushed through.
+    test "a large write sends every byte exactly once" do
+      payload = :binary.copy("x", 1_000_000)
+      # A sink, not an echo: writing 1 MB into `cat` without concurrently
+      # draining stdout deadlocks by design, which is the backpressure working.
+      {:ok, pid} = Proc.start("/bin/sh", ["-c", "cat > /dev/null"], [])
+
+      assert :ok = Proc.write(pid, payload)
+      assert :ok = Proc.close_stdin(pid)
+      assert {:ok, 0} = Proc.await_exit(pid, 10_000)
+
+      # The exact count is the whole point: a size-only check on the child's
+      # output would pass while megabytes of duplicates were pushed through.
+      assert Proc.stats(pid).bytes_in == byte_size(payload)
+
+      GenServer.stop(pid)
+    end
+
+    test "a large streamed write does not duplicate data" do
+      payload = :binary.copy("y", 1_000_000)
+
+      collected =
+        ["/bin/cat"]
+        |> NetRunner.stream!(input: payload)
+        |> Enum.join()
+
+      assert collected == payload
+    end
+  end
+
   describe "nif_create_fd fd-type guard" do
     # read/write now run on normal schedulers, which is only safe while every
     # fd honours O_NONBLOCK. The guard turns that invariant from a comment

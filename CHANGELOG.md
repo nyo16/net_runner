@@ -41,6 +41,26 @@ are medians on an Apple M1 Max (10 cores), OTP 29, default VM flags.
   blocking `:socket.recv` inside the GenServer, during which it answered no
   calls, serviced no readiness and drained no stderr. Replaced with a single
   non-blocking sweep.
+- **A partially-completed write restarted from offset 0 on every readiness
+  event** — `retry_write_loop/4` advanced through the payload internally but
+  never wrote the remaining bytes back to the parked operation, so each
+  `:ready_output` re-sent the payload from the beginning. The child received the
+  same bytes over and over and the write never completed. Latent before this
+  release and only reachable at particular pipe capacities; enlarging the pipes
+  (below) exposed it as a hang, observed as **5.8 GB written for a 100 KB
+  payload** across 707,801 writes. `Operations.update_context/3` now persists
+  the remainder.
+- **`arm_uds/1` could spin on a zero-byte read** — a peer at EOF is permanently
+  readable, so recursing on `{:ok, <<>>}` would loop the GenServer forever and
+  starve every parked caller. Only a non-empty read now earns another pass, and
+  partial data delivered alongside a `:select` or an error tuple is retained
+  instead of dropped.
+- **`finish_exit/2` could truncate buffered output** — now that the exit status
+  arrives as soon as the shepherd sends it, it can land while the child's output
+  is still in the pipe. Parked readers were failed with
+  `{:error, :process_exited}`, which `NetRunner.Stream` treats as a normal end
+  of stream, silently losing data. Parked reads are now served from the pipe
+  first; only what cannot be satisfied is failed.
 - **Spawn latency recovered** (152 ms -> ~3 ms median): the per-spawn `0700`
   socket directory added `mkdir`, `chmod` and `rmdir` file syscalls to every
   spawn. The directory is now created once per VM, with the same traversal

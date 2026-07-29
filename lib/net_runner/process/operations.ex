@@ -89,6 +89,24 @@ defmodule NetRunner.Process.Operations do
   end
 
   @doc """
+  Replaces a pending operation's context, keeping its type, caller and monitor.
+
+  A partially-completed write must record how much is left; without this the
+  parked op keeps its original payload and every readiness event rewrites it
+  from the beginning, so the child receives duplicate bytes and the write never
+  finishes. No-op if the ref is already gone.
+  """
+  def update_context(%__MODULE__{pending: pending} = ops, ref, context) do
+    case Map.fetch(pending, ref) do
+      {:ok, {type, from, _old}} ->
+        %{ops | pending: Map.put(pending, ref, {type, from, context})}
+
+      :error ->
+        ops
+    end
+  end
+
+  @doc """
   Replies to all pending operations with the given response and clears them.
   Demonitors every caller along the way.
   """

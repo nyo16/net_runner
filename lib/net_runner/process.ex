@@ -534,8 +534,13 @@ defmodule NetRunner.Process do
         end
 
       {:error, :eagain} ->
-        # Still parked, enif_select already re-registered
-        state
+        # Persist the remaining bytes. enif_select is already re-registered,
+        # but the parked op must carry forward what is left to write: leaving
+        # the original payload in place restarts the write from offset 0 on
+        # every readiness event, so the child receives the same bytes again and
+        # again and the write never completes. Observed as 5.8 GB written for a
+        # 100 KB payload.
+        %{state | operations: Operations.update_context(state.operations, ref, data)}
 
       {:error, _} = error ->
         GenServer.reply(from, error)
@@ -641,21 +646,38 @@ defmodule NetRunner.Process do
     if state.status == :exited do
       state
     else
-      case :socket.recv(state.uds_socket, 0, [], :nowait) do
-        {:ok, data} ->
-          arm_uds(%{state | uds_carry: state.uds_carry <> data})
+      recv_uds(state)
+    end
+  end
 
-        {:select, _info} ->
-          state
+  # One `:socket.recv` per call, then re-enter only on demonstrated progress.
+  # A zero-byte read must terminate the loop: a peer at EOF is permanently
+  # readable, so recursing on it would spin the GenServer forever and starve
+  # every parked caller. Only a non-empty read earns another pass.
+  defp recv_uds(state) do
+    case :socket.recv(state.uds_socket, 0, [], :nowait) do
+      {:ok, data} when byte_size(data) > 0 ->
+        arm_uds(%{state | uds_carry: state.uds_carry <> data})
 
-        {:error, {_reason, data}} when is_binary(data) ->
-          drain_uds_carry(%{state | uds_carry: state.uds_carry <> data})
+      {:ok, _empty} ->
+        # Treated as EOF: nothing more will arrive, and re-arming a select on
+        # an EOF socket would produce an endless readiness storm.
+        drain_uds_carry(state)
 
-        {:error, _reason} ->
-          # Includes :closed (shepherd gone) and :ealready (a select from an
-          # earlier arm is still outstanding and will deliver on its own).
-          state
-      end
+      {:select, {_info, data}} when is_binary(data) and byte_size(data) > 0 ->
+        # Partial data alongside the select registration — keep the bytes.
+        drain_uds_carry(%{state | uds_carry: state.uds_carry <> data})
+
+      {:select, _info} ->
+        state
+
+      {:error, {_reason, data}} when is_binary(data) and byte_size(data) > 0 ->
+        drain_uds_carry(%{state | uds_carry: state.uds_carry <> data})
+
+      {:error, _reason} ->
+        # Includes :closed (shepherd gone) and :ealready (a select from an
+        # earlier arm is still outstanding and will deliver on its own).
+        state
     end
   end
 
@@ -686,12 +708,24 @@ defmodule NetRunner.Process do
   defp finish_exit(state, exit_status) do
     stats = Stats.finalize(state.stats, exit_status)
 
+    # Exit status now arrives over the UDS as soon as the shepherd sends it,
+    # which can be while the child's output is still sitting in the pipe. Serve
+    # parked readers from that buffer first — the child's write ends are closed
+    # by now, so a read returns the remaining bytes and then :eof rather than
+    # EAGAIN. Failing them outright here would silently truncate a stream.
+    state =
+      state
+      |> Map.put(:stats, stats)
+      |> retry_reads_for({:read, :stdout})
+      |> retry_reads_for({:read, :stderr})
+
     # Reply to all awaiting callers
     Enum.each(state.awaiting_exit, fn from ->
       GenServer.reply(from, {:ok, exit_status})
     end)
 
-    # Reply to any pending operations with appropriate errors
+    # Anything still parked (writes, or a reader whose pipe is already gone)
+    # can never be satisfied now.
     Operations.reply_all(state.operations, {:error, :process_exited})
 
     %{
@@ -699,8 +733,7 @@ defmodule NetRunner.Process do
       | exit_status: exit_status,
         status: :exited,
         awaiting_exit: [],
-        operations: %Operations{},
-        stats: stats
+        operations: %Operations{}
     }
   end
 end
