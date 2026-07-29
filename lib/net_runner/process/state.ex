@@ -22,6 +22,11 @@ defmodule NetRunner.Process.State do
     # dropped). Stats still count every byte. Held as a single binary.
     stderr_tail: <<>>,
     stderr_tail_bytes: 8_192,
+    # Unconsumed bytes read from the shepherd's UDS. The socket is a byte
+    # stream, so a read can deliver half a frame or several frames at once —
+    # a frame boundary is not a read boundary. Anything not yet parsed lives
+    # here until the next read completes it.
+    uds_carry: <<>>,
     status: :starting,
     stats: %Stats{}
   ]
@@ -43,6 +48,7 @@ defmodule NetRunner.Process.State do
           stderr_mode: :consume | :disabled,
           stderr_tail: binary(),
           stderr_tail_bytes: non_neg_integer(),
+          uds_carry: binary(),
           status: status()
         }
 end

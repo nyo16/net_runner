@@ -76,7 +76,11 @@ All I/O goes through the NIF using `enif_select`, which integrates with the BEAM
 2. **Write**: NIF attempts `write(fd)`. Handles partial writes by retrying until `EAGAIN`, then parks.
 3. **Ready notification**: BEAM sends `{:select, resource, ref, :ready_input/:ready_output}` to the GenServer, which retries parked operations.
 
-All NIF functions run on dirty IO schedulers to prevent BEAM scheduler stalls.
+All NIF functions run on **normal** schedulers. Every fd is set to `O_NONBLOCK`
+by `nif_create_fd`, so every syscall is bounded and a dirty-scheduler handoff
+would be pure overhead — see ADR-6 in `decisions.md` for the measurements.
+`nif_read`/`nif_write` call `enif_consume_timeslice` in proportion to the bytes
+they moved.
 
 ## PTY Mode
 
@@ -99,6 +103,6 @@ When `cgroup_path:` is set:
 
 Every NetRunner process is fully independent:
 - Each command gets its own shepherd process, pipe FDs, and GenServer
-- NIF functions run on BEAM's dirty IO scheduler pool (default 10 threads)
+- NIF functions run on the normal scheduler pool; no dirty-scheduler queue to contend for
 - `enif_select` integrates with BEAM's epoll/kqueue — handles thousands of concurrent FDs
 - No global lock, no shared process manager

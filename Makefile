@@ -50,7 +50,9 @@ ifeq ($(SANITIZE),1)
 	SHEPHERD_LDFLAGS += $(SAN_FLAGS)
 endif
 
-NIF_CFLAGS = $(CFLAGS) -I$(ERTS_INCLUDE_DIR) -I$(C_SRC_DIR) -fPIC
+# -fvisibility=hidden: only nif_init needs to be exported, and ERL_NIF_INIT
+# already marks it default-visible.
+NIF_CFLAGS = $(CFLAGS) -I$(ERTS_INCLUDE_DIR) -I$(C_SRC_DIR) -fPIC -fvisibility=hidden
 
 # Targets
 SHEPHERD = $(PRIV_DIR)/shepherd

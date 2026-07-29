@@ -1,9 +1,21 @@
 /*
  * net_runner_nif.c - NIF for async I/O on raw file descriptors
  *
- * All functions run on dirty IO schedulers to avoid blocking normal schedulers.
- * Uses enif_select for async readiness notification integrated with BEAM's
- * epoll/kqueue event loop.
+ * Every function here runs on a NORMAL scheduler, deliberately. nif_create_fd
+ * puts each fd in O_NONBLOCK and rejects anything that is not a pipe, socket
+ * or character device (a PTY master), so every syscall in this file is
+ * bounded: read/write cannot wait, and kill/dup/fcntl/close never could.
+ * Readiness is delivered by enif_select through BEAM's own epoll/kqueue loop,
+ * so there is nothing here to block on.
+ *
+ * Do NOT reintroduce ERL_NIF_DIRTY_JOB_IO_BOUND. A dirty-scheduler handoff
+ * measured ~0.5-10 ms on a busy host (30 spinning scheduler threads on 10
+ * cores must wait for an OS timeslice) against ~30 ns for a plain
+ * normal-scheduler NIF call, and a streamed chunk pays two hops — one
+ * nif_read returning data, one returning EAGAIN to re-arm enif_select. That
+ * single flag cost ~280x of the achievable stdout throughput. Running on a
+ * normal scheduler instead obliges nif_read/nif_write to declare the work
+ * they did via enif_consume_timeslice.
  *
  * Resources:
  *   io_resource_t - wraps a raw FD with mutex protection, owner monitoring,
@@ -15,6 +27,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "erl_nif.h"
@@ -86,8 +99,13 @@ static void io_resource_down(ErlNifEnv *env, void *obj, ErlNifPid *pid,
     if (fd_to_stop >= 0) {
         /* Hand fd off to the stop callback — it will close it after any
          * in-flight enif_select completes. */
-        enif_select(env, (ErlNifEvent)fd_to_stop, ERL_NIF_SELECT_STOP,
-                    obj, NULL, enif_make_atom(env, "undefined"));
+        if (enif_select(env, (ErlNifEvent)fd_to_stop, ERL_NIF_SELECT_STOP,
+                        obj, NULL, enif_make_atom(env, "undefined")) < 0) {
+            /* No stop callback will run and there is no caller to report to,
+             * so close directly rather than leak the fd for the lifetime of
+             * the VM. */
+            close(fd_to_stop);
+        }
     }
 }
 
@@ -131,6 +149,23 @@ static const char *errno_to_atom(int err) {
     }
 }
 
+/*
+ * Charge the scheduler for a byte copy.
+ *
+ * nif_read/nif_write run on normal schedulers, so they must declare the work
+ * they did or they distort the reduction budget of the calling process. Model:
+ * ~1 MiB of copying counts as one full ~1 ms timeslice. That is deliberately
+ * pessimistic (a 1 MiB copy measures ~30-60 us on an M1), which is the safe
+ * direction — over-reporting only yields the scheduler sooner. Anything
+ * smaller still pays the 1% floor, since enif_consume_timeslice rejects 0.
+ */
+static void consume_bytes_timeslice(ErlNifEnv *env, size_t n) {
+    int pct = (int)((n * 100) / 1048576);
+    if (pct < 1) pct = 1;
+    if (pct > 100) pct = 100;
+    (void)enif_consume_timeslice(env, pct);
+}
+
 /* ---- NIF Functions ---- */
 
 /*
@@ -151,6 +186,21 @@ static ERL_NIF_TERM nif_create_fd(ErlNifEnv *env, int argc,
     ErlNifPid owner;
     if (!enif_get_local_pid(env, argv[1], &owner)) {
         return enif_make_badarg(env);
+    }
+
+    /* Enforce the non-blocking precondition this whole NIF depends on rather
+     * than trusting it: O_NONBLOCK is honoured by pipes, sockets and PTY
+     * masters, but a regular file ignores it and read() on one WOULD block a
+     * normal scheduler. */
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        return enif_make_tuple2(env, atom_error,
+                                MAKE_ATOM(env, "invalid_fd"));
+    }
+    if (!S_ISFIFO(st.st_mode) && !S_ISSOCK(st.st_mode) &&
+        !S_ISCHR(st.st_mode)) {
+        return enif_make_tuple2(env, atom_error,
+                                MAKE_ATOM(env, "unsupported_fd_type"));
     }
 
     /* Set non-blocking */
@@ -184,10 +234,17 @@ static ERL_NIF_TERM nif_create_fd(ErlNifEnv *env, int argc,
                                 MAKE_ATOM(env, "mutex_failed"));
     }
 
-    /* Monitor the owner process */
-    if (enif_monitor_process(env, res, &owner, &res->monitor) == 0) {
-        res->monitor_active = 1;
+    /* Monitor the owner process. This monitor is the only leak safety net the
+     * resource has: a resource with a live enif_select relation is never
+     * destructed, so without it a brutally-killed owner would leak the fd for
+     * the lifetime of the VM. Refuse to hand out a resource we cannot clean
+     * up. */
+    if (enif_monitor_process(env, res, &owner, &res->monitor) != 0) {
+        enif_release_resource(res); /* dtor closes the fd */
+        return enif_make_tuple2(env, atom_error,
+                                MAKE_ATOM(env, "monitor_failed"));
     }
+    res->monitor_active = 1;
 
     ERL_NIF_TERM resource_term = enif_make_resource(env, res);
     enif_release_resource(res);
@@ -216,8 +273,27 @@ static ERL_NIF_TERM nif_read(ErlNifEnv *env, int argc,
     }
     if (max_bytes > 1048576) max_bytes = 1048576; /* Cap at 1MB */
 
+    /* Read into a stack buffer for the common sizes and allocate an
+     * exactly-sized binary only once we know how many bytes actually arrived.
+     * Allocating up front cost a full max_bytes alloc+free on every EAGAIN —
+     * roughly half of all calls in a demand-driven loop — plus an
+     * enif_realloc_binary shrink on every short read. 64 KiB of stack is well
+     * inside a scheduler thread's stack budget; above that we keep the
+     * alloc-then-shrink path rather than growing the C frame to 1 MiB. */
+    unsigned char stackbuf[65536];
     ErlNifBinary bin;
-    if (!enif_alloc_binary(max_bytes, &bin)) {
+    unsigned char *dst;
+    int on_stack = max_bytes <= sizeof(stackbuf);
+
+    /* Only the heap path touches bin before a successful alloc; zero it so no
+     * compiler has to prove that. */
+    memset(&bin, 0, sizeof(bin));
+
+    if (on_stack) {
+        dst = stackbuf;
+    } else if (enif_alloc_binary(max_bytes, &bin)) {
+        dst = bin.data;
+    } else {
         return enif_make_tuple2(env, atom_error, MAKE_ATOM(env, "alloc_failed"));
     }
 
@@ -227,22 +303,31 @@ static ERL_NIF_TERM nif_read(ErlNifEnv *env, int argc,
     enif_mutex_lock(res->lock);
     if (res->closed || res->fd < 0) {
         enif_mutex_unlock(res->lock);
-        enif_release_binary(&bin);
+        if (!on_stack) enif_release_binary(&bin);
         return enif_make_tuple2(env, atom_error, MAKE_ATOM(env, "closed"));
     }
     int fd = res->fd;
 
-    ssize_t n = read(fd, bin.data, bin.size);
+    ssize_t n = read(fd, dst, (size_t)max_bytes);
     int saved_errno = errno;
 
     if (n > 0) {
         enif_mutex_unlock(res->lock);
-        enif_realloc_binary(&bin, (size_t)n);
+        if (on_stack) {
+            if (!enif_alloc_binary((size_t)n, &bin)) {
+                return enif_make_tuple2(env, atom_error,
+                                        MAKE_ATOM(env, "alloc_failed"));
+            }
+            memcpy(bin.data, stackbuf, (size_t)n);
+        } else {
+            enif_realloc_binary(&bin, (size_t)n);
+        }
+        consume_bytes_timeslice(env, (size_t)n);
         return enif_make_tuple2(env, atom_ok, enif_make_binary(env, &bin));
     }
     if (n == 0) {
         enif_mutex_unlock(res->lock);
-        enif_release_binary(&bin);
+        if (!on_stack) enif_release_binary(&bin);
         return atom_eof;
     }
     if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
@@ -250,7 +335,7 @@ static ERL_NIF_TERM nif_read(ErlNifEnv *env, int argc,
                                   ERL_NIF_SELECT_READ, res, NULL,
                                   atom_undefined);
         enif_mutex_unlock(res->lock);
-        enif_release_binary(&bin);
+        if (!on_stack) enif_release_binary(&bin);
         if (sel_ret < 0) {
             return enif_make_tuple2(env, atom_error,
                                     MAKE_ATOM(env, "select_failed"));
@@ -258,7 +343,7 @@ static ERL_NIF_TERM nif_read(ErlNifEnv *env, int argc,
         return enif_make_tuple2(env, atom_error, atom_eagain);
     }
     enif_mutex_unlock(res->lock);
-    enif_release_binary(&bin);
+    if (!on_stack) enif_release_binary(&bin);
     return enif_make_tuple2(env, atom_error,
                             MAKE_ATOM(env, errno_to_atom(saved_errno)));
 }
@@ -301,6 +386,7 @@ static ERL_NIF_TERM nif_write(ErlNifEnv *env, int argc,
 
     if (n > 0) {
         enif_mutex_unlock(res->lock);
+        consume_bytes_timeslice(env, (size_t)n);
         return enif_make_tuple2(env, atom_ok, enif_make_int64(env, (int64_t)n));
     }
     /* write() returning 0 on a non-empty buffer (bin.size > 0 here) is rare
@@ -360,8 +446,16 @@ static ERL_NIF_TERM nif_close(ErlNifEnv *env, int argc,
      * registration to drain before calling stop, which then close()s the fd.
      * Concurrent nif_read/nif_write serialize on res->lock; once they observe
      * closed==1 they early-out without touching the fd. */
-    enif_select(env, (ErlNifEvent)fd, ERL_NIF_SELECT_STOP, res, NULL,
-                atom_undefined);
+    int sel_ret = enif_select(env, (ErlNifEvent)fd, ERL_NIF_SELECT_STOP, res,
+                              NULL, atom_undefined);
+    if (sel_ret < 0) {
+        /* Diagnostic only, not a retry request: the fd is already marked
+         * closed and the monitor is already gone, so there is nothing left to
+         * roll back or call again. The fd is leaked and the caller should log
+         * that fact. */
+        return enif_make_tuple2(env, atom_error,
+                                MAKE_ATOM(env, "select_failed"));
+    }
 
     return atom_ok;
 }
@@ -502,13 +596,15 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
 }
 
 static ErlNifFunc nif_funcs[] = {
-    {"nif_create_fd", 2, nif_create_fd, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"nif_read", 2, nif_read, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"nif_write", 2, nif_write, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"nif_close", 1, nif_close, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"nif_dup_fd", 1, nif_dup_fd, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"nif_kill", 2, nif_kill, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"nif_is_os_pid_alive", 1, nif_is_os_pid_alive, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    /* Flags are 0 on purpose — see the file header. Every syscall reachable
+     * from here is bounded, so a dirty-scheduler hop would be pure latency. */
+    {"nif_create_fd", 2, nif_create_fd, 0},
+    {"nif_read", 2, nif_read, 0},
+    {"nif_write", 2, nif_write, 0},
+    {"nif_close", 1, nif_close, 0},
+    {"nif_dup_fd", 1, nif_dup_fd, 0},
+    {"nif_kill", 2, nif_kill, 0},
+    {"nif_is_os_pid_alive", 1, nif_is_os_pid_alive, 0},
     {"nif_signal_number", 1, nif_signal_number, 0}
 };
 

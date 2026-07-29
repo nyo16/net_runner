@@ -34,7 +34,7 @@
 **Consequences**:
 - (+) Natural backpressure: reader must call `nif_read` to consume data
 - (+) Integrates with BEAM's epoll/kqueue for zero-cost idle waiting
-- (+) Dirty IO schedulers prevent BEAM scheduler stalls
+- (+) Bounded non-blocking syscalls run on normal schedulers — no dirty-scheduler handoff per chunk (see ADR-6)
 - (-) NIF crashes take down the entire BEAM (mitigated by simple, well-tested C code)
 - (-) More complex than Port-based approaches
 
@@ -65,17 +65,41 @@
 - (-) Slightly redundant — both may try to kill the same process
 - (-) Requires careful handling of the race (both use `kill()` which is idempotent)
 
-## ADR-6: Dirty IO Schedulers for All NIFs
+## ADR-6: Normal Schedulers for All NIFs
 
-**Context**: Even "non-blocking" reads can briefly stall if the kernel has work to do.
+**Context**: Originally every NIF was marked `ERL_NIF_DIRTY_JOB_IO_BOUND`, on
+the theory that even a "non-blocking" read can briefly stall if the kernel has
+work to do. Measurement showed the opposite trade: a dirty-scheduler handoff
+costs a thread context switch, and on a host whose dirty schedulers are
+contended (the BEAM starts 10 normal + 10 dirty-CPU + 10 dirty-IO threads, so a
+10-core machine is oversubscribed 3:1) that handoff waits for an OS timeslice.
+Measured on an Apple M1 Max: ~30 ns for a normal-scheduler NIF versus
+0.5–10 ms for a dirty-IO one. A streamed chunk costs two calls (one returning
+data, one returning `EAGAIN` to re-arm `enif_select`), which capped stdout
+throughput at ~6 MiB/s against ~500 MiB/s for a plain `Port`.
 
-**Decision**: Mark all NIF functions as `ERL_NIF_DIRTY_JOB_IO_BOUND`.
+**Decision**: Run every NIF on a normal scheduler (flags `0`).
+
+This is sound because nothing in the NIF can block. `nif_create_fd` sets
+`O_NONBLOCK` and every fd originates from `pipe()`/`pipe2()` or `openpty()`,
+both of which honour it; readiness is delivered asynchronously by `enif_select`.
+`kill(2)`, `dup(2)`, `fcntl(2)` and `close(2)` are all bounded.
 
 **Consequences**:
-- (+) Never blocks BEAM's normal schedulers
-- (+) 10 dirty IO threads by default, configurable via `+SDio`
-- (-) Slightly higher latency (thread context switch to dirty scheduler)
-- (-) Limited by dirty scheduler pool size under extreme concurrency
+- (+) ~280x measured stdout throughput improvement, with no VM tuning required
+- (+) No dependence on dirty scheduler pool sizing (`+SDio`) or busy-wait
+  settings (`+sbwt`) for acceptable performance
+- (-) The non-blocking invariant is now load-bearing. `nif_create_fd` `fstat`s
+  the fd and rejects anything that is not a FIFO, socket or character device: a
+  regular file ignores `O_NONBLOCK` and would stall a normal scheduler. Do not
+  remove that guard.
+- (-) `nif_read`/`nif_write` must report the work they did via
+  `enif_consume_timeslice` so a large buffer copy cannot monopolise a
+  scheduler slot.
+
+**Do not reintroduce `ERL_NIF_DIRTY_JOB_IO_BOUND` here as a safety
+improvement** — it is a 2-3 order of magnitude regression and buys nothing for
+calls that cannot block.
 
 ## ADR-7: Process-per-Command (vs Singleton Manager)
 

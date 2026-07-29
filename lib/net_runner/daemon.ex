@@ -31,6 +31,13 @@ defmodule NetRunner.Daemon do
 
   @type on_output :: :discard | :log | (binary() -> any())
 
+  # terminate/2 must finish inside the supervisor's shutdown budget, which is the
+  # `use GenServer` default of 5_000 ms above — past that the Daemon is
+  # brutal-killed and the SIGKILL escalation never runs. Keep
+  # @sigterm_grace_ms + @sigkill_grace_ms comfortably under that 5_000 ms.
+  @sigterm_grace_ms 3_000
+  @sigkill_grace_ms 1_000
+
   def start_link(opts) do
     {gen_opts, daemon_opts} = Keyword.split(opts, [:name])
     GenServer.start_link(__MODULE__, daemon_opts, gen_opts)
@@ -117,13 +124,27 @@ defmodule NetRunner.Daemon do
     if Proc.alive?(state.proc) do
       Proc.kill(state.proc, :sigterm)
 
-      case Proc.await_exit(state.proc, 5_000) do
-        {:ok, _} -> :ok
-        _ -> Proc.kill(state.proc, :sigkill)
+      case safe_await_exit(state.proc, @sigterm_grace_ms) do
+        {:ok, _} ->
+          :ok
+
+        _ ->
+          Proc.kill(state.proc, :sigkill)
+          safe_await_exit(state.proc, @sigkill_grace_ms)
+          :ok
       end
     end
   catch
     :exit, _ -> :ok
+  end
+
+  # Proc.await_exit/2 is a GenServer.call, so exhausting the grace exits the
+  # caller. Trap that here rather than in terminate/2, where it would unwind
+  # past the SIGKILL escalation and make it unreachable.
+  defp safe_await_exit(proc, timeout) do
+    Proc.await_exit(proc, timeout)
+  catch
+    :exit, _ -> :timeout
   end
 
   defp start_drain(proc, pipe, on_output) do
@@ -142,27 +163,31 @@ defmodule NetRunner.Daemon do
   end
 
   defp drain_loop(reader, proc, on_output) do
-    case reader.(proc) do
+    case safe_read(reader, proc) do
       {:ok, data} ->
         safe_handle_output(on_output, data)
         drain_loop(reader, proc, on_output)
 
-      :eof ->
-        :ok
-
-      {:error, _} ->
+      _stop ->
+        # :eof, {:error, _}, or :error from safe_read/2.
         :ok
     end
+  end
+
+  # Defensive: if reader.() blows up (e.g. Proc already terminated while we were
+  # mid-call), stop draining without bringing down the Daemon. This lives in its
+  # own function because a rescue/catch on drain_loop/3 wraps its whole body in a
+  # try, which takes the self-call above out of tail position — every drained
+  # chunk then leaks a stack frame that is only popped at EOF.
+  defp safe_read(reader, proc) do
+    reader.(proc)
   rescue
-    # Defensive: if reader.() or caller pattern blows up (e.g. Proc already
-    # terminated while we were mid-call), stop draining without bringing
-    # down the Daemon through the linked Task.
     e ->
       require Logger
       Logger.warning("[NetRunner.Daemon] drain exception: #{inspect(e)}")
-      :ok
+      :error
   catch
-    :exit, _ -> :ok
+    :exit, _ -> :error
   end
 
   defp safe_handle_output(on_output, data) do
