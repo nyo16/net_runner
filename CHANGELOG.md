@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 This project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.3.0] - 2026-07-28
 
 Performance and correctness pass driven by measurement. Two defects dominated
 every benchmark: all NIF I/O was routed through dirty IO schedulers, and the
@@ -129,7 +129,75 @@ are medians on an Apple M1 Max (10 cores), OTP 29, default VM flags.
   stack bound, Daemon shutdown budget, early-halted stream teardown, fd-type
   guard).
 
-## [1.1.2]
+## [1.2.2] - 2026-06-28
+
+Bounded the stderr buffer and made `Daemon` stderr handling deterministic.
+
+### Added
+
+- **`NetRunner.Process.stderr_tail/1`** — returns the retained tail of consumed
+  stderr, with a `:stderr_tail_bytes` option (default 8 KB) controlling how
+  much is kept. Useful for diagnosing why a command failed.
+
+### Fixed
+
+- **Unbounded `stderr_buffer` growth in `:consume` mode** — stderr was drained
+  to keep the child from blocking on a full pipe, but every chunk was retained
+  for the life of the process. Retention is now capped at
+  `:stderr_tail_bytes`; a cap of 0 drains and drops. Stats still count every
+  byte.
+- **Lost initial stderr chunk in `:consume` mode**
+  — `kick_stderr_read` in `init/1` sent `{:stderr_data, data}` to
+  `self()` but no `handle_info/2` clause matched, so the first (and
+  often only) chunk of stderr for fast-exiting processes was silently
+  dropped. The missing handler now appends to the stderr buffer and
+  drains any remainder.
+- **`Daemon` stderr interleaving** — the Daemon now forces
+  `stderr: :disabled` on its child process so its own drain task is the sole
+  reader, instead of racing the process's internal consumer for chunks.
+
+## [1.2.1] - 2026-06-06
+
+Follow-up review pass: stderr API surface, UDS permissions, signal
+validation, and Daemon drain isolation.
+
+### Fixed
+
+- **UDS socket permissions** — the socket lived directly in the
+  world-traversable tmp dir, so a same-host attacker who won the accept race
+  against the real shepherd would receive the child's pipe FDs via
+  `SCM_RIGHTS`. It now lives inside a per-spawn `0700` directory, reducing the
+  threat to same-uid processes.
+- **`write_loop` spin on `{:ok, 0}`** — if the kernel ever returned
+  0 bytes on a non-empty write, the GenServer would recurse forever.
+  The NIF now maps a zero-byte write on a non-empty buffer to
+  `:eagain` and registers `enif_select` for write readiness.
+- **`nif_kill` signal range** — signals outside POSIX `1..31` are rejected in
+  the NIF as well as in `Signal.resolve`, mirroring `shepherd.c`'s `CMD_KILL`
+  validation and bounding the blast radius of a stray call.
+- **`:stderr` option validation** — reject anything other than `:consume` or
+  `:disabled` at the spawn boundary rather than silently ignoring it.
+- **O(1) demonitor for parked callers** — `Operations` gained an
+  `op_monitors` reverse index so popping a parked operation no longer scans
+  the monitor map.
+- **Daemon drain isolation** — drain tasks moved to
+  `Task.Supervisor.async_nolink/2` under a new `NetRunner.TaskSupervisor`, so
+  a drain-task crash cannot take the Daemon down through a linked task.
+
+## [1.2.0] - 2026-04-17
+
+### Fixed
+
+- **`read_uds_message` race** — replaced the `:peek` + full-recv
+  pattern (which could time out if the payload arrived a moment
+  after the opcode) with an opcode-first read flow and longer
+  timeouts.
+- **Exit status lost on a slow UDS** — on slow CI runners (notably macOS) the
+  socket buffer could trail the shepherd `Port`'s `{:exit_status, _}`
+  notification, so the real status was missed. `drain_uds_for_exit/2` retries
+  the read instead of falling straight through to the forced timeout.
+
+## [1.1.2] - 2026-04-17
 
 Focused code-review pass across the NIF, shepherd, and Elixir layers.
 Correctness-first: closes two real-world race/leak bugs, hardens the
@@ -150,16 +218,6 @@ post-fork child window, and adds an AddressSanitizer + UBSan CI job.
   across the syscall and the subsequent `enif_select` registration;
   the actual `close()` is deferred to the `io_resource_stop` callback
   so BEAM can drain pending selects before the fd is released.
-- **Lost initial stderr chunk in `:consume` mode**
-  — `kick_stderr_read` in `init/1` sent `{:stderr_data, data}` to
-  `self()` but no `handle_info/2` clause matched, so the first (and
-  often only) chunk of stderr for fast-exiting processes was silently
-  dropped. The missing handler now appends to the stderr buffer and
-  drains any remainder.
-- **`write_loop` spin on `{:ok, 0}`** — if the kernel ever returned
-  0 bytes on a non-empty write, the GenServer would recurse forever.
-  The NIF now maps a zero-byte write on a non-empty buffer to
-  `:eagain` and registers `enif_select` for write readiness.
 - **Shepherd UDS command framing** — the event loop parsed only
   `buf[0]`, discarding any coalesced or tail commands (e.g.
   `CMD_CLOSE_STDIN` followed immediately by `CMD_KILL`). Frames are
@@ -198,10 +256,6 @@ post-fork child window, and adds an AddressSanitizer + UBSan CI job.
   EAGAIN are now `Process.monitor/1`-ed; dead callers are pruned on
   `:DOWN` instead of lingering in the pending map until process
   exit.
-- **`read_uds_message` race** — replaced the `:peek` + full-recv
-  pattern (which could time out if the payload arrived a moment
-  after the opcode) with an opcode-first read flow and longer
-  timeouts.
 - **`cmd` / `args` validation** — reject non-binary, empty, or
   NUL-containing cmd and args at the spawn boundary. Passing NUL
   bytes through `Port.open`'s `args:` is undefined on the C side.
@@ -239,6 +293,29 @@ post-fork child window, and adds an AddressSanitizer + UBSan CI job.
   path, stderr-only fast-exit stats, binary-with-NUL round-trip, and
   `NetRunner.run` / `NetRunner.stream` returning validation errors
   cleanly.
+
+## [1.1.0] - 2026-03-21
+
+### Added
+
+- **Command DSL** — `NetRunner.Command` for reusable command templates, with
+  `defcommand` for compile-time definitions. `NetRunner.run/2` and
+  `NetRunner.stream/2` accept a `%NetRunner.Command{}` in place of a
+  `[cmd | args]` list.
+
+## [1.0.4] - 2026-03-01
+
+### Fixed
+
+- Publish pipeline ran with the wrong `MIX_ENV`, so `ex_doc` was unavailable
+  when building docs for Hex.
+
+## [1.0.1] - 2026-03-01
+
+### Fixed
+
+- Security hardening and file-descriptor leak fixes across the NIF and
+  shepherd.
 
 ## [1.0.0] - 2026-02-26
 

@@ -12,7 +12,7 @@ NetRunner combines NIF-based async I/O (`enif_select`) with a persistent **sheph
 ```elixir
 def deps do
   [
-    {:net_runner, "~> 1.0"}
+    {:net_runner, "~> 1.3"}
   ]
 end
 ```
