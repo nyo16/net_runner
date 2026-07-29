@@ -10,7 +10,9 @@
 # Where third-party dependencies like ExDoc output generated docs.
 /doc/
 
-# Temporary files, for example, from tests.
+# Temporary files, for example, from tests. Also holds local-only planning
+# artifacts (tmp/plans, tmp/audit, tmp/prs) — the record of why the code looks
+# the way it does, kept out of the repo deliberately.
 /tmp/
 
 # If the VM crashes, it generates a dump, let's ignore it too.
@@ -34,6 +36,5 @@ c_src/*.o
 # Local .tool-versions
 .tool-versions
 
-# Local agent settings (the rest of .claude/ — plans, scratchpads, audits — is
-# tracked deliberately: it is the record of why the code looks the way it does).
-.claude/settings.local.json
+# Local agent settings and scratch.
+/.claude/

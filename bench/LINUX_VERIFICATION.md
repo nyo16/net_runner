@@ -1,8 +1,14 @@
 # Linux verification — handoff
 
 **Branch**: `perf/io-pipelining-followup`
-**Plan**: `.claude/plans/perf-io-followup/plan.md`
-**Results so far**: `.claude/audit/2026-07-29-io-pipelining.md`
+**Commit**: the single `perf:` commit on this branch — its message is the
+condensed changelog and is worth reading first.
+
+> The planning artifacts for this work (plan, scratchpad, before/after audit)
+> are **local-only** and deliberately not in the repo — they live under `tmp/`,
+> which is gitignored. You do not need them: everything actionable has been
+> inlined below. If you *do* have the authoring working copy, `tmp/plans/` and
+> `tmp/audit/` have the long form.
 
 Everything in this branch was implemented and measured on **macOS 25.5, Apple
 M1 Max, OTP 29 / erts 17.0.3**. Four things cannot be verified on that host.
@@ -82,9 +88,12 @@ still has unreaped tasks in the cgroup. A single `echo` in its own cgroup will
 `rmdir` on the **first** attempt and cost 0 ms. Measure that and you will
 "prove" a 0 ms delta in both orderings and learn nothing.
 
-This is the same failure mode as N9 in
-`.claude/plans/perf-io-followup/scratchpad.md`: a test that passes against a
-path that never executes reads like coverage and is worse than no test.
+This is the single most likely way to waste the trip, and it already happened
+once on the macOS side with a different test: the obvious stderr-flood test
+passed, *and* passed the mutation that broke the code it was supposed to guard,
+because a 64 KiB pipe never let the drain reach its budget. A test that passes
+against a path that never executes reads like coverage and is worse than no
+test.
 
 **You must force at least one `EBUSY`.** Give the cgroup a straggler that
 outlives the direct child, so `cgroup.kill` + reap takes longer than the
@@ -171,9 +180,12 @@ change is never *worse* (65 536 ≥ 65 535, and both stay under `nif_read`'s
 honesty in the published number, not about whether to keep the change.
 
 **Do not** raise the read size to exploit the 1 MiB Linux pipe without reading
-X4 in `.claude/plans/perf-io-followup/scratchpad.md` first. Above 65 536 every
-read falls off the NIF's stack fast path into `enif_alloc_binary` + shrink. A
-platform-conditional read size is a real idea but a separate, bigger decision.
+the upper bound in ADR-9 (`docs/decisions.md`) first. `nif_read`'s fast path is
+`on_stack = max_bytes <= sizeof(stackbuf)` against a 65 536-byte stack buffer,
+so at 65 537 every read falls into `enif_alloc_binary` + `enif_realloc_binary`
+shrink — reintroducing exactly the per-call allocation cycle the previous cycle
+removed, and giving back more than the alignment won. A platform-conditional
+read size is a real idea, but it is a separate and bigger decision.
 
 ---
 
@@ -219,8 +231,8 @@ Read `bench/README.md` first, especially the variance section: medians over
 interleaved rounds, never a single round, and never a "before" round taken
 minutes apart from an "after" round.
 
-Worth comparing against the macOS column in
-`.claude/audit/2026-07-29-io-pipelining.md`:
+Compare against the macOS column, measured on an idle Apple M1 Max (10 cores),
+OTP 29 / erts 17.0.3, `MIX_ENV=prod`:
 
 | probe | macOS result | why Linux may differ |
 |---|---|---|
@@ -250,18 +262,20 @@ stderr pipe, and the test fails by timeout rather than by assertion.
 
 Update these, in this order:
 
-1. **`.claude/audit/2026-07-29-io-pipelining.md`** — add a Linux column. Do not
-   overwrite the macOS numbers; the point is that they are two hosts.
-2. **`CHANGELOG.md`**, `[Unreleased]`:
+1. **`CHANGELOG.md`**, `[Unreleased]`:
    - The Phase 3 entry currently ends with *"**Not verified on Linux with a real
      cgroup**"*. Replace with the measurement, or with what you found instead.
    - The read-size entry says *"The win is macOS-shaped"*. Put the Linux figure
      next to it.
-3. **`.claude/plans/perf-io-followup/plan.md`** — the last unchecked box in
-   Phase 7 is the Linux run. Check it with a one-line note.
-4. **`.claude/plans/perf-io-followup/scratchpad.md`** — append anything
-   surprising. That file is the institutional memory for this work and it has
-   already paid for itself twice.
+2. **This file** — replace each task with its result, so the next person does
+   not repeat the run. Keep the macOS numbers alongside the Linux ones; the
+   whole point is that they are two hosts.
+3. **`docs/decisions.md`** ADR-9 — its consequences section predicts the Linux
+   win is "much weaker". Confirm or correct that with the real figure.
+4. If you have the authoring working copy: `tmp/plans/perf-io-followup/plan.md`
+   has one unchecked box (the Linux run) and
+   `tmp/plans/perf-io-followup/scratchpad.md` is where anything surprising
+   belongs. Skip both if you cloned fresh — nothing depends on them.
 
 Then this branch is ready to merge and tag.
 
@@ -269,24 +283,31 @@ Then this branch is ready to merge and tag.
 
 ## Context, in reading order
 
+Everything below is in the repo; nothing here depends on the local-only
+artifacts.
+
 | file | what it gives you |
 |---|---|
-| `.claude/plans/perf-io-followup/plan.md` | the full plan, with per-task implementation notes appended inline |
-| `.claude/plans/perf-io-followup/scratchpad.md` | decisions (E1–E10), rejected alternatives (X1–X7), dead ends (N1–N11). **Read N9 and N11 before writing any test or trusting any target.** |
-| `.claude/audit/2026-07-29-io-pipelining.md` | every before/after number, plus the mutation checks |
-| `CHANGELOG.md` `[Unreleased]` | the user-facing summary |
-| `docs/decisions.md` ADR-9 | why the read size is exactly 65 536, bounded on both sides |
-| `docs/architecture.md` | the two-`exec` spawn cost, and why `:input` must be written concurrently |
+| the branch's commit message | the condensed changelog: what broke, what changed, what was measured |
+| `CHANGELOG.md` `[Unreleased]` | the same, user-facing, with the caveats spelled out |
+| `docs/decisions.md` ADR-9 | why the read size is exactly 65 536, bounded on *both* sides |
+| `docs/architecture.md` | the two-`exec` spawn cost, and why `:input` must be written concurrently with reading |
 | `bench/README.md` | how to run the harness and how to read its noise |
+| `test/io_pipelining_test.exs` | the Phase 1/2/4 regression guards, with the reasoning in comments |
 
 ### Two things that will save you time
 
-**N9 — verify your test fails.** The obvious stderr-flood test passed *and*
-passed the mutation that broke the code it was supposed to guard, because a
-64 KiB pipe never let the drain reach its budget. Every regression guard in this
-branch was mutation-checked; see the table at the end of the audit. Do the same
-for anything you add.
+**Verify your test fails.** Every regression guard on this branch was
+mutation-checked — the change it guards was reverted and the test confirmed to
+fail. Three examples, all of which did fail as intended: reverting
+`@default_read_size` to 65 535 ("134 tiny chunks"); renaming the
+`handle_info(:consume_stderr_more, …)` clause so the catch-all swallows it
+(30 s `await_exit` timeout); and `keep = cap - size - 1` in
+`append_stderr_tail/3` (3 of 10 tail tests). Do the same for anything you add,
+especially in Task A where the slow path is easy to miss entirely.
 
-**N11 — a stated target can be arithmetically impossible.** The plan asked for
-"`run/2` 128 KiB through `cat` ≥ 500 MB/s" on a bench row that spans one ~5 ms
-spawn. Check the arithmetic before chasing a number.
+**A stated target can be arithmetically impossible.** The original plan asked
+for "`run/2` 128 KiB through `cat` ≥ 500 MB/s" on a bench row that spans one
+full spawn — whose floor the same plan documents at ~5.3 ms. That would need
+the transfer *and* the spawn inside 0.25 ms. The row was measuring spawn
+latency in MB/s units. Check the arithmetic before chasing a number.
