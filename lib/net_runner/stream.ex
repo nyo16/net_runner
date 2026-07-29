@@ -8,6 +8,7 @@ defmodule NetRunner.Stream do
   Typically used through `NetRunner.stream!/2` or `NetRunner.stream/2`.
   """
 
+  alias NetRunner.InputWriter
   alias NetRunner.Process, as: Proc
 
   # A stream that reached :eof has a child which already closed stdout, so it is
@@ -63,75 +64,31 @@ defmodule NetRunner.Stream do
         # the monitor, so the spawn-time owner still covers the window before
         # the first consumption.
         Proc.set_owner(pid, self())
-        start_writer(pid, input)
+        {:reading, InputWriter.start(pid, input)}
       end,
       fn acc -> read_next(pid, acc) end,
       fn
-        {:error, proc_pid, reason} ->
-          cleanup_process(proc_pid, :halted)
-          raise "writer task crashed: #{inspect(reason)}"
-
-        :done ->
+        {:done, writer} ->
+          InputWriter.reap(writer, :done)
           cleanup_process(pid, :eof)
 
-        _acc ->
-          # Still :reading or {:writing, _} — the consumer halted early.
+        {:reading, writer} ->
+          # The consumer halted mid-stream.
+          InputWriter.reap(writer, :halted)
           cleanup_process(pid, :halted)
       end
     )
   end
 
-  defp start_writer(pid, nil) do
-    # No input — close stdin immediately
-    Proc.close_stdin(pid)
-    :reading
-  end
-
-  defp start_writer(pid, input) when is_binary(input) do
-    writer =
-      Task.async(fn ->
-        Proc.write(pid, input)
-        Proc.close_stdin(pid)
-      end)
-
-    {:writing, writer}
-  end
-
-  defp start_writer(pid, %Stream{} = input) do
-    start_writer(pid, {:enumerable, input})
-  end
-
-  defp start_writer(pid, {:enumerable, enumerable}) do
-    writer =
-      Task.async(fn ->
-        Enum.each(enumerable, fn chunk ->
-          Proc.write(pid, chunk)
-        end)
-
-        Proc.close_stdin(pid)
-      end)
-
-    {:writing, writer}
-  end
-
-  defp start_writer(pid, input) when is_list(input) do
-    start_writer(pid, {:enumerable, input})
-  end
-
-  defp read_next(pid, {:writing, writer} = acc) do
-    # Check if writer is done, but don't block
-    case Task.yield(writer, 0) do
-      {:ok, _} -> read_next(pid, :reading)
-      {:exit, reason} -> {:halt, {:error, pid, reason}}
-      nil -> do_read(pid, acc)
-    end
-  end
-
-  defp read_next(pid, :reading) do
-    do_read(pid, :reading)
-  end
-
-  defp do_read(pid, acc) do
+  # The writer is carried through the accumulator untouched and reaped once in
+  # the after-fun. It used to be polled with `Task.yield(writer, 0)` on *every*
+  # stdout chunk — a selective receive with `after 0`, so O(mailbox length) per
+  # chunk: free for a bare consumer, pathological for a GenServer or LiveView
+  # with unrelated traffic in its mailbox. Its only jobs were flipping the
+  # accumulator and prettifying a writer crash, and `Task.async` links, so an
+  # abnormal writer exit already takes the consumer down before a poll could
+  # observe it.
+  defp read_next(pid, {:reading, writer} = acc) do
     case Proc.read(pid) do
       {:ok, data} ->
         {[data], acc}
@@ -139,10 +96,10 @@ defmodule NetRunner.Stream do
       # Distinct terminal accumulator: the after-fun uses it to tell a natural
       # end-of-stream apart from a consumer that halted mid-stream.
       :eof ->
-        {:halt, :done}
+        {:halt, {:done, writer}}
 
       {:error, :process_exited} ->
-        {:halt, :done}
+        {:halt, {:done, writer}}
 
       {:error, reason} ->
         raise "read error: #{inspect(reason)}"
@@ -151,6 +108,23 @@ defmodule NetRunner.Stream do
 
   # :eof — the child closed stdout on its own, so wait briefly for it to reap.
   defp cleanup_process(pid, :eof) do
+    reap_child(pid, :eof)
+    Proc.stop(pid)
+  end
+
+  # Halted early — the child is still producing output nobody will read, so
+  # signal it immediately and keep the wait short.
+  defp cleanup_process(pid, :halted) do
+    reap_child(pid, :halted)
+    Proc.stop(pid)
+  end
+
+  # Proc.stop/1 is the answer to the teardown question cycle 1 left open: the
+  # after-fun used to leave the server running and rely on the owner monitor,
+  # which only fires when the *consumer* dies. A long-lived consumer — a
+  # GenServer or LiveView streaming many commands — accumulated one Process
+  # GenServer, one Watcher, a UDS socket and three pipe FDs per stream.
+  defp reap_child(pid, :eof) do
     if Process.alive?(pid) do
       Proc.close_stdin(pid)
       stop_process(pid, @eof_grace_ms)
@@ -159,9 +133,7 @@ defmodule NetRunner.Stream do
     :exit, _ -> :ok
   end
 
-  # Halted early — the child is still producing output nobody will read, so
-  # signal it immediately and keep the wait short.
-  defp cleanup_process(pid, :halted) do
+  defp reap_child(pid, :halted) do
     if Process.alive?(pid) do
       Proc.kill(pid, :sigterm)
       stop_process(pid, @halted_grace_ms)

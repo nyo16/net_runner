@@ -21,6 +21,7 @@ defmodule NetRunner do
       # => "       5\\n"
   """
 
+  alias NetRunner.InputWriter
   alias NetRunner.Process, as: Proc
   alias NetRunner.Stream, as: NRStream
 
@@ -40,7 +41,10 @@ defmodule NetRunner do
     * `:stderr_tail_bytes` - cap (bytes) on the retained stderr tail. Default
       `8192`. `0` retains nothing. The tail is raw bytes and may begin
       mid-character, so treat it as diagnostic text, not valid UTF-8.
-    * `:input` - data to write to stdin (binary or enumerable)
+    * `:input` - data to write to stdin. A binary, a list of binaries, or a
+      `Stream` — the same three shapes `stream!/2` accepts. Written by a
+      concurrent task while stdout is being read, so an input larger than the
+      OS pipe buffers does not deadlock. Stdin is closed after the last chunk.
     * `:timeout` - maximum wall-clock time in milliseconds. Sends SIGTERM then SIGKILL
       on timeout. Returns `{:error, :timeout}` instead of `{output, exit_status}`.
     * `:max_output_size` - maximum bytes to collect from stdout. Kills the process
@@ -95,22 +99,29 @@ defmodule NetRunner do
 
     effective_timeout = timeout || :infinity
 
-    case Task.yield(task, effective_timeout) || Task.shutdown(task) do
-      {:ok, {output, exit_status}} when is_binary(output) and is_integer(exit_status) ->
-        {output, exit_status}
+    result =
+      case Task.yield(task, effective_timeout) || Task.shutdown(task) do
+        {:ok, {output, exit_status}} when is_binary(output) and is_integer(exit_status) ->
+          {output, exit_status}
 
-      {:ok, {:error, _} = error} ->
-        kill_and_cleanup(pid)
-        error
+        {:ok, {:error, _} = error} ->
+          kill_and_cleanup(pid)
+          error
 
-      nil ->
-        kill_and_cleanup(pid)
-        {:error, :timeout}
+        nil ->
+          kill_and_cleanup(pid)
+          {:error, :timeout}
 
-      {:exit, reason} ->
-        kill_and_cleanup(pid)
-        {:error, {:task_crashed, reason}}
-    end
+        {:exit, reason} ->
+          kill_and_cleanup(pid)
+          {:error, {:task_crashed, reason}}
+      end
+
+    # run/2 never hands the pid to the caller, so nothing else can ever stop
+    # this server. Without it, each call leaks the Process GenServer, its
+    # Watcher, the UDS socket and three pipe FDs for the lifetime of the VM.
+    Proc.stop(pid)
+    result
   end
 
   @doc """
@@ -173,16 +184,6 @@ defmodule NetRunner do
 
   # --- Private ---
 
-  defp write_all_input(pid, input) when is_binary(input) do
-    Proc.write(pid, input)
-    Proc.close_stdin(pid)
-  end
-
-  defp write_all_input(pid, input) when is_list(input) do
-    Enum.each(input, &Proc.write(pid, &1))
-    Proc.close_stdin(pid)
-  end
-
   defp read_all_with_limits(pid, max_output_size) do
     read_all_loop(pid, max_output_size, 0, [])
   end
@@ -211,18 +212,22 @@ defmodule NetRunner do
   end
 
   defp run_io(pid, input, max_output_size) do
-    if input do
-      write_all_input(pid, input)
-    else
-      Proc.close_stdin(pid)
-    end
+    # The writer must run concurrently with the reader. Writing to completion
+    # first deadlocks any filter command once the input exceeds
+    # stdin_buffer + stdout_buffer (~128 KiB on macOS): the child fills its
+    # stdout pipe, blocks in write(2), and therefore stops draining stdin,
+    # while we are blocked filling stdin. Neither side can move and the
+    # default :timeout of nil means there is no escape.
+    writer = InputWriter.start(pid, input)
 
     case read_all_with_limits(pid, max_output_size) do
       {:ok, output} ->
+        InputWriter.reap(writer, :done)
         {:ok, exit_status} = Proc.await_exit(pid)
         {output, exit_status}
 
       {:error, _} = error ->
+        InputWriter.reap(writer, :halted)
         error
     end
   end

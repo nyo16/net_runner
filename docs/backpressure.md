@@ -12,14 +12,14 @@ NetRunner uses NIF-based I/O with `enif_select` to implement demand-driven backp
 sequenceDiagram
     participant E as Elixir Consumer
     participant GS as GenServer
-    participant NIF as NIF (dirty IO)
+    participant NIF as NIF (normal scheduler)
     participant Pipe as OS Pipe Buffer
     participant Child as Child Process
 
     E->>GS: Process.read(p)
-    GS->>NIF: nif_read(fd, 65535)
+    GS->>NIF: nif_read(fd, 65536)
     alt Data available
-        NIF->>Pipe: read(fd, buf, 65535)
+        NIF->>Pipe: read(fd, buf, 65536)
         Pipe-->>NIF: bytes
         NIF-->>GS: {:ok, binary}
         GS-->>E: {:ok, binary}
@@ -29,7 +29,7 @@ sequenceDiagram
         GS->>GS: Park caller in operations queue
         Note over Pipe,Child: Child writes, pipe fills
         Pipe-->>GS: {:select, fd, ref, :ready_input}
-        GS->>NIF: nif_read(fd, 65535) [retry]
+        GS->>NIF: nif_read(fd, 65536) [retry]
         NIF-->>GS: {:ok, binary}
         GS-->>E: {:ok, binary}
     end
@@ -41,7 +41,9 @@ sequenceDiagram
 
 1. `NetRunner.Process.read/2` calls `GenServer.call(pid, {:read, :stdout, max_bytes}, :infinity)`
 2. GenServer tries `Pipe.read(pipe, max_bytes)` → calls `Nif.nif_read(resource, max_bytes)`
-3. NIF runs on dirty IO scheduler:
+3. NIF runs on a normal scheduler (see ADR-6); `max_bytes` defaults to
+   `65_536`, exactly one pipe buffer and exactly the NIF's stack-buffer size
+   (see ADR-9):
    - Calls `read(fd, buf, max_bytes)`
    - If data available: returns `{:ok, binary}` immediately
    - If `EAGAIN`: calls `enif_select(fd, ERL_NIF_SELECT_READ)`, returns `{:error, :eagain}`

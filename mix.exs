@@ -64,6 +64,16 @@ defmodule NetRunner.MixProject do
       main: "NetRunner",
       source_ref: "v#{@version}",
       source_url: @source_url,
+      # These are all @moduledoc false, so every reference to them from an
+      # extra resolves to a hidden entry and warns. The docs cite them by name
+      # deliberately — they are the framing contract, the writer convention and
+      # the read-size source of truth respectively — so suppress the autolink
+      # rather than the prose or the modules' internal status.
+      skip_code_autolink_to: [
+        "NetRunner.Process.Exec.parse_uds_message/1",
+        "NetRunner.InputWriter",
+        "NetRunner.Process.Pipe.read/2"
+      ],
       extras: [
         "README.md",
         "LICENSE",

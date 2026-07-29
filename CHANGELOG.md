@@ -4,6 +4,123 @@ All notable changes to this project will be documented in this file.
 
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Second measurement-driven cycle against the code 1.3.0 produced. One liveness
+bug, one one-byte constant that cost 42% of read wall time, one resource leak
+found while fixing it, and three responsiveness fixes. Numbers are medians on
+an Apple M1 Max (10 cores), OTP 29 / erts 17.0.3, `MIX_ENV=prod`; the harness
+that produced them is now committed under `bench/`.
+
+### Fixed
+
+- **`run/2` hung forever on `:input` larger than ~128 KiB.** `run_io/3` wrote
+  the whole of `:input` to completion before the read loop started, so any
+  filter command — `cat`, `gzip`, `jq` — filled its 64 KiB stdout pipe, blocked
+  in `write(2)`, stopped draining stdin, and left us blocked filling a full
+  stdin pipe. Neither side could move, and `run/2`'s default `:timeout` of
+  `nil` means `:infinity`, so there was no escape. Measured: completed for
+  input ≤ 131 072 bytes, hung indefinitely at ≥ 262 144. `stream!/2` was never
+  affected — it has always written from a `Task`. The writer now runs
+  concurrently with the reader in both entry points, sharing one
+  implementation (`NetRunner.InputWriter`) so they cannot drift apart again.
+  16 MiB through `cat`: `run/2` 1163 MB/s vs `stream!/2` 1130 MB/s.
+  - `run/2`'s `:input` now accepts the same three shapes as `stream!/2` — a
+    binary, a list of binaries, or a `Stream`. The docs previously advertised
+    "binary or enumerable" while the code handled only binaries and lists.
+- **`run/2` and `stream!/2` leaked a `NetRunner.Process` GenServer per call.**
+  Neither hands the pid to the caller, so nothing could ever stop it; teardown
+  relied on an owner monitor that only fires when the *caller* dies. A
+  long-lived caller (a GenServer, a LiveView) accumulated one Process
+  GenServer, one `Watcher`, a UDS socket and three pipe FDs per command, with
+  no bound. Measured 100 leaked processes per 50 calls, now 0. New public
+  `NetRunner.Process.stop/1`; the stream after-fun and every `run/2` exit path
+  call it. This also resolves the teardown question 1.3.0 left open.
+- **Exit status could be delayed up to 1 s on Linux with `--cgroup-path`.** The
+  shepherd ran `cgroup_cleanup()` — which retries `rmdir` ten times with
+  `usleep(100000)` between — *before* sending `MSG_CHILD_EXITED`, so a caller
+  could wait a full second in `await_exit` for a status the shepherd already
+  held in a local variable. The two calls are now swapped;
+  nothing in `cgroup_cleanup` can change `child_status` or `uds_fd`. Ordering
+  in `kill_child` is deliberately unchanged. **Not verified on Linux with a
+  real cgroup** — this cycle was measured on macOS, where `cgroup_cleanup`
+  returns immediately and the change is a no-op.
+
+### Changed
+
+- **Default read size is now 65 536, was 65 535.** One byte under pipe
+  capacity leaves exactly one byte behind in a saturated pipe, and that byte
+  costs a whole extra `GenServer.call` round trip. Measured on a 64 MiB stdout
+  read: 1596–1826 chunks (572–802 of them ≤ 16 bytes) and 25–31 ms at 65 535,
+  versus 1024 chunks (zero tiny) and 17–22 ms at 65 536 — +56–78% chunk count
+  and +42% wall time for the one-byte shortfall. 65 536 is also the exact size
+  of `nif_read`'s stack buffer, so it stays on the allocation-free fast path;
+  see ADR-9. `Pipe.read/2`'s duplicate default was removed rather than
+  updated. The win is macOS-shaped: Linux sets `F_SETPIPE_SZ` to 1 MiB, where
+  the alignment argument is much weaker.
+- **The stderr drain loop is bounded.** `consume_stderr/1` recursed inside
+  `handle_info` for as long as the pipe kept producing. Now capped at 16 chunks
+  (~1 MiB) per pass, resuming via a self-sent message, at a cost of one extra
+  message per MiB. Honest scope: measured worst-case latency of a concurrent
+  trivial `handle_call` under a 256 MB stderr flood was **279 µs**, not the
+  "seconds of starvation" the unbounded recursion suggests — pipe capacity
+  already caps what one burst can consume. It is now ~28 µs, at the idle jitter
+  floor. Drain throughput is unchanged (928–969 MB/s).
+- **`NetRunner.Daemon.write/2` no longer blocks the Daemon.** It called
+  `NetRunner.Process.write/2` (an `:infinity` `GenServer.call`) from inside its
+  own `handle_call`, so a child that stopped draining stdin wedged `os_pid/1`,
+  `alive?/1` and — worst — the `Proc.alive?/1` in `terminate/2`, burning the
+  supervisor's 5 000 ms shutdown budget before the SIGTERM/SIGKILL escalation
+  could run. The write is now forwarded from a task that replies. Sequential
+  writes from one caller stay ordered; concurrent writers from different
+  processes are no longer serialised by the Daemon.
+- **`Daemon` `on_output: :log` coalesces output.** One `Logger` call per
+  drained chunk pushes Logger past its sync threshold and collapses the drain
+  rate to Logger's throughput. Consecutive chunks are now batched while the
+  child is saturating the drain, and flushed as soon as a read blocks or the
+  batch reaches 16 KiB, so nothing sits unlogged. Custom `on_output` functions
+  are unaffected and still see every chunk as it arrives.
+
+### Performance
+
+- `NetRunner.Stream` no longer polls the input writer with `Task.yield(writer,
+  0)` on **every** stdout chunk. That is a selective `receive` with `after 0`,
+  so its cost is O(mailbox length) per chunk: free for a bare consumer,
+  pathological for a GenServer or LiveView with unrelated traffic in its
+  mailbox. The writer is reaped once, in the after-fun.
+- `append_stderr_tail/2`'s steady-state branch built `tail <> data` and then
+  sliced it back down to the cap — ~2·cap + size bytes copied and a transient
+  ~72 KiB refc binary per chunk. It now builds the result at exactly `cap` in
+  one pass.
+- The write and stderr-drain loops carry their byte and syscall counts as loop
+  parameters and write state once on exit, instead of allocating a `Stats`
+  struct and a state map per iteration (~16 iterations per 1 MiB write).
+
+### Added
+
+- `NetRunner.Process.stop/1` — stops the server, releasing its pipes, UDS
+  socket and `Watcher` entry. Idempotent.
+- `bench/` — the measurement harness, with `make bench`. Repo-only; it is not
+  in the Hex package. Three of this cycle's findings are numbers rather than
+  opinions only because it exists, and it demoted three static-analysis
+  findings that reading the code had ranked high.
+
+### Measured and deliberately not changed
+
+- **Spawn latency (4.4–7.2 ms).** One `fork`+`exec` on this host costs 2532 µs
+  (`System.cmd`) / 2655 µs (raw `Port`); NetRunner performs two by design and
+  the second one *is* the zero-zombie guarantee, so ~5.3 ms is the floor.
+  Everything addressable on the Elixir side sums to ~1% (`File.dir?/1` 35 µs,
+  `:code.priv_dir` 5 µs, `Watcher.watch/2` 6.8 µs). Only shepherd pooling would
+  move this, and that is a design project with real lifetime and security
+  questions. See `docs/architecture.md`.
+- **The per-child `Watcher` GenServer**, flagged as high-impact by static
+  analysis, measures 6.8 µs; 128-way concurrent spawn runs at 846 µs/op with
+  ~13% scheduler utilisation. Not a bottleneck.
+- **`-flto` / `-O3`.** The NIF is a single translation unit, so `-O2` already
+  inlines everything within it, and the hot path is `read(2)`/`write(2)`/
+  `memcpy`. Build variance for no measurable win.
+
 ## [1.3.0] - 2026-07-28
 
 Performance and correctness pass driven by measurement. Two defects dominated

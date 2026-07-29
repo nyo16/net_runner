@@ -26,6 +26,9 @@ defmodule NetRunner.StderrTailTest do
       assert Proc.stats(pid).bytes_err == @total_bytes
     end
 
+    # Every read is ~64 KiB, far larger than the 1 KiB cap, so this is the
+    # "one chunk crosses the cap on its own" branch: the incoming chunk is
+    # sliced and the old tail is never concatenated.
     test "honors a custom :stderr_tail_bytes cap" do
       pid =
         start_proc("sh", ["-c", "yes errline 2>/dev/null | head -c #{@total_bytes} 1>&2"],
@@ -35,8 +38,64 @@ defmodule NetRunner.StderrTailTest do
       assert {:ok, _status} = Proc.await_exit(pid)
       wait_until_drained(pid, @total_bytes)
 
-      assert byte_size(Proc.stderr_tail(pid)) == 1_024
+      tail = Proc.stderr_tail(pid)
+      assert byte_size(tail) == 1_024
+      assert tail == String.duplicate(@line, 128)
       assert Proc.stats(pid).bytes_err == @total_bytes
+    end
+
+    # The steady-state branch: the cap is larger than a single read, so once
+    # the tail is full every chunk must splice `cap - size` retained bytes onto
+    # the new chunk. This is the branch Phase 4 rewrote to build the result at
+    # exactly `cap` in one pass instead of concatenating then re-slicing.
+    test "retains exactly the last cap bytes when the cap exceeds one read" do
+      total = 500_000
+      cap = 200_000
+
+      pid =
+        start_proc("sh", ["-c", "yes errline 2>/dev/null | head -c #{total} 1>&2"],
+          stderr_tail_bytes: cap
+        )
+
+      assert {:ok, _status} = Proc.await_exit(pid)
+      wait_until_drained(pid, total)
+
+      tail = Proc.stderr_tail(pid)
+      assert byte_size(tail) == cap
+      # cap / 8 = 25_000 whole lines, so the boundary lands cleanly.
+      assert tail == String.duplicate(@line, div(cap, byte_size(@line)))
+      assert Proc.stats(pid).bytes_err == total
+    end
+
+    # Same boundary, crossed by many small chunks instead of one big one: the
+    # writes are spaced so each readiness event yields a single 8-byte read.
+    # The tail therefore fills byte-by-byte (the "still under cap" branch) and
+    # then crosses into the steady-state branch mid-line.
+    test "crosses the cap correctly across many small chunks" do
+      lines = 50
+      cap = 100
+      expected_full = String.duplicate(@line, lines)
+      total = byte_size(expected_full)
+
+      pid =
+        start_proc(
+          "sh",
+          [
+            "-c",
+            "i=0; while [ $i -lt #{lines} ]; do printf 'errline\\n' >&2; sleep 0.01; " <>
+              "i=$((i+1)); done"
+          ],
+          stderr_tail_bytes: cap
+        )
+
+      assert {:ok, _status} = Proc.await_exit(pid)
+      wait_until_drained(pid, total)
+
+      tail = Proc.stderr_tail(pid)
+      assert byte_size(tail) == cap
+      # Starts mid-line — the cap is not a multiple of the line length.
+      assert tail == binary_part(expected_full, total - cap, cap)
+      assert Proc.stats(pid).bytes_err == total
     end
 
     test ":stderr_tail_bytes of 0 retains nothing but still drains the pipe" do

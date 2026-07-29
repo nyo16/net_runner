@@ -33,8 +33,11 @@ defmodule NetRunner.Process.Stats do
     %{stats | bytes_err: stats.bytes_err + bytes}
   end
 
-  def record_write(%__MODULE__{} = stats, bytes) do
-    %{stats | bytes_in: stats.bytes_in + bytes, write_count: stats.write_count + 1}
+  # `count` is the number of write(2) calls the bytes took, so a partial-write
+  # loop can fold its whole run into one struct update without changing what
+  # `write_count` means.
+  def record_write(%__MODULE__{} = stats, bytes, count \\ 1) do
+    %{stats | bytes_in: stats.bytes_in + bytes, write_count: stats.write_count + count}
   end
 
   def finalize(%__MODULE__{} = stats, exit_status) do

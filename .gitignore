@@ -33,3 +33,7 @@ c_src/*.o
 
 # Local .tool-versions
 .tool-versions
+
+# Local agent settings (the rest of .claude/ — plans, scratchpads, audits — is
+# tracked deliberately: it is the record of why the code looks the way it does).
+.claude/settings.local.json

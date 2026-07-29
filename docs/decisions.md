@@ -126,3 +126,49 @@ calls that cannot block.
 - (+) Finalized on exit with duration and exit status
 - (-) Not distributed (each GenServer has its own stats)
 - (-) Lost if GenServer crashes before stats are read
+
+## ADR-9: Default Read Size Is Exactly 65 536
+
+**Context**: `NetRunner.Process.@default_read_size` was `65_535` — one byte
+under an OS pipe buffer. A saturated pipe therefore always leaves exactly one
+byte behind, and that byte costs a whole extra `GenServer.call` round trip.
+Measured on a 64 MiB stdout read, two consecutive runs each:
+
+```
+max_bytes=65535: 1596 / 1826 chunks (572 / 802 of them <= 16 B), 25-31 ms
+max_bytes=65536: 1024 / 1024 chunks (   0 /   0 tiny            ), 17-22 ms
+```
+
+1024 is exactly 64 MiB / 64 KiB. The shortfall costs +56–78% chunk count and
++42% wall time.
+
+**Decision**: `@default_read_size` is `65_536`, defined once in
+`NetRunner.Process`. `NetRunner.Process.Pipe.read/2` deliberately has **no**
+default argument, so there is no second definition to drift.
+
+**This constant is bounded on both sides. Do not "tidy" it.**
+
+- It must not be **lower**: below pipe capacity it reintroduces the tiny-chunk
+  remainder above.
+- It must not be **higher**: `nif_read`'s fast path is
+  `on_stack = max_bytes <= sizeof(stackbuf)` against
+  `unsigned char stackbuf[65536]` (`c_src/net_runner_nif.c`). At 65 537 every
+  read falls into `enif_alloc_binary` + `enif_realloc_binary` shrink —
+  reintroducing exactly the per-call allocation cycle ADR-6's work removed, and
+  giving back more than the alignment won.
+
+**Consequences**:
+- (+) One `read(2)` and one `GenServer` round trip per full pipe buffer.
+- (+) Stays on the NIF's allocation-free stack path.
+- (−) The win is platform-shaped. macOS has no `F_SETPIPE_SZ` equivalent and is
+  inherently round-trip-bound at 64 KiB, which is where the 42% was measured.
+  On Linux the shepherd sets `F_SETPIPE_SZ` to 1 MiB, so the pipe holds sixteen
+  reads and the alignment argument is much weaker. A platform-conditional read
+  size would genuinely fetch more per syscall on Linux, but that is a bigger
+  decision and it is not this one.
+- (−) `Pipe.read/2` now requires its second argument at every call site. That
+  is the point.
+
+Regression guard: `test/io_pipelining_test.exs`, "a saturated stdout read
+returns full-capacity chunks". Reproduce with
+`MIX_ENV=prod mix run bench/claims.exs`, section B.
