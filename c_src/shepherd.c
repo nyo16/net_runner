@@ -646,24 +646,28 @@ static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
 }
 
 /*
- * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] <cmd> [args...]
+ * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--cwd <dir>]
+ *                 <cmd> [args...]
  *
  *   uds_path:       Path to the UDS listener socket created by the BEAM
  *   --kill-timeout:  SIGTERM->SIGKILL escalation timeout in ms (default 5000)
  *   --token-fd:     read the 32-char hex handshake token from fd 3 (the
  *                   BEAM port channel) and send it verbatim as the first
  *                   frame after connect so the BEAM can authenticate us
+ *   --cwd:          Directory to run the child in (default: inherited)
  *   cmd:            Command to execute
  *   args:           Arguments for the command
  */
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         fprintf(stderr,
-                "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] <cmd> [args...]\n");
+                "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] "
+                "[--cwd <dir>] <cmd> [args...]\n");
         return 1;
     }
 
     const char *uds_path = argv[1];
+    const char *child_cwd = NULL;
     int cmd_idx = 2;
     int token_from_fd = 0;
     char token[TOKEN_HEX_LEN + 1] = {0};
@@ -689,6 +693,13 @@ int main(int argc, char *argv[]) {
              * to exactly the same-uid attacker it exists to stop. */
             token_from_fd = 1;
             cmd_idx += 1;
+        } else if (strcmp(argv[cmd_idx], "--cwd") == 0 && cmd_idx + 1 < argc) {
+            if (argv[cmd_idx + 1][0] == '\0') {
+                fprintf(stderr, "error: --cwd must not be empty\n");
+                return 1;
+            }
+            child_cwd = argv[cmd_idx + 1];
+            cmd_idx += 2;
         } else if (strcmp(argv[cmd_idx], "--cgroup-path") == 0 && cmd_idx + 1 < argc) {
             const char *path = argv[cmd_idx + 1];
             /* Reject path traversal: no ".." components, no leading "/" */
@@ -820,6 +831,16 @@ int main(int argc, char *argv[]) {
             close(uds_fd);
             return 1;
         }
+    }
+
+    /* Keep chdir after authentication so the token remains the first frame.
+     * Keep it before fork so a failure can use MSG_ERROR. */
+    if (child_cwd != NULL && chdir(child_cwd) != 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "chdir failed: %s", strerror(errno));
+        send_error(uds_fd, msg);
+        close(uds_fd);
+        return 1;
     }
 
     pid_t child_pid;

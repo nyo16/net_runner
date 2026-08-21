@@ -349,6 +349,7 @@ defmodule NetRunner.Process.Exec do
     validate_stderr_tail_bytes!(Keyword.get(opts, :stderr_tail_bytes, 8_192))
     validate_cgroup_path!(Keyword.get(opts, :cgroup_path, nil))
     validate_env!(Keyword.get(opts, :env, nil))
+    validate_cwd!(Keyword.get(opts, :cwd, nil))
     opts
   end
 
@@ -426,6 +427,25 @@ defmodule NetRunner.Process.Exec do
       true ->
         :ok
     end
+  end
+
+  defp validate_cwd!(nil), do: :ok
+
+  defp validate_cwd!(cwd) when is_binary(cwd) do
+    cond do
+      cwd == "" ->
+        raise ArgumentError, ":cwd must not be empty"
+
+      String.contains?(cwd, <<0>>) ->
+        raise ArgumentError, ":cwd must not contain NUL bytes"
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_cwd!(other) do
+    raise ArgumentError, ":cwd must be a binary, got: #{inspect(other)}"
   end
 
   # Place the socket inside a 0700 directory so only the current user can
@@ -531,6 +551,7 @@ defmodule NetRunner.Process.Exec do
     pty_mode = Keyword.get(opts, :pty, false)
 
     cgroup_path = Keyword.get(opts, :cgroup_path, nil)
+    cwd = Keyword.get(opts, :cwd, nil)
 
     # --token-fd, not --token <hex>: argv is world-readable via
     # /proc/<pid>/cmdline (Linux) and same-uid readable via KERN_PROCARGS2
@@ -543,6 +564,8 @@ defmodule NetRunner.Process.Exec do
       if cgroup_path,
         do: shepherd_flags ++ ["--cgroup-path", to_string(cgroup_path)],
         else: shepherd_flags
+
+    shepherd_flags = if cwd, do: shepherd_flags ++ ["--cwd", cwd], else: shepherd_flags
 
     port_args = [uds_path | shepherd_flags] ++ [cmd | args]
 

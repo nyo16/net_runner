@@ -36,8 +36,8 @@ defmodule NetRunner do
 
   Malformed options are programmer errors and raise `ArgumentError` — unknown
   keys (`Keyword.validate!/2`) as well as invalid values (`:output`,
-  `:input_buffer`, `:stderr`, `:stderr_tail_bytes`, `:cgroup_path`, `:env`).
-  Runtime spawn failures (an invalid command, shepherd errors) return
+  `:input_buffer`, `:stderr`, `:stderr_tail_bytes`, `:cgroup_path`, `:cwd`,
+  `:env`). Runtime spawn failures (an invalid command, shepherd errors) return
   `{:error, reason}` instead. This convention holds at every NetRunner entry
   point.
 
@@ -69,6 +69,11 @@ defmodule NetRunner do
       grace on top of `:timeout`.
     * `:max_output_size` - maximum bytes to collect from stdout. Kills the process
       and returns `{:error, {:max_output_exceeded, partial_output}}` if exceeded.
+    * `:cwd` - working directory for the child. Defaults to the BEAM working
+      directory. Relative values use the BEAM working directory as their base.
+      The child resolves relative paths and executables from `:cwd`. A failed
+      directory change returns `{:error, {:shepherd_error, reason}}`. This
+      option does not change `PWD`.
     * `:output` - result shape for collected stdout: `:binary` (default)
       concatenates chunks into one binary; `:iodata` returns the collected
       chunks as iodata and skips the final flatten — for a 64 MiB output
@@ -109,6 +114,7 @@ defmodule NetRunner do
     :timeout,
     :max_output_size,
     :output,
+    :cwd,
     :stderr,
     :stderr_tail_bytes,
     :pty,

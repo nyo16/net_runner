@@ -172,3 +172,20 @@ default argument, so there is no second definition to drift.
 Regression guard: `test/io_pipelining_test.exs`, "a saturated stdout read
 returns full-capacity chunks". Reproduce with
 `MIX_ENV=prod mix run bench/claims.exs`, section B.
+
+## ADR-10: Set the Working Directory in the Shepherd
+
+**Context**: Callers sometimes need to set a child working directory. NetRunner
+can set it through the `Port.open` `cd:` option, in the child between `fork()`
+and `exec()`, or in the shepherd before `fork()`.
+
+**Decision**: Pass `--cwd <dir>` to the shepherd. The shepherd calls `chdir()`
+after authentication and before `fork()`.
+
+**Consequences**:
+- A failed `chdir()` returns `MSG_ERROR` with `strerror(errno)` before a child
+  starts.
+- `Port.open` with `cd:` cannot report this error through the shepherd.
+- A child-side `chdir()` failure would look like an exit status from the child.
+- The selected directory controls relative paths and relative executables.
+- The shepherd also changes directory. Its later filesystem paths are absolute.

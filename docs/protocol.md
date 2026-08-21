@@ -16,12 +16,13 @@ Communication between the BEAM and the shepherd binary occurs over a Unix domain
 4. BEAM verifies the token (and, where the platform exposes peer
    credentials, the peer uid); a failed or stalling connection is closed and
    the BEAM keeps accepting until the deadline
-5. Shepherd forks the child process
-6. Shepherd sends pipe FDs via `SCM_RIGHTS` (1 message)
-7. Shepherd sends `MSG_CHILD_STARTED` (may be in same recv as FDs)
-8. Bidirectional command/notification flow begins
-9. On child exit: `MSG_CHILD_EXITED`, shepherd exits
-10. On BEAM death: shepherd sees `POLLHUP`, kills child
+5. Shepherd enters `--cwd` when present (`MSG_ERROR` and exit on failure)
+6. Shepherd forks the child process
+7. Shepherd sends pipe FDs via `SCM_RIGHTS` (1 message)
+8. Shepherd sends `MSG_CHILD_STARTED` (may be in same recv as FDs)
+9. Bidirectional command/notification flow begins
+10. On child exit: `MSG_CHILD_EXITED`, shepherd exits
+11. On BEAM death: shepherd sees `POLLHUP`, kills child
 
 ## Authentication Handshake
 
@@ -44,6 +45,9 @@ so an impostor costs only its own connection.
 
 The shepherd binary and the Elixir library always ship together, so there is
 no compatibility shim for token-less shepherds.
+
+The shepherd applies `--cwd` after authentication. The token must remain the
+first frame on the socket.
 
 ## FD Passing (SCM_RIGHTS)
 

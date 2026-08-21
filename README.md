@@ -328,6 +328,32 @@ Output handling options:
 
 Graceful shutdown: on `terminate/2`, sends SIGTERM, waits 5 seconds, then SIGKILL.
 
+## Working Directory
+
+`cwd:` sets the child working directory:
+
+```elixir
+{output, 0} = NetRunner.run(~w(git status), cwd: "/srv/checkouts/job_123")
+```
+
+Relative paths and executable names use this directory. A relative `cwd:`
+value uses the BEAM working directory as its base.
+
+If the shepherd cannot enter the directory, NetRunner returns an error before
+the command runs:
+
+```elixir
+NetRunner.run(~w(git status), cwd: "/srv/gone")
+#=> {:error, {:shepherd_error, "chdir failed: No such file or directory"}}
+```
+
+`cwd:` does not change the `PWD` environment variable. Set `PWD` through `env:`
+if the child requires it:
+
+```elixir
+NetRunner.run(~w(git status), cwd: dir, env: [{"PWD", dir}])
+```
+
 ## cgroup Support (Linux)
 
 Isolate child processes in a cgroup v2 hierarchy for resource control:
@@ -447,6 +473,7 @@ end, max_concurrency: 20)
 | `:pty` | boolean | `false` | Use pseudo-terminal |
 | `:kill_timeout` | integer | `5000` | SIGTERM→SIGKILL escalation timeout in ms |
 | `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only); must sit under a `net_runner/` prefix and be under 256 bytes |
+| `:cwd` | string | `nil` | Child working directory. Defaults to the BEAM working directory. |
 
 Unknown options raise `ArgumentError` (`Keyword.validate!/2`) instead of being
 silently ignored. `stream!/2` accepts the same options minus `:timeout`,

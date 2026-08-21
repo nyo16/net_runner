@@ -90,6 +90,13 @@ remaining findings across shepherd/NIF, lib, tests, docs, and CI).
   full-size allocation and copy for large outputs. Default `:binary`
   unchanged; the `max_output_exceeded` partial is always a binary.
 
+- **`:cwd` sets the child working directory.** `NetRunner.run/2`, `stream!/2`,
+  `stream/2`, and `NetRunner.Process.start/3` accept `cwd: path`.
+  `NetRunner.Daemon` accepts it in `process_opts`. If the shepherd cannot enter
+  the directory, the spawn returns `{:error, {:shepherd_error, reason}}`.
+  Relative paths use the BEAM working directory. This option does not change
+  `PWD`. See ADR-10 in `docs/decisions.md`.
+
 ### Changed
 
 - **Internal read batching.** `run/2`, `stream!/2`, and `Daemon` drain

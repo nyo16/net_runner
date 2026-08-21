@@ -172,6 +172,18 @@ When `pty: true` is passed:
 - BEAM dups the FD for independent stdin/stdout NIF resources
 - `set_window_size/3` sends `CMD_SET_WINSIZE` to shepherd, which calls `ioctl(TIOCSWINSZ)`
 
+## Working Directory
+
+The `cwd:` option has this flow:
+- BEAM accepts a non-empty binary without NUL and passes it to the shepherd as
+  `--cwd <dir>`
+- Shepherd calls `chdir()` after authentication and before `fork()`
+- A failed `chdir()` sends `MSG_ERROR` before the shepherd starts a child
+- The UDS and cgroup paths are absolute, so the directory change does not
+  affect them
+
+See ADR-10 in `decisions.md`.
+
 ## cgroup Support (Linux Only)
 
 When `cgroup_path:` is set (must sit under a `net_runner/` prefix, < 256

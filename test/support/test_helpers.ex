@@ -94,4 +94,11 @@ defmodule NetRunner.TestHelpers do
         false
     end
   end
+
+  def tmp_dir(prefix) do
+    dir = Path.join(System.tmp_dir!(), "#{prefix}_#{:erlang.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    ExUnit.Callbacks.on_exit(fn -> File.rm_rf(dir) end)
+    dir
+  end
 end
