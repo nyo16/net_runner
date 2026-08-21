@@ -32,8 +32,15 @@ defmodule NetRunner.Process.Exec do
       with :ok <- validate_cmd_and_args(cmd, args),
            {:ok, listen_socket} <- create_uds_listener(uds_path),
            {:ok, shepherd_port} <- open_shepherd(uds_path, token, cmd, args, opts),
+           shepherd_monitor = :erlang.monitor(:port, shepherd_port),
            {:ok, conn_socket} <-
-             accept_authenticated(listen_socket, shepherd_port, token, accept_deadline()),
+             accept_authenticated(
+               listen_socket,
+               shepherd_port,
+               shepherd_monitor,
+               token,
+               accept_deadline()
+             ),
            :ok <- cleanup_listener(listen_socket, uds_path) do
         # conn_socket and shepherd_port are now live — clean up on any failure
         setup_after_connection(conn_socket, shepherd_port, owner, cmd, args, opts, pty_mode)
@@ -56,33 +63,105 @@ defmodule NetRunner.Process.Exec do
   # queued connect is still served on the next accept. On final failure the
   # shepherd port is closed (the listener is closed by spawn_process's error
   # path via cleanup_listener never running — close it here too).
-  defp accept_authenticated(listen_socket, shepherd_port, token, deadline) do
-    remaining = deadline - System.monotonic_time(:millisecond)
+  defp accept_authenticated(listen_socket, shepherd_port, shepherd_monitor, token, deadline) do
+    case accept_or_shepherd_exit(listen_socket, shepherd_port, shepherd_monitor, deadline) do
+      {:ok, conn_socket} ->
+        case authenticate_shepherd(conn_socket, token, deadline) do
+          :ok ->
+            Process.demonitor(shepherd_monitor, [:flush])
+            {:ok, conn_socket}
 
-    with true <- remaining > 0,
-         {:ok, conn_socket} <- :socket.accept(listen_socket, remaining) do
-      case authenticate_shepherd(conn_socket, token, deadline) do
-        :ok ->
-          {:ok, conn_socket}
-
-        {:error, _} ->
-          # Impostor (or a stalling peer): its socket is closed by
-          # authenticate_shepherd; keep listening for the real shepherd.
-          accept_authenticated(listen_socket, shepherd_port, token, deadline)
-      end
-    else
-      false ->
-        fail_accept(listen_socket, shepherd_port, :shepherd_connect_timeout)
-
-      {:error, :timeout} ->
-        fail_accept(listen_socket, shepherd_port, :shepherd_connect_timeout)
+          {:error, _} ->
+            # Impostor (or a stalling peer): its socket is closed by
+            # authenticate_shepherd; keep listening for the real shepherd.
+            accept_authenticated(
+              listen_socket,
+              shepherd_port,
+              shepherd_monitor,
+              token,
+              deadline
+            )
+        end
 
       {:error, reason} ->
-        fail_accept(listen_socket, shepherd_port, reason)
+        fail_accept(listen_socket, shepherd_port, shepherd_monitor, reason)
     end
   end
 
-  defp fail_accept(listen_socket, shepherd_port, reason) do
+  # Use an asynchronous accept so socket readiness and port exit share one wait.
+  defp accept_or_shepherd_exit(listen_socket, port, port_monitor, deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      {:error, :shepherd_connect_timeout}
+    else
+      case :socket.accept(listen_socket, :nowait) do
+        {:ok, _conn} = ok ->
+          ok
+
+        {:select, select_info} ->
+          await_connection(listen_socket, port, port_monitor, deadline, select_info)
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+  end
+
+  defp await_connection(listen_socket, port, port_monitor, deadline, select_info) do
+    {:select_info, _tag, handle} = select_info
+    timeout = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:"$socket", ^listen_socket, :select, ^handle} ->
+        accept_or_shepherd_exit(listen_socket, port, port_monitor, deadline)
+
+      {:"$socket", ^listen_socket, :abort, {^handle, reason}} ->
+        {:error, {:accept_aborted, reason}}
+
+      {^port, {:exit_status, status}} ->
+        cancel_select(listen_socket, select_info)
+
+        shepherd_stopped(
+          listen_socket,
+          {port, {:exit_status, status}},
+          {:exit_status, status}
+        )
+
+      {:DOWN, ^port_monitor, :port, ^port, reason} ->
+        cancel_select(listen_socket, select_info)
+        shepherd_stopped(listen_socket, nil, reason)
+    after
+      timeout ->
+        cancel_select(listen_socket, select_info)
+        {:error, :shepherd_connect_timeout}
+    end
+  end
+
+  # Port exit and socket readiness come from different senders and can arrive
+  # out of order. Check the listener before reporting a spawn failure. Requeue
+  # the exit status if a connection is pending so Process can handle it.
+  defp shepherd_stopped(listen_socket, pending_message, reason) do
+    case :socket.accept(listen_socket, :nowait) do
+      {:ok, _conn} = ok ->
+        if pending_message, do: send(self(), pending_message)
+        ok
+
+      {:select, select_info} ->
+        cancel_select(listen_socket, select_info)
+        {:error, {:shepherd_spawn_failed, reason}}
+
+      {:error, _reason} ->
+        {:error, {:shepherd_spawn_failed, reason}}
+    end
+  end
+
+  defp cancel_select(listen_socket, select_info) do
+    :socket.cancel(listen_socket, select_info)
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp fail_accept(listen_socket, shepherd_port, shepherd_monitor, reason) do
+    Process.demonitor(shepherd_monitor, [:flush])
     safe_close_socket(listen_socket)
     safe_port_close(shepherd_port)
     {:error, reason}
@@ -484,6 +563,10 @@ defmodule NetRunner.Process.Exec do
     # value so spawn_process's error path still reclaims the listener and the
     # bound socket file.
     port = Port.open({:spawn_executable, shepherd}, port_opts)
+
+    # Port.command/2 can exit its caller when the token write fails. Unlink
+    # first so accept_authenticated/5 can return the port's exit status.
+    Process.unlink(port)
     send_token(port, token)
     {:ok, port}
   rescue

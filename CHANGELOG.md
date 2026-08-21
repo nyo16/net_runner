@@ -44,6 +44,11 @@ remaining findings across shepherd/NIF, lib, tests, docs, and CI).
   deadline, so a wedged peer cannot park the shepherd after reap and skip
   cgroup cleanup.
 
+- **Startup failures return promptly.** If the OS rejects the shepherd's
+  arguments or environment, NetRunner returns
+  `{:error, {:shepherd_spawn_failed, reason}}` without waiting for the socket
+  timeout. An immediate child exit remains a valid spawn.
+
 ### Changed
 
 - **`NetRunner.Process.Nif` renamed to `NetRunner.Nif`** (internal,
