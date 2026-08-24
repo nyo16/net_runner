@@ -66,7 +66,7 @@ NIF_OBJ = $(C_SRC_DIR)/net_runner_nif.o
 
 HEADERS = $(C_SRC_DIR)/protocol.h $(C_SRC_DIR)/utils.h
 
-.PHONY: all clean asan
+.PHONY: all clean asan bench bench-perf bench-claims bench-deadlock bench-spawn bench-exec
 
 all: $(PRIV_DIR) $(SHEPHERD) $(NIF_LIB)
 
@@ -94,3 +94,26 @@ $(NIF_OBJ): $(NIF_SRC) $(HEADERS)
 
 clean:
 	rm -f $(SHEPHERD) $(NIF_LIB) $(SHEPHERD_OBJ) $(NIF_OBJ)
+
+# --- Benchmarks (repo-only; see bench/README.md) ---
+#
+# MIX_ENV=prod is not optional: the BEAM side compiles differently in dev and
+# dev-mode numbers are not comparable to anything published.
+BENCH_ENV = MIX_ENV=prod
+
+bench: bench-perf bench-claims bench-deadlock bench-spawn bench-exec
+
+bench-perf:
+	$(BENCH_ENV) mix run bench/perf.exs
+
+bench-claims:
+	$(BENCH_ENV) mix run bench/claims.exs
+
+bench-deadlock:
+	$(BENCH_ENV) mix run bench/deadlock_probe.exs
+
+bench-spawn:
+	$(BENCH_ENV) mix run bench/spawn_breakdown.exs
+
+bench-exec:
+	$(BENCH_ENV) mix run bench/exec_baseline.exs

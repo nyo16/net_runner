@@ -28,8 +28,12 @@ defmodule NetRunner.Process.Pipe do
   @doc """
   Reads up to `max_bytes` from the pipe.
   Returns `{:ok, binary}`, `{:error, :eagain}`, or `:eof`.
+
+  Deliberately has no default: `NetRunner.Process.@default_read_size` is the
+  single source of truth for the read size, and a second default here would
+  drift from it silently.
   """
-  def read(%__MODULE__{resource: res}, max_bytes \\ 65_535) do
+  def read(%__MODULE__{resource: res}, max_bytes) do
     Nif.nif_read(res, max_bytes)
   end
 

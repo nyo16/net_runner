@@ -531,11 +531,16 @@ static int event_loop(int uds_fd, pid_t child_pid, int stdin_w) {
         }
     }
 
+    /* Notify BEAM of the child exit FIRST. cgroup_cleanup() retries rmdir up
+     * to ten times with usleep(100000) between, so doing it first parks the
+     * caller's await_exit for up to a full second on a status we already hold
+     * in child_status. Nothing in cgroup_cleanup() can change child_status or
+     * uds_fd, so the order is free to swap. (kill_child's ordering at :352 is
+     * deliberately the other way round — there the cleanup is the point.) */
+    send_child_exited(uds_fd, child_status);
+
     /* Cleanup cgroup on normal exit too */
     cgroup_cleanup();
-
-    /* Notify BEAM of child exit */
-    send_child_exited(uds_fd, child_status);
     return child_status;
 }
 

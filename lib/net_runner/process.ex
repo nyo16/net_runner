@@ -24,11 +24,28 @@ defmodule NetRunner.Process do
   alias NetRunner.Process.{Exec, Nif, Operations, Pipe, Stats}
   alias NetRunner.Signal
 
-  @default_read_size 65_535
+  # Exactly one OS pipe buffer (Linux default and macOS grown capacity), and
+  # exactly the size of nif_read's stack buffer. Both bounds are load-bearing:
+  # 65_535 leaves one byte in a saturated pipe and costs a whole extra
+  # GenServer round trip per chunk (+42% wall time on a 64 MiB read), and
+  # anything above 65_536 falls off the NIF's stack fast path into
+  # enif_alloc_binary + shrink. See docs/decisions.md.
+  @default_read_size 65_536
+
+  # Chunks a single stderr drain pass may consume before yielding back to
+  # `receive`. @default_read_size each, so ~1 MiB per pass and one extra
+  # message per MiB. Without a bound, consume_stderr/1 recurses inside
+  # handle_info for as long as the pipe keeps producing and every concurrent
+  # handle_call waits behind it.
+  @stderr_drain_chunks 16
 
   # Backstop only. Exit status normally arrives over the UDS; this fires when
   # the shepherd died without delivering one.
   @force_exit_timeout 5_000
+
+  # Graceful stop budget for stop/1. terminate/2 only closes FDs and a Port,
+  # so this is a backstop against a wedged server, not an expected wait.
+  @stop_timeout_ms 5_000
 
   # --- Public API ---
 
@@ -40,6 +57,29 @@ defmodule NetRunner.Process do
   def start(cmd, args \\ [], opts \\ []) do
     gen_opts = Keyword.take(opts, [:name])
     GenServer.start(__MODULE__, {cmd, args, opts}, gen_opts)
+  end
+
+  @doc """
+  Stops the server, releasing its pipes, UDS socket and `Watcher` entry.
+
+  Idempotent and safe on an already-dead server. Safe to call while the OS
+  process is still running: `terminate/2` closes the pipes and the UDS, which
+  the shepherd sees as POLLHUP and turns into a kill. Callers that want the
+  child reaped first should `await_exit/2` (or `kill/2`) beforehand.
+
+  Nothing else stops the server on its own — the owner monitor only fires when
+  the owner dies — so any caller that holds a `NetRunner.Process` for a
+  bounded span must call this or leak it.
+  """
+  @spec stop(GenServer.server()) :: :ok
+  def stop(process) do
+    if is_pid(process) and not Process.alive?(process) do
+      :ok
+    else
+      GenServer.stop(process, :normal, @stop_timeout_ms)
+    end
+  catch
+    :exit, _ -> :ok
   end
 
   @doc "Read from stdout. Blocks until data available or EOF."
@@ -341,9 +381,20 @@ defmodule NetRunner.Process do
   # the data would be silently dropped by the catch-all below.
   def handle_info({:stderr_data, data}, state) when is_binary(data) do
     stats = Stats.record_read_stderr(state.stats, byte_size(data))
-    state = %{state | stderr_tail: append_stderr_tail(state, data), stats: stats}
+    tail = append_stderr_tail(state.stderr_tail, state.stderr_tail_bytes, data)
+    state = %{state | stderr_tail: tail, stats: stats}
     # Drain anything else buffered and re-arm enif_select on EAGAIN.
     {:noreply, consume_stderr(state)}
+  end
+
+  # Resumption of a drain pass that hit @stderr_drain_chunks. MUST stay above
+  # the catch-all below: matched by it instead, the message is silently
+  # dropped, stderr stops draining, and the child deadlocks on a full stderr
+  # pipe. maybe_consume_stderr/1 makes re-entry a no-op when stderr is
+  # disabled or already closed, so a straggler arriving after :eof or
+  # finish_exit/2 costs one function call.
+  def handle_info(:consume_stderr_more, state) do
+    {:noreply, maybe_consume_stderr(state)}
   end
 
   def handle_info(_msg, state) do
@@ -395,7 +446,7 @@ defmodule NetRunner.Process do
   defp get_pipe(_, _), do: nil
 
   defp do_write(data, from, state) do
-    write_loop(data, from, state)
+    write_loop(data, from, state, 0, 0)
   end
 
   # Writes data in a loop: partial writes retry immediately until EAGAIN
@@ -404,30 +455,43 @@ defmodule NetRunner.Process do
   # without going through the NIF's EAGAIN path must not be taken here.
   # A zero-byte write on a non-empty buffer is mapped to :eagain inside the
   # NIF (which registers select), so it can never reach this loop.
-  defp write_loop(<<>>, _from, state), do: {:reply, :ok, state}
+  #
+  # Bytes and syscall count are carried as loop parameters and folded into the
+  # state exactly once on exit — a 1 MiB write takes ~16 iterations and used to
+  # allocate a Stats struct and a state map on each of them.
+  defp write_loop(<<>>, _from, state, written, calls) do
+    {:reply, :ok, commit_write(state, written, calls)}
+  end
 
-  defp write_loop(data, from, state) do
+  defp write_loop(data, from, state, written, calls) do
     case Pipe.write(state.stdin, data) do
       {:ok, bytes_written} ->
-        stats = Stats.record_write(state.stats, bytes_written)
-        state = %{state | stats: stats}
+        written = written + bytes_written
+        calls = calls + 1
         total = byte_size(data)
 
         if bytes_written >= total do
-          {:reply, :ok, state}
+          {:reply, :ok, commit_write(state, written, calls)}
         else
           remaining = binary_part(data, bytes_written, total - bytes_written)
-          write_loop(remaining, from, state)
+          write_loop(remaining, from, state, written, calls)
         end
 
       {:error, :eagain} ->
         # enif_select is now registered for write readiness
+        state = commit_write(state, written, calls)
         {ops, _ref} = Operations.park(state.operations, :write, from, data)
         {:noreply, %{state | operations: ops}}
 
       {:error, _} = error ->
-        {:reply, error, state}
+        {:reply, error, commit_write(state, written, calls)}
     end
+  end
+
+  defp commit_write(state, 0, 0), do: state
+
+  defp commit_write(state, written, calls) do
+    %{state | stats: Stats.record_write(state.stats, written, calls)}
   end
 
   defp handle_ready_input(state, resource) do
@@ -504,33 +568,43 @@ defmodule NetRunner.Process do
   end
 
   defp retry_pending_writes(state) do
-    pending = Operations.pending_by_type(state.operations, :write)
-
-    Enum.reduce(pending, state, fn {ref, {:write, from, data}}, acc ->
-      if is_nil(acc.stdin) do
-        GenServer.reply(from, {:error, :closed})
-        {_, ops} = Operations.pop(acc.operations, ref)
-        %{acc | operations: ops}
-      else
-        retry_write_loop(ref, from, data, acc)
-      end
-    end)
+    # Mirrors retry_reads_for/2: :ready_output only fires after a write
+    # EAGAIN'd, so `pending` is non-empty by construction — this is symmetry
+    # and readability, not a measured win.
+    if Operations.empty?(state.operations) do
+      state
+    else
+      state.operations
+      |> Operations.pending_by_type(:write)
+      |> Enum.reduce(state, &retry_pending_write/2)
+    end
   end
 
-  defp retry_write_loop(ref, from, data, state) do
+  defp retry_pending_write({ref, {:write, from, data}}, state) do
+    if is_nil(state.stdin) do
+      GenServer.reply(from, {:error, :closed})
+      {_, ops} = Operations.pop(state.operations, ref)
+      %{state | operations: ops}
+    else
+      retry_write_loop(ref, from, data, state, 0, 0)
+    end
+  end
+
+  defp retry_write_loop(ref, from, data, state, written, calls) do
     case Pipe.write(state.stdin, data) do
       {:ok, bytes_written} ->
-        stats = Stats.record_write(state.stats, bytes_written)
-        state = %{state | stats: stats}
+        written = written + bytes_written
+        calls = calls + 1
         total = byte_size(data)
 
         if bytes_written >= total do
           GenServer.reply(from, :ok)
+          state = commit_write(state, written, calls)
           {_, ops} = Operations.pop(state.operations, ref)
           %{state | operations: ops}
         else
           remaining = binary_part(data, bytes_written, total - bytes_written)
-          retry_write_loop(ref, from, remaining, state)
+          retry_write_loop(ref, from, remaining, state, written, calls)
         end
 
       {:error, :eagain} ->
@@ -540,10 +614,12 @@ defmodule NetRunner.Process do
         # every readiness event, so the child receives the same bytes again and
         # again and the write never completes. Observed as 5.8 GB written for a
         # 100 KB payload.
+        state = commit_write(state, written, calls)
         %{state | operations: Operations.update_context(state.operations, ref, data)}
 
       {:error, _} = error ->
         GenServer.reply(from, error)
+        state = commit_write(state, written, calls)
         {_, ops} = Operations.pop(state.operations, ref)
         %{state | operations: ops}
     end
@@ -572,49 +648,68 @@ defmodule NetRunner.Process do
   end
 
   # Appends `data` to the retained stderr tail, keeping only the most-recent
-  # `stderr_tail_bytes` bytes. A cap of 0 retains nothing (drain-and-drop);
-  # the pipe is still drained so the child never blocks. All bytes are still
-  # counted in stats — only retention is bounded.
-  #
-  # The `:binary.copy/1` calls are load-bearing: binary_part/3 on a refc
-  # binary returns a sub-binary that pins its parent, so without the copy an
-  # 8 KiB tail would retain the whole ~72 KiB concat for the life of the
-  # process.
-  defp append_stderr_tail(%{stderr_tail_bytes: 0}, _data), do: <<>>
+  # `cap` bytes. A cap of 0 retains nothing (drain-and-drop); the pipe is
+  # still drained so the child never blocks. All bytes are still counted in
+  # stats — only retention is bounded.
+  defp append_stderr_tail(_tail, 0, _data), do: <<>>
 
-  defp append_stderr_tail(%{stderr_tail: tail, stderr_tail_bytes: cap}, data) do
+  defp append_stderr_tail(tail, cap, data) do
     size = byte_size(data)
 
     cond do
       size >= cap ->
         # The chunk alone already fills the cap, so concatenating the old tail
-        # would copy bytes the following slice immediately discards.
+        # would copy bytes the following slice immediately discards. The
+        # :binary.copy/1 is load-bearing: binary_part/3 on a refc binary
+        # returns a sub-binary that pins its ~64 KiB parent for the life of
+        # the process.
         :binary.copy(binary_part(data, size - cap, cap))
 
       byte_size(tail) + size <= cap ->
+        # Only reachable during the first `cap` bytes of the process's life.
         tail <> data
 
       true ->
-        combined = tail <> data
-        :binary.copy(binary_part(combined, byte_size(combined) - cap, cap))
+        # Steady state once the tail is full. Build the result at exactly
+        # `cap` in one pass: `tail <> data` followed by a slice would copy
+        # cap + size and then cap again, ~2*cap + size bytes and a transient
+        # ~72 KiB refc binary per chunk. Bitstring construction always
+        # produces a fresh binary, so it pins nothing and needs no copy.
+        keep = cap - size
+        <<binary_part(tail, byte_size(tail) - keep, keep)::binary, data::binary>>
     end
   end
 
   defp consume_stderr(state) do
-    case Pipe.read(state.stderr) do
+    consume_stderr(state, @stderr_drain_chunks, state.stderr_tail, 0)
+  end
+
+  # Budget exhausted: yield to `receive` so concurrent handle_call work is not
+  # queued behind an arbitrarily long drain, and resume from the mailbox.
+  # enif_select is NOT armed on this path (we stopped short of EAGAIN), so the
+  # self-send is the only thing that keeps the pipe draining.
+  defp consume_stderr(state, 0, tail, bytes) do
+    send(self(), :consume_stderr_more)
+    commit_stderr(state, tail, bytes)
+  end
+
+  defp consume_stderr(state, budget, tail, bytes) do
+    case Pipe.read(state.stderr, @default_read_size) do
       {:ok, data} ->
-        stats = Stats.record_read_stderr(state.stats, byte_size(data))
-        consume_stderr(%{state | stderr_tail: append_stderr_tail(state, data), stats: stats})
+        tail = append_stderr_tail(tail, state.stderr_tail_bytes, data)
+        consume_stderr(state, budget - 1, tail, bytes + byte_size(data))
 
-      :eof ->
-        state
-
-      {:error, :eagain} ->
-        state
-
-      {:error, _} ->
-        state
+      # :eof, {:error, :eagain} (enif_select re-armed) or a hard error — all
+      # end the pass without scheduling a resume.
+      _stop ->
+        commit_stderr(state, tail, bytes)
     end
+  end
+
+  defp commit_stderr(state, _tail, 0), do: state
+
+  defp commit_stderr(state, tail, bytes) do
+    %{state | stderr_tail: tail, stats: Stats.record_read_stderr(state.stats, bytes)}
   end
 
   defp send_shepherd_command(state, command) do

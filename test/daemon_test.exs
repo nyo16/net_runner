@@ -72,6 +72,37 @@ defmodule NetRunner.DaemonTest do
 
       refute os_pid_alive?(os_pid)
     end
+
+    # Proc.write/2 is an :infinity GenServer.call. Performed inside the
+    # Daemon's own handle_call it wedged every other control call for as long
+    # as the child refused to drain stdin — including the Proc.alive?/1 in
+    # terminate/2, which then burned the supervisor's 5_000 ms shutdown budget
+    # before the SIGTERM/SIGKILL escalation could run.
+    test "control calls stay responsive while the child refuses to read stdin" do
+      # `sleep` never reads stdin, so 4 MiB overflows any pipe buffer
+      # (including the shepherd's 1 MiB F_SETPIPE_SZ on Linux) and the write
+      # parks in the Process GenServer for the whole test.
+      {:ok, daemon} = Daemon.start_link(cmd: "sleep", args: ["100"])
+      writer = Task.async(fn -> Daemon.write(daemon, :binary.copy(<<0>>, 4_194_304)) end)
+
+      # Let the write get as far as the pipe allows before probing.
+      Process.sleep(100)
+      refute Task.yield(writer, 0), "the write completed; the child drained stdin after all"
+
+      {us, os_pid} = :timer.tc(fn -> Daemon.os_pid(daemon) end)
+      assert is_integer(os_pid) and os_pid > 0
+      assert us < 100_000, "os_pid/1 took #{us} us behind a stalled write"
+
+      {us_alive, true} = :timer.tc(fn -> Daemon.alive?(daemon) end)
+      assert us_alive < 100_000, "alive?/1 took #{us_alive} us behind a stalled write"
+
+      # And terminate/2 still finishes well inside the shutdown budget.
+      {us_stop, :ok} = :timer.tc(fn -> GenServer.stop(daemon) end)
+      assert us_stop < 5_000_000, "shutdown took #{us_stop} us"
+
+      Task.shutdown(writer, :brutal_kill)
+      refute os_pid_alive?(os_pid)
+    end
   end
 
   defp os_pid_alive?(os_pid) do

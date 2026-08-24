@@ -436,7 +436,7 @@ end, max_concurrency: 20)
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `:input` | binary \| list | `nil` | Data to write to stdin |
+| `:input` | binary \| list \| `Stream` | `nil` | Data to write to stdin. Written concurrently with reading stdout, so an input larger than the OS pipe buffers does not deadlock. Stdin is closed after the last chunk. |
 | `:timeout` | integer | `nil` | Wall-clock timeout in ms |
 | `:max_output_size` | integer | `nil` | Max bytes to collect |
 | `:stderr` | atom | `:consume` | `:consume` (drained internally) or `:disabled` |
@@ -483,14 +483,20 @@ Medians on an idle Apple M1 Max (10 cores), OTP 29, default VM flags:
 
 | | |
 |---|---|
-| spawn (fork + execvp + UDS handshake + FD passing) | ~3 ms |
-| stdout throughput, 64 KiB reads | ~650 MiB/s |
-| `NetRunner.run(["/bin/echo", "hi"])` end to end | ~7 ms |
+| spawn (two `fork`+`exec`, UDS handshake, FD passing) | ~4.4–7.2 ms |
+| stdout throughput, 64 KiB reads | ~2000 MB/s (`run/2`), ~2800 MB/s (`stream!/2`) |
+| stdin+stdout round trip, 16 MiB through `cat` | ~1160 MB/s (`run/2`), ~1130 MB/s (`stream!/2`) |
+| stderr drain, `:consume` mode with an 8 KiB tail | ~930–970 MB/s |
+| `NetRunner.run(["/bin/echo", "hi"])` end to end | ~6 ms |
 
-For reference, reading the same producer through a plain Erlang `Port` on the
-same host measures ~420-525 MiB/s, so the backpressured path is not paying for
-its safety in throughput. Spawn is a one-time cost; I/O after that is limited
-by the pipe, not by NetRunner.
+Spawn is a one-time cost and it is two `exec`s by design — the shepherd's is
+the zero-zombie guarantee. One `fork`+`exec` on this host measures 2532 µs via
+`System.cmd/2` and 2655 µs via a raw `Port`, so ~5.3 ms is the floor for this
+architecture. See [Architecture](docs/architecture.md#spawn-cost-two-execs-by-design).
+
+I/O after that is limited by the pipe, not by NetRunner. Reads are sized at
+exactly one pipe buffer (65 536 bytes); see ADR-9 in
+[Decisions](docs/decisions.md) before changing that constant.
 
 Every NIF call is a bounded, non-blocking syscall on a normal scheduler.
 Readiness comes from `enif_select`, integrated with BEAM's epoll/kqueue, so an

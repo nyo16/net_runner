@@ -146,6 +146,53 @@ defmodule NetRunner.LeakTest do
     end
   end
 
+  describe "GenServer lifecycle" do
+    # Neither entry point hands the Process pid to the caller, so nothing else
+    # can ever stop it. Before Proc.stop/1 was wired into run_with_pid/4 and
+    # the stream after-fun, every call leaked a Process GenServer, a Watcher,
+    # a UDS socket and three pipe FDs until the *caller* died — unbounded for
+    # a long-lived caller such as a GenServer or LiveView.
+    test "run/2 does not leak processes" do
+      baseline = length(Process.list())
+
+      for _ <- 1..20, do: assert({"hi\n", 0} = NetRunner.run(~w(echo hi)))
+
+      assert settled_process_count(baseline)
+    end
+
+    test "a fully consumed stream does not leak processes" do
+      baseline = length(Process.list())
+
+      for _ <- 1..20 do
+        assert ["hi\n"] == NetRunner.stream!(~w(echo hi)) |> Enum.to_list()
+      end
+
+      assert settled_process_count(baseline)
+    end
+
+    test "a stream halted early does not leak processes" do
+      baseline = length(Process.list())
+
+      for _ <- 1..20 do
+        assert [_] = NetRunner.stream!(["sh", "-c", "yes"]) |> Enum.take(1)
+      end
+
+      assert settled_process_count(baseline)
+    end
+  end
+
+  # Teardown is asynchronous (shepherd reap, Watcher stop), so poll rather
+  # than sample once.
+  defp settled_process_count(baseline, attempts \\ 100) do
+    now = length(Process.list())
+
+    cond do
+      now <= baseline -> true
+      attempts == 0 -> flunk("leaked #{now - baseline} processes")
+      true -> Process.sleep(20) && settled_process_count(baseline, attempts - 1)
+    end
+  end
+
   # Helper to count open FDs via /proc/self/fd
   defp count_open_fds do
     case File.ls("/proc/self/fd") do
