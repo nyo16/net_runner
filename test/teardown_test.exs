@@ -7,6 +7,8 @@ defmodule NetRunner.TeardownTest do
   alias NetRunner.Nif
   alias NetRunner.Process, as: Proc
 
+  @cat System.find_executable("cat") || raise("these tests require `cat`")
+
   describe "Daemon drain loop" do
     # `rescue`/`catch` clauses on a `def` wrap the whole body in a try, which
     # takes the recursive call out of tail position. The drain loop then
@@ -134,7 +136,7 @@ defmodule NetRunner.TeardownTest do
       payload = :binary.copy("y", 1_000_000)
 
       collected =
-        ["/bin/cat"]
+        [@cat]
         |> NetRunner.stream!(input: payload)
         |> Enum.join()
 
