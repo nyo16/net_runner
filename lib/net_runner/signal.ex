@@ -16,14 +16,4 @@ defmodule NetRunner.Signal do
     do: {:ok, signal}
 
   def resolve(_signal), do: {:error, :unknown_signal}
-
-  @doc """
-  Resolves a signal, raising on failure.
-  """
-  def resolve!(signal) do
-    case resolve(signal) do
-      {:ok, num} -> num
-      {:error, reason} -> raise ArgumentError, "unknown signal: #{inspect(signal)} (#{reason})"
-    end
-  end
 end

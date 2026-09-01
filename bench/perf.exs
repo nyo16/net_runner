@@ -112,6 +112,33 @@ Bench.throughput("write+read 128KB through cat (run/2, spawn-bound)", 131_072, f
   131_072 = byte_size(out)
 end)
 
+# --- 4b. Tiny-element stdin: 16 MiB as ~80-byte lines ---
+# The InputWriter coalescing target: per-element writes cost one GenServer
+# round trip each (~13 µs), so 200k elements are messaging-bound, not
+# I/O-bound. Eager lists coalesce unconditionally; lazy enumerables only
+# with :input_buffer (write-through is the default for interactive stdin).
+line = String.duplicate("x", 79) <> "\n"
+tiny_count = div(16 * 1_048_576, 80)
+tiny_bytes = tiny_count * 80
+tiny_list = List.duplicate(line, tiny_count)
+
+Bench.throughput("write+read 16MB tiny lines through cat (list input)", tiny_bytes, fn ->
+  {out, 0} = NetRunner.run(~w(cat), input: tiny_list)
+  ^tiny_bytes = byte_size(out)
+end)
+
+Bench.throughput("write+read 16MB tiny lines (lazy, input_buffer: 64KiB)", tiny_bytes, fn ->
+  lazy = Stream.map(1..tiny_count, fn _ -> line end)
+  {out, 0} = NetRunner.run(~w(cat), input: lazy, input_buffer: 65_536)
+  ^tiny_bytes = byte_size(out)
+end)
+
+Bench.throughput("write+read 16MB tiny lines (lazy, write-through default)", tiny_bytes, fn ->
+  lazy = Stream.map(1..tiny_count, fn _ -> line end)
+  {out, 0} = NetRunner.run(~w(cat), input: lazy)
+  ^tiny_bytes = byte_size(out)
+end)
+
 # --- 5. stderr consume path (bounded tail) ---
 Bench.throughput("drain 16MB stderr (tail 8KB)", 16 * 1_048_576, fn ->
   {_out, 0} =

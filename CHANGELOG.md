@@ -6,11 +6,163 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Second measurement-driven cycle against the code 1.3.0 produced. One liveness
-bug, one one-byte constant that cost 42% of read wall time, one resource leak
-found while fixing it, and three responsiveness fixes. Numbers are medians on
-an Apple M1 Max (10 cores), OTP 29 / erts 17.0.3, `MIX_ENV=prod`; the harness
-that produced them is now committed under `bench/`.
+Performance follow-up cycle (from the 2026-08-31 `/phx:perf` reports; numbers
+are medians on an Apple M1 Max, `MIX_ENV=prod`, harness under `bench/`).
+
+### Added
+
+- **`NetRunner.Process.read_batch/3` and `read_stderr_batch/3`.** Read up to
+  `max_chunks` pipe chunks in one GenServer round trip. A batch never waits
+  once it has data (it ends at the first EAGAIN), and an EOF/error after ≥1
+  chunk is deferred to the next call so collected data is always delivered
+  first. `read/2` is unchanged.
+- **`:input_buffer` option for `run/2` and `stream!/2`.** Bytes of stdin
+  coalescing for a *lazy* `:input` enumerable. Default `0` keeps
+  element-granular write-through (interactive/PTY stdin depends on it);
+  `input_buffer: 65_536` batches a `File.stream!`-style line stream into
+  64 KiB writes (measured 12× faster on 16 MiB of ~80-byte lines).
+- **`output: :iodata` option for `run/2`.** Returns collected stdout as
+  iodata, skipping the terminal `IO.iodata_to_binary/1` flatten — an extra
+  full-size allocation and copy for large outputs. Default `:binary`
+  unchanged; the `max_output_exceeded` partial is always a binary.
+
+### Changed
+
+- **Internal read batching.** `run/2`, `stream!/2`, and `Daemon` drain
+  stdout/stderr via batched reads, cutting GenServer round trips per MiB
+  wherever the kernel pipe holds more than one chunk (Linux's 1 MiB
+  shepherd-grown pipes; on macOS the 64 KiB pipe bounds batches at ~1 chunk).
+  `stream!/2` may now emit several ≤64 KiB chunks per resource step; chunk
+  sizes and ordering are unchanged, but code timing-coupled to
+  one-read-per-element may observe the difference.
+- **Eager list `:input` is written in coalesced batches.** A list is fully
+  realised, so write-through granularity is unobservable; coalescing happens
+  in the caller's process before any task closure captures the list (closure
+  capture of a 200k-element list alone cost ~2×20 ms). 16 MiB of ~80-byte
+  list elements: 711 ms → 30 ms (1.54× a single-binary write).
+- **Parked-write bookkeeping slimmed and bounded.** `Operations` dropped two
+  of its four maps (the monitor ref now rides in the pending entry), and a
+  multi-writer resume pass shares ONE write budget with a deduplicated
+  `:continue_writes` self-send — the server's occupancy bound no longer
+  multiplies by the number of parked writers.
+- **`Stats.read_count`** now counts read(2) calls under batched reads (one
+  count per chunk), keeping its meaning unchanged.
+
+## [1.4.0] - 2026-08-31
+
+Two cycles in one release. First, an audit-remediation pass over the
+2026-08-31 project-health audit: security hardening of the shepherd/NIF
+boundary, supervision-correctness fixes for `Daemon`/`Watcher`, API
+validation, and test-suite health. Second, the measurement-driven performance
+cycle below (numbers are medians on an Apple M1 Max, OTP 29 / erts 17.0.3,
+`MIX_ENV=prod`; the harness is committed under `bench/`).
+
+### Security
+
+- **Authenticated FD channel.** The BEAM delivers a per-spawn 16-byte random
+  token to the shepherd over the private fd-3 port channel (never argv —
+  `/proc/<pid>/cmdline` is world-readable); the shepherd echoes it as the
+  very first frame after connecting, and the BEAM verifies it (plus the peer
+  uid, where the platform exposes credentials) before accepting any FDs via
+  `SCM_RIGHTS`. A rejected connection no longer aborts the spawn: the BEAM
+  keeps accepting until the deadline, so a rogue connect costs only itself
+  rather than turning into a spawn DoS. Protocol documented in
+  `docs/protocol.md`.
+- **No signalling after reap, on every path.** Besides `kill/2` and the
+  Watcher stand-down, the owner-DOWN path now also refuses to signal an
+  `:exited` process, and the Watcher's timed SIGKILL escalation was removed
+  outright — a 5-seconds-later alive?→kill from a process with no reap
+  authority is a check-then-act race against OS pid reuse. Escalation is the
+  shepherd's job (its POLLHUP SIGTERM→SIGKILL ladder); the Watcher keeps
+  only its immediate SIGTERM probe for the shepherd-died-first case.
+- **cgroup ownership guard.** The shepherd only `cgroup.kill`s and removes a
+  cgroup directory it created itself; a pre-existing directory is attached to
+  but never destroyed. `cgroup_path` must now sit under a `net_runner/`
+  prefix and be under 256 bytes — over-length paths are rejected instead of
+  silently truncated to a different cgroup.
+- **Port FDs are CLOEXEC.** The shepherd marks fds 3/4 (the `:nouse_stdio`
+  port channel) close-on-exec, so the child cannot inherit a handle to the
+  BEAM.
+- **Private UDS base directory, atomically.** The socket directory is created
+  with a raw `mkdir(dir, 0700)` NIF (never observable with wider
+  permissions), a pre-existing directory is never adopted, and the memoised
+  path is re-verified (owner, mode, real directory) before every bind.
+- **No FD leaks on spawn error paths.** FDs received via `SCM_RIGHTS` but not
+  yet wrapped in NIF resources are closed on every failure path (new
+  `nif_close_fd/1`), including the dup'd PTY write fd; `nif_create_fd`'s
+  contract is now "on error the caller retains fd ownership", removing a
+  latent double-close.
+- **`io_resource_stop` marks the resource closed under its lock** before
+  closing the fd, so the destructor can never close a recycled fd a second
+  time.
+- **No signalling after reap.** `kill/2` on an exited process returns
+  `{:error, :not_running}`, and the `Watcher` stands down as soon as the exit
+  status is delivered — a reused OS pid can never be signalled (found
+  independently by two auditors as SEC-4/ARCH-M1).
+- **`set_window_size/3` validates** rows/cols into `0..65535`
+  (`{:error, :invalid_window_size}`), and `:stderr_tail_bytes` is capped at
+  1 MiB.
+
+### Added
+
+- **`:env` option** (`run/2`, `stream!/2`, `Process.start/3`): a map of
+  environment variables for the child; a binary value sets, `nil` unsets.
+  PATH resolution happens before `:env` applies — pass absolute command
+  paths when overriding `PATH`.
+- **`stderr: :capture` for `run/2`** — returns the retained stderr tail as a
+  third tuple element: `{output, exit_status, stderr}`.
+- **`NetRunner.Error`** exception with the original reason in `:reason`;
+  `stream!/2` raises it on spawn failure and mid-stream read errors instead
+  of ad-hoc `RuntimeError`s.
+- **`NetRunner.Process.shutdown/3`** — the single owner of the
+  SIGTERM→await→SIGKILL escalation ladder, now used by `run/2`, `Stream`
+  teardown and `Daemon.terminate/2`.
+
+### Changed (potentially breaking for lax callers)
+
+- **`run/2` now sets an owner monitor on its internal process**: a caller
+  that dies mid-`run/2` tears down the child instead of leaking it (the
+  Stream path already behaved this way).
+- **`Daemon` stops on infrastructure failure too**: a crashed drain task or
+  a dead stdin forwarder now stops the Daemon (`{:shutdown, :drain_crashed}`
+  / `{:shutdown, :forwarder_down}`) instead of leaving a healthy-looking
+  GenServer that silently stopped draining; `on_output` callbacks that
+  *exit* (not just raise) are contained; and `Daemon` terminate explicitly
+  stops its `NetRunner.Process` so `GenServer.stop(daemon)` leaks nothing.
+- **`close_stdin/1` fails parked writers eagerly** with `{:error, :closed}`
+  instead of leaving them parked until child exit.
+- **`kill/3`** gained an optional call-timeout argument (default 5_000).
+- **`run(cmd, pty: true, stderr: :capture)` raises `ArgumentError`** — PTY
+  folds stderr into the master fd, so the captured tail would always be
+  empty; rejecting beats silently returning `""`.
+- **`:env` values travel as raw bytes** (`execve` semantics): non-UTF-8
+  values no longer raise from inside spawn, and UTF-8 values are no longer
+  transcoded to codepoints.
+- **`Daemon` stops when its child exits**, with
+  `{:shutdown, {:exit_status, n}}`, so `restart: :permanent` supervisors
+  restart it; previously it lingered as a healthy-looking GenServer over a
+  dead child. `Daemon` also traps exits so a supervisor shutdown runs the
+  graceful SIGTERM→SIGKILL escalation.
+- **Options are validated at every entry point** (`Keyword.validate!/2`):
+  unknown or misplaced options (e.g. `:timeout` on the stream path) now raise
+  `ArgumentError` instead of being silently ignored.
+- **`run([])`/`stream!([])`** return `{:error, {:invalid_cmd, "empty
+  command"}}` / raise `NetRunner.Error` instead of `FunctionClauseError`.
+- **`:input` accepts any `Enumerable`** of iodata chunks (`File.stream!`,
+  `Range`, function streams), not just binaries, lists and `%Stream{}`.
+- **`Process.write/2` normalises iodata to a binary at the API boundary**;
+  the NIF now accepts binaries only.
+- **Stdin writes are bounded per scheduling slice**: a fast-draining child no
+  longer keeps the write loop occupying the GenServer for the whole payload —
+  `kill/2` and reads interleave; the write resumes from the mailbox.
+- **Stats**: stderr bytes read by an external `read_stderr/2` caller now
+  count in `bytes_err`, not `bytes_out`.
+- The dead `:starting` state, `Pipe.owner`/`Pipe.type` fields and
+  `Signal.resolve!/1` were removed.
+
+---
+
+The measurement-driven cycle:
 
 ### Fixed
 
@@ -71,15 +223,16 @@ that produced them is now committed under `bench/`.
   own `handle_call`, so a child that stopped draining stdin wedged `os_pid/1`,
   `alive?/1` and — worst — the `Proc.alive?/1` in `terminate/2`, burning the
   supervisor's 5 000 ms shutdown budget before the SIGTERM/SIGKILL escalation
-  could run. The write is now forwarded from a task that replies. Sequential
-  writes from one caller stay ordered; concurrent writers from different
-  processes are no longer serialised by the Daemon.
-- **`Daemon` `on_output: :log` coalesces output.** One `Logger` call per
-  drained chunk pushes Logger past its sync threshold and collapses the drain
-  rate to Logger's throughput. Consecutive chunks are now batched while the
-  child is saturating the drain, and flushed as soon as a read blocks or the
-  batch reaches 16 KiB, so nothing sits unlogged. Custom `on_output` functions
-  are unaffected and still see every chunk as it arrives.
+  could run. Writes are now forwarded through a single long-lived forwarder
+  task, so the Daemon stays responsive, sequential writes from one caller
+  stay ordered, and concurrent writers are serialised by the forwarder.
+- **`Daemon` `on_output: :log` logs each drained chunk immediately.** A
+  batch-across-reads scheme was tried during this cycle and reverted: a
+  blocking read held already-drained bytes for as long as the child stayed
+  quiet (log lines sitting unflushed for hours), and the OS pipe already
+  coalesces bursts into large read chunks, so per-read `Logger` calls are
+  bounded (~16/MiB at saturation). Custom `on_output` functions are
+  unaffected and still see every chunk as it arrives.
 
 ### Performance
 

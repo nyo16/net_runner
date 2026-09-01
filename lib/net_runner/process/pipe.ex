@@ -3,22 +3,20 @@ defmodule NetRunner.Process.Pipe do
 
   alias NetRunner.Process.Nif
 
-  defstruct [:resource, :owner, :type]
+  defstruct [:resource]
 
-  @type pipe_type :: :stdin | :stdout | :stderr
-  @type t :: %__MODULE__{
-          resource: reference() | nil,
-          owner: pid(),
-          type: pipe_type()
-        }
+  @type t :: %__MODULE__{resource: reference() | nil}
 
   @doc """
   Creates a new pipe by wrapping a raw FD in a NIF resource.
+
+  On error the caller retains ownership of the raw fd (see nif_create_fd)
+  and must close it via `Nif.nif_close_fd/1`.
   """
-  def new(fd, owner, type) when type in [:stdin, :stdout, :stderr] do
+  def new(fd, owner) do
     case Nif.nif_create_fd(fd, owner) do
       {:ok, resource} ->
-        {:ok, %__MODULE__{resource: resource, owner: owner, type: type}}
+        {:ok, %__MODULE__{resource: resource}}
 
       {:error, _} = error ->
         error

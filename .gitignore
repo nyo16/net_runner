@@ -33,8 +33,5 @@ c_src/*.o
 # Dialyzer
 /priv/plts/
 
-# Local .tool-versions
-.tool-versions
-
 # Local agent settings and scratch.
 /.claude/

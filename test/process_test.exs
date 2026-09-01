@@ -1,6 +1,8 @@
 defmodule NetRunner.ProcessTest do
   use ExUnit.Case, async: true
 
+  import NetRunner.TestHelpers
+
   alias NetRunner.Process, as: Proc
 
   describe "basic I/O" do
@@ -30,6 +32,166 @@ defmodule NetRunner.ProcessTest do
       output = read_all(pid)
       assert output == "onetwothree"
       assert {:ok, 0} = Proc.await_exit(pid)
+    end
+  end
+
+  describe "read_batch" do
+    test "returns at least one chunk and :eof after drain" do
+      {:ok, pid} = Proc.start("cat", [])
+      assert :ok = Proc.write(pid, "hello world")
+      assert {:ok, chunks} = Proc.read_batch(pid)
+      assert is_list(chunks) and chunks != []
+      assert IO.iodata_to_binary(chunks) == "hello world"
+      assert :ok = Proc.close_stdin(pid)
+      assert :eof = Proc.read_batch(pid)
+      assert {:ok, 0} = Proc.await_exit(pid)
+    end
+
+    test "preserves byte order across a multi-chunk stream" do
+      expected = Enum.map_join(1..20_000, "", &"#{&1}\n")
+      {:ok, pid} = Proc.start("sh", ["-c", "seq 1 20000"])
+
+      output = batch_read_all(pid, [])
+      assert output == expected
+      assert {:ok, 0} = Proc.await_exit(pid)
+    end
+
+    test "a batch cut short by EOF delivers data first, :eof next" do
+      # Deterministic: after await_exit the pipe holds both the data and the
+      # EOF, so the first batch MUST take the deferred-EOF branch.
+      {:ok, pid} = Proc.start("sh", ["-c", "printf abc"])
+      assert {:ok, 0} = Proc.await_exit(pid)
+
+      assert {:ok, chunks} = Proc.read_batch(pid)
+      assert IO.iodata_to_binary(chunks) == "abc"
+      assert :eof = Proc.read_batch(pid)
+      GenServer.stop(pid)
+    end
+
+    test "max_bytes and max_chunks bound the batch" do
+      {:ok, pid} = Proc.start("cat", [])
+      assert :ok = Proc.write(pid, "abcdef")
+
+      assert {:ok, ["ab", "cd"]} = Proc.read_batch(pid, 2, 2)
+      assert {:ok, ["ef"]} = Proc.read_batch(pid, 2, 2)
+      assert :ok = Proc.close_stdin(pid)
+      assert {:ok, 0} = Proc.await_exit(pid)
+    end
+
+    test "a parked batch read resumes as a batch when data arrives" do
+      # No data until the child writes: the first read EAGAINs and the caller
+      # parks; the readiness event must resume it as a batch, not a single
+      # read. The park is ASSERTED (not assumed from timing) before the
+      # child is allowed to produce, so the {:batch, _, _} retry clause is
+      # guaranteed to run.
+      {:ok, pid} = Proc.start("sh", ["-c", "sleep 0.5; printf abc"])
+
+      task = Task.async(fn -> Proc.read_batch(pid) end)
+      assert wait_until(fn -> map_size(:sys.get_state(pid).operations.pending) == 1 end)
+
+      assert {:ok, chunks} = Task.await(task, 5_000)
+      assert IO.iodata_to_binary(chunks) == "abc"
+      assert :eof = Proc.read_batch(pid)
+      assert {:ok, 0} = Proc.await_exit(pid)
+    end
+
+    test "read_count reflects one count per underlying read" do
+      {:ok, pid} = Proc.start("cat", [])
+      assert :ok = Proc.write(pid, "abcdef")
+      assert {:ok, chunks} = Proc.read_batch(pid)
+      assert Proc.stats(pid).read_count == length(chunks)
+      assert :ok = Proc.close_stdin(pid)
+      assert {:ok, 0} = Proc.await_exit(pid)
+    end
+  end
+
+  defp batch_read_all(pid, acc) do
+    case Proc.read_batch(pid) do
+      {:ok, chunks} ->
+        batch_read_all(pid, [acc | chunks])
+
+      :eof ->
+        IO.iodata_to_binary(acc)
+
+      # Normalized to EOF on purpose: the equality assert downstream still
+      # catches byte loss; only a server that wrongly reports exit instead
+      # of :eof would slip through, and the deferred-EOF test above pins
+      # that ordering directly.
+      {:error, :process_exited} ->
+        IO.iodata_to_binary(acc)
+    end
+  end
+
+  # Polls `fun` (~5ms period) until truthy or ~1s elapses; returns the last
+  # result so callers can `assert wait_until(...)`.
+  defp wait_until(fun, attempts \\ 200)
+  defp wait_until(fun, 0), do: fun.()
+
+  defp wait_until(fun, attempts) do
+    if fun.() do
+      true
+    else
+      Process.sleep(5)
+      wait_until(fun, attempts - 1)
+    end
+  end
+
+  describe "multi-writer fan-in" do
+    test "4 concurrent writers complete with exact byte accounting" do
+      # The child sleeps first so the writers EAGAIN-park behind a full
+      # pipe, then drains: the resume pass services them under ONE shared
+      # write budget and every byte must land exactly once. 4 MiB total —
+      # well past Linux's 1 MiB shepherd-grown pipe, so parking happens on
+      # every platform — and the park is asserted before the drain starts.
+      {:ok, pid} = Proc.start("sh", ["-c", "sleep 0.5; exec cat > /dev/null"])
+      payload = :binary.copy(<<1>>, 1_048_576)
+
+      tasks = for _ <- 1..4, do: Task.async(fn -> Proc.write(pid, payload) end)
+      assert wait_until(fn -> map_size(:sys.get_state(pid).operations.pending) > 0 end)
+
+      results = Task.await_many(tasks, 15_000)
+
+      assert results == [:ok, :ok, :ok, :ok]
+      assert Proc.stats(pid).bytes_in == 4 * 1_048_576
+      assert :ok = Proc.close_stdin(pid)
+      assert {:ok, 0} = Proc.await_exit(pid)
+      GenServer.stop(pid)
+    end
+
+    test "kill/2 during a parked multi-writer fan-in replies promptly" do
+      # Occupancy bound: with 4 parked 2 MiB writers the server must still
+      # interleave a kill/2 call instead of spending 4 full write budgets
+      # per resume pass. Each payload EXCEEDS every platform's pipe capacity
+      # (macOS 64 KiB, Linux 1 MiB shepherd-grown) so no writer can complete
+      # before parking — a 1 MiB payload fit the Linux pipe exactly and the
+      # first writer sailed through, leaving only 3 parked (CI failure).
+      {:ok, pid} = Proc.start("sleep", ["100"])
+      payload = :binary.copy(<<1>>, 2 * 1_048_576)
+
+      tasks = for _ <- 1..4, do: Task.async(fn -> Proc.write(pid, payload) end)
+
+      # All four writers must actually be parked before the kill is issued,
+      # or the occupancy bound below is a trivial pass.
+      assert wait_until(fn ->
+               :sys.get_state(pid).operations.pending
+               |> Enum.count(fn {_ref, {type, _f, _c, _m}} -> type == :write end) == 4
+             end)
+
+      t0 = System.monotonic_time(:millisecond)
+      assert :ok = Proc.kill(pid, :sigkill)
+      assert System.monotonic_time(:millisecond) - t0 < 1_000
+
+      for task <- tasks do
+        assert Task.await(task, 5_000) in [
+                 :ok,
+                 {:error, :process_exited},
+                 {:error, :closed},
+                 {:error, :epipe}
+               ]
+      end
+
+      assert {:ok, _} = Proc.await_exit(pid)
+      GenServer.stop(pid)
     end
   end
 
@@ -185,37 +347,13 @@ defmodule NetRunner.ProcessTest do
       # Poll until the Process GenServer detects the DOWN, SIGKILLs the
       # child, reaps it, and stops. Avoids a fixed sleep that flakes on
       # loaded CI runners.
-      assert eventually(fn ->
-               not Process.alive?(proc_pid) and not os_pid_alive?(os_pid)
-             end),
+      assert eventually(
+               fn ->
+                 not Process.alive?(proc_pid) and not os_pid_alive?(os_pid)
+               end,
+               3_000
+             ),
              "Process GenServer should have stopped and OS process should be killed"
-    end
-  end
-
-  # Polls `fun` every 50 ms until it returns true or `timeout` elapses.
-  defp eventually(fun, timeout \\ 3_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_eventually(fun, deadline)
-  end
-
-  defp do_eventually(fun, deadline) do
-    cond do
-      fun.() ->
-        true
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        false
-
-      true ->
-        Process.sleep(50)
-        do_eventually(fun, deadline)
-    end
-  end
-
-  defp os_pid_alive?(os_pid) do
-    case System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true) do
-      {_, 0} -> true
-      _ -> false
     end
   end
 

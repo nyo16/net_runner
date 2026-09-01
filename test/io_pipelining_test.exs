@@ -1,6 +1,8 @@
 defmodule NetRunner.IOPipeliningTest do
   use ExUnit.Case, async: true
 
+  import NetRunner.TestHelpers
+
   alias NetRunner.Process, as: Proc
 
   # A regression must fail by timeout, never by hanging the suite. `run/2`'s
@@ -55,7 +57,7 @@ defmodule NetRunner.IOPipeliningTest do
     # The escape hatch must survive the concurrent writer: the writer task is
     # now live on the timeout branch and has to be torn down with the reader.
     test "still returns {:error, :timeout} and reaps the OS process" do
-      marker = "313"
+      marker = "86400#{System.unique_integer([:positive])}"
       payload = :binary.copy(<<?x>>, 4_194_304)
 
       # Drains stdin fully (so the writer finishes) and then refuses to exit.
@@ -65,20 +67,18 @@ defmodule NetRunner.IOPipeliningTest do
                  timeout: 300
                )
 
-      Process.sleep(300)
-      assert count_matching("sleep #{marker}") == 0
+      eventually(fn -> count_matching("sleep #{marker}") == 0 end, 3_000)
     end
 
     test "times out even while the writer is still blocked on a full stdin pipe" do
-      marker = "317"
+      marker = "86400#{System.unique_integer([:positive])}"
       payload = :binary.copy(<<?x>>, 4_194_304)
 
       # Never reads stdin, so the writer parks in Proc.write for the whole run.
       assert {:error, :timeout} =
                NetRunner.run(["sh", "-c", "sleep #{marker}"], input: payload, timeout: 300)
 
-      Process.sleep(300)
-      assert count_matching("sleep #{marker}") == 0
+      eventually(fn -> count_matching("sleep #{marker}") == 0 end, 3_000)
     end
   end
 
@@ -121,28 +121,34 @@ defmodule NetRunner.IOPipeliningTest do
       parent = self()
 
       spawn_link(fn ->
-        worst =
-          Enum.reduce(1..200, 0, fn _, acc ->
+        samples =
+          Enum.map(1..200, fn _ ->
             {us, _} = :timer.tc(fn -> Proc.os_pid(pid) end)
             Process.sleep(1)
-            max(acc, us)
+            us
           end)
 
-        send(parent, {:worst, worst})
+        send(parent, {:samples, samples})
       end)
 
       assert {:ok, 0} = Proc.await_exit(pid, 60_000)
 
-      worst =
+      samples =
         receive do
-          {:worst, us} -> us
+          {:samples, samples} -> samples
         after
           30_000 -> flunk("latency probe never finished")
         end
 
-      # Measured worst case is ~30 us against a jitter floor of the same order;
-      # 50 ms is far above that and far below an unbounded drain.
-      assert worst < 50_000, "worst concurrent handle_call was #{worst} us"
+      # Percentiles, not worst-of-200: a single scheduler hiccup on a loaded
+      # CI runner must not fail the test, but a systematically unbounded
+      # drain (every call queued behind megabytes of stderr) still does.
+      sorted = Enum.sort(samples)
+      median = Enum.at(sorted, div(length(sorted), 2))
+      p90 = Enum.at(sorted, div(length(sorted) * 9, 10))
+
+      assert median < 10_000, "median concurrent handle_call was #{median} us"
+      assert p90 < 50_000, "p90 concurrent handle_call was #{p90} us"
 
       # And the flood really was drained, not abandoned.
       assert Proc.stats(pid).bytes_err == 64 * 1_048_576
@@ -168,16 +174,8 @@ defmodule NetRunner.IOPipeliningTest do
         )
 
       assert {:ok, 0} = Proc.await_exit(pid, 30_000)
-      assert wait_until(fn -> Proc.stats(pid).bytes_err == total end), "stderr drain stalled"
+      eventually(fn -> Proc.stats(pid).bytes_err == total end, 5_000)
       assert byte_size(Proc.stderr_tail(pid)) == 1_048_576
-    end
-  end
-
-  defp wait_until(fun, attempts \\ 200) do
-    cond do
-      fun.() -> true
-      attempts == 0 -> false
-      true -> Process.sleep(20) && wait_until(fun, attempts - 1)
     end
   end
 

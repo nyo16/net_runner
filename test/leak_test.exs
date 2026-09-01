@@ -4,7 +4,7 @@ defmodule NetRunner.LeakTest do
   alias NetRunner.Process, as: Proc
 
   describe "FD leak prevention" do
-    @tag :linux_only
+    # Runs on Linux via /proc/self/fd and on macOS via lsof -p.
     test "rapid spawn/kill cycle does not leak FDs" do
       # Warm-up run to stabilize FD baseline
       for _ <- 1..5 do
@@ -35,18 +35,6 @@ defmodule NetRunner.LeakTest do
       # Allow margin for BEAM-internal FD activity
       assert final_fd_count <= initial_fd_count + 30,
              "FD leak detected: started with #{initial_fd_count}, ended with #{final_fd_count}"
-    end
-
-    test "stream abort cleans up process" do
-      # Start a long-running stream and abort mid-read
-      stream = NetRunner.stream!(["sh", "-c", "while true; do echo line; sleep 0.01; done"])
-
-      # Take only a few elements then halt
-      result = Enum.take(stream, 3)
-      assert length(result) == 3
-
-      # Give cleanup time to run
-      Process.sleep(500)
     end
 
     test "process exit before read gives clean error" do
@@ -193,11 +181,16 @@ defmodule NetRunner.LeakTest do
     end
   end
 
-  # Helper to count open FDs via /proc/self/fd
+  # Counts this BEAM's open FDs: /proc/self/fd on Linux, lsof -p on macOS
+  # (which has no procfs).
   defp count_open_fds do
     case File.ls("/proc/self/fd") do
-      {:ok, entries} -> length(entries)
-      {:error, _} -> 0
+      {:ok, entries} ->
+        length(entries)
+
+      {:error, _} ->
+        {out, _status} = System.cmd("lsof", ["-p", System.pid()], stderr_to_stdout: true)
+        out |> String.split("\n", trim: true) |> length()
     end
   end
 end

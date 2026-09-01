@@ -1,7 +1,18 @@
 defmodule NetRunner.DaemonTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+  import NetRunner.TestHelpers
+
   alias NetRunner.Daemon
+
+  # The Daemon now stops with {:shutdown, {:exit_status, n}} when its child
+  # exits, and start_link links it to the test process — so every test whose
+  # child can exit traps exits.
+  setup do
+    Process.flag(:trap_exit, true)
+    :ok
+  end
 
   describe "Daemon" do
     test "start and stop a long-running process" do
@@ -11,10 +22,9 @@ defmodule NetRunner.DaemonTest do
       assert is_integer(os_pid) and os_pid > 0
 
       GenServer.stop(daemon)
-      Process.sleep(100)
 
       # OS process should be dead after daemon stops
-      refute os_pid_alive?(os_pid)
+      eventually(fn -> not os_pid_alive?(os_pid) end)
     end
 
     test "write to daemon stdin" do
@@ -23,10 +33,44 @@ defmodule NetRunner.DaemonTest do
       GenServer.stop(daemon)
     end
 
-    test "on_output :log works" do
-      {:ok, daemon} = Daemon.start_link(cmd: "echo", args: ["logged"], on_output: :log)
-      Process.sleep(200)
-      GenServer.stop(daemon)
+    test "write after child exit returns an error tuple" do
+      {:ok, daemon} = Daemon.start_link(cmd: "cat", args: [])
+      os_pid = Daemon.os_pid(daemon)
+
+      System.cmd("kill", ["-KILL", to_string(os_pid)])
+
+      # Once the Daemon observes the exit it stops; a write racing that stop
+      # must come back as a value — never hang and never crash the caller.
+      result =
+        try do
+          eventually(fn ->
+            match?({:error, _}, Daemon.write(daemon, "late\n"))
+          end)
+        catch
+          :exit, _ -> true
+        end
+
+      assert result
+    end
+
+    test "alive? is false after the child exits naturally" do
+      {:ok, daemon} = Daemon.start_link(cmd: "sh", args: ["-c", "exit 0"])
+
+      # The Daemon stops itself with the exit status; observing that stop IS
+      # the "not alive" signal for a supervised daemon.
+      assert_receive {:EXIT, ^daemon, {:shutdown, {:exit_status, 0}}}, 5_000
+      refute Process.alive?(daemon)
+    end
+
+    test "on_output :log logs the drained output" do
+      log =
+        capture_log(fn ->
+          {:ok, daemon} = Daemon.start_link(cmd: "echo", args: ["logged-marker"], on_output: :log)
+
+          assert_receive {:EXIT, ^daemon, {:shutdown, {:exit_status, 0}}}, 5_000
+        end)
+
+      assert log =~ "logged-marker"
     end
 
     test "on_output with custom function" do
@@ -41,7 +85,7 @@ defmodule NetRunner.DaemonTest do
       assert_receive {:output, data}, 2_000
       assert data =~ "custom"
 
-      GenServer.stop(daemon)
+      assert_receive {:EXIT, ^daemon, {:shutdown, {:exit_status, 0}}}, 5_000
     end
 
     test "a crashing on_output callback does not bring the Daemon down" do
@@ -62,15 +106,33 @@ defmodule NetRunner.DaemonTest do
     end
 
     test "daemon cleans up on crash" do
-      Process.flag(:trap_exit, true)
       {:ok, daemon} = Daemon.start_link(cmd: "sleep", args: ["100"])
       os_pid = Daemon.os_pid(daemon)
 
       Process.exit(daemon, :kill)
       assert_receive {:EXIT, ^daemon, :killed}, 1_000
-      Process.sleep(500)
+      eventually(fn -> not os_pid_alive?(os_pid) end, 3_000)
+    end
 
-      refute os_pid_alive?(os_pid)
+    test "an exiting on_output callback does not disable draining or stop-on-exit" do
+      # exit (not raise) is the classic callback failure — GenServer.call to
+      # a dead process. It must not kill the drain task: a dead stdout drain
+      # would disable both draining and the Daemon's stop-on-child-exit.
+      {:ok, daemon} =
+        Daemon.start_link(
+          cmd: "sh",
+          args: ["-c", "echo one; sleep 0.1; exit 3"],
+          on_output: fn _ -> exit(:callback_boom) end
+        )
+
+      # The drain survived the exit and still observed the child's status.
+      assert_receive {:EXIT, ^daemon, {:shutdown, {:exit_status, 3}}}, 5_000
+    end
+
+    test "rejects unknown options" do
+      assert_raise ArgumentError, fn ->
+        Daemon.start_link(cmd: "cat", args: [], on_ouptut: :log)
+      end
     end
 
     # Proc.write/2 is an :infinity GenServer.call. Performed inside the
@@ -101,14 +163,30 @@ defmodule NetRunner.DaemonTest do
       assert us_stop < 5_000_000, "shutdown took #{us_stop} us"
 
       Task.shutdown(writer, :brutal_kill)
-      refute os_pid_alive?(os_pid)
+      eventually(fn -> not os_pid_alive?(os_pid) end)
     end
   end
 
-  defp os_pid_alive?(os_pid) do
-    case System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true) do
-      {_, 0} -> true
-      _ -> false
+  describe "log flush latency (PERF-3)" do
+    test "a small quiet burst is logged promptly, not held for the next read" do
+      log =
+        capture_log(fn ->
+          {:ok, daemon} =
+            Daemon.start_link(
+              cmd: "sh",
+              args: ["-c", "echo prompt-marker; sleep 100"],
+              on_output: :log
+            )
+
+          # Far below the old 16 KiB flush threshold and the child stays
+          # quiet: the marker must still appear without waiting for EOF.
+          # (The child sleeps for 100 s, so if the marker shows up within
+          # this window it was flushed promptly, not held for the next read.)
+          Process.sleep(300)
+          GenServer.stop(daemon)
+        end)
+
+      assert log =~ "prompt-marker"
     end
   end
 end

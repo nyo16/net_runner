@@ -203,6 +203,13 @@ static int pty_master_fd = -1;
 static char cgroup_path[CGROUP_PATH_MAX] = {0};
 
 #ifdef __linux__
+/* Set only when this shepherd created the cgroup directory itself. A
+ * pre-existing directory belongs to someone else: attach the child to it,
+ * but never cgroup.kill it or rmdir it on teardown. */
+static int cgroup_owned = 0;
+#endif
+
+#ifdef __linux__
 #include <dirent.h>
 
 static int cgroup_setup(pid_t child_pid) {
@@ -217,7 +224,12 @@ static int cgroup_setup(pid_t child_pid) {
         ERROR_LOG("cgroup path too long");
         return -1;
     }
-    mkdir(full_path, 0755); /* ignore error if exists */
+    if (mkdir(full_path, 0755) == 0) {
+        cgroup_owned = 1;
+    } else if (errno != EEXIST) {
+        ERROR_LOG("mkdir(%s) failed: %s", full_path, strerror(errno));
+        return -1;
+    }
 
     n = snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs", full_path);
     if (n < 0 || (size_t)n >= sizeof(procs_path)) {
@@ -235,7 +247,7 @@ static int cgroup_setup(pid_t child_pid) {
 }
 
 static void cgroup_cleanup(void) {
-    if (cgroup_path[0] == '\0') return;
+    if (cgroup_path[0] == '\0' || !cgroup_owned) return;
 
     char full_path[512];
     char kill_path[576];
@@ -446,7 +458,7 @@ static size_t handle_commands(int uds_fd, pid_t child_pid, int *stdin_w,
  *   - UDS socket for BEAM commands and POLLHUP (BEAM death)
  *   - Signal pipe for SIGCHLD (child death)
  */
-static int event_loop(int uds_fd, pid_t child_pid, int stdin_w) {
+static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
     struct pollfd fds[2];
     int child_status = -1;
     int child_exited = 0;
@@ -483,7 +495,7 @@ static int event_loop(int uds_fd, pid_t child_pid, int stdin_w) {
             ssize_t n = read(uds_fd, cbuf + cbuf_used, sizeof(cbuf) - cbuf_used);
             if (n > 0) {
                 cbuf_used += (size_t)n;
-                size_t consumed = handle_commands(uds_fd, child_pid, &stdin_w,
+                size_t consumed = handle_commands(uds_fd, child_pid, stdin_w,
                                                   cbuf, cbuf_used);
                 if (consumed > 0 && consumed < cbuf_used) {
                     memmove(cbuf, cbuf + consumed, cbuf_used - consumed);
@@ -545,22 +557,26 @@ static int event_loop(int uds_fd, pid_t child_pid, int stdin_w) {
 }
 
 /*
- * Usage: shepherd <uds_path> [--kill-timeout <ms>] <cmd> [args...]
+ * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token <hex>] <cmd> [args...]
  *
  *   uds_path:       Path to the UDS listener socket created by the BEAM
  *   --kill-timeout:  SIGTERM->SIGKILL escalation timeout in ms (default 5000)
+ *   --token:        32-char hex handshake token, sent verbatim as the first
+ *                   frame after connect so the BEAM can authenticate us
  *   cmd:            Command to execute
  *   args:           Arguments for the command
  */
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         fprintf(stderr,
-                "usage: shepherd <uds_path> [--kill-timeout <ms>] <cmd> [args...]\n");
+                "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token <hex>] <cmd> [args...]\n");
         return 1;
     }
 
     const char *uds_path = argv[1];
     int cmd_idx = 2;
+    int token_from_fd = 0;
+    char token[TOKEN_HEX_LEN + 1] = {0};
 
     /* Parse optional flags */
     while (cmd_idx < argc && argv[cmd_idx][0] == '-') {
@@ -576,6 +592,13 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[cmd_idx], "--pty") == 0) {
             pty_mode = MODE_PTY;
             cmd_idx += 1;
+        } else if (strcmp(argv[cmd_idx], "--token-fd") == 0) {
+            /* The token is read from fd 3 (the :nouse_stdio port channel),
+             * NEVER argv: /proc/<pid>/cmdline is world-readable on Linux and
+             * same-uid readable on macOS, so an argv token would be visible
+             * to exactly the same-uid attacker it exists to stop. */
+            token_from_fd = 1;
+            cmd_idx += 1;
         } else if (strcmp(argv[cmd_idx], "--cgroup-path") == 0 && cmd_idx + 1 < argc) {
             const char *path = argv[cmd_idx + 1];
             /* Reject path traversal: no ".." components, no leading "/" */
@@ -583,8 +606,15 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "error: invalid cgroup path (must be relative, no '..')\n");
                 return 1;
             }
-            strncpy(cgroup_path, path, CGROUP_PATH_MAX - 1);
-            cgroup_path[CGROUP_PATH_MAX - 1] = '\0';
+            /* Reject rather than silently truncate: a truncated path would
+             * attach the child to (and later kill) a different cgroup than
+             * the one the caller validated. */
+            if (strlen(path) >= CGROUP_PATH_MAX) {
+                fprintf(stderr, "error: cgroup path too long (max %d bytes)\n",
+                        CGROUP_PATH_MAX - 1);
+                return 1;
+            }
+            memcpy(cgroup_path, path, strlen(path) + 1);
             cmd_idx += 2;
         } else {
             break; /* Unknown flag — treat as command */
@@ -594,6 +624,31 @@ int main(int argc, char *argv[]) {
     if (cmd_idx >= argc) {
         fprintf(stderr, "error: no command specified\n");
         return 1;
+    }
+
+    /* FDs 3/4 are the BEAM port's :nouse_stdio channel to this shepherd.
+     * Mark them close-on-exec so the child cannot inherit a handle to the
+     * BEAM. (The UDS and pipe fds get their own CLOEXEC below.) */
+    set_cloexec(3);
+    set_cloexec(4);
+
+    /* Read the handshake token from the BEAM before touching the UDS. The
+     * port channel is private to the BEAM and this process. */
+    if (token_from_fd) {
+        size_t got = 0;
+        while (got < TOKEN_HEX_LEN) {
+            ssize_t n = read(3, token + got, TOKEN_HEX_LEN - got);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                perror("token read");
+                return 1;
+            }
+            if (n == 0) {
+                fprintf(stderr, "error: BEAM closed before sending token\n");
+                return 1;
+            }
+            got += (size_t)n;
+        }
     }
 
     char *cmd = argv[cmd_idx];
@@ -655,6 +710,24 @@ int main(int argc, char *argv[]) {
     }
 
     set_cloexec(uds_fd);
+
+    /* Authenticate: the BEAM handed us a per-spawn random token over fd 3
+     * and accepts FDs only from the peer that echoes it back as the very
+     * first frame. Without this, any same-uid process that wins the accept
+     * race would receive the child's pipe FDs via SCM_RIGHTS. */
+    if (token_from_fd) {
+        size_t sent = 0;
+        while (sent < TOKEN_HEX_LEN) {
+            ssize_t n = write(uds_fd, token + sent, TOKEN_HEX_LEN - sent);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                perror("token write");
+                close(uds_fd);
+                return 1;
+            }
+            sent += (size_t)n;
+        }
+    }
 
     pid_t child_pid;
     int shepherd_stdin_w = -1;
@@ -878,8 +951,10 @@ int main(int argc, char *argv[]) {
         close(stderr_pipe[0]);
     }
 
-    /* Enter event loop */
-    int result = event_loop(uds_fd, child_pid, shepherd_stdin_w);
+    /* Enter event loop. stdin_w is passed by pointer so a CMD_CLOSE_STDIN
+     * handled inside the loop is visible here — otherwise the fd would be
+     * closed a second time below, racing whatever recycled the number. */
+    int result = event_loop(uds_fd, child_pid, &shepherd_stdin_w);
 
     /* Cleanup */
     if (shepherd_stdin_w >= 0) close(shepherd_stdin_w);

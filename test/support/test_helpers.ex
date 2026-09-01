@@ -1,0 +1,76 @@
+defmodule NetRunner.TestHelpers do
+  @moduledoc """
+  Shared helpers for the NetRunner test suite.
+
+  `eventually/2` replaces sleep-then-assert: it polls the assertion until it
+  passes or the deadline expires, so tests wait exactly as long as the system
+  needs instead of a guessed fixed interval (fast machines waste time, slow
+  CI flakes).
+  """
+
+  @doc """
+  Polls `fun` until it returns a truthy value or passes its assertions,
+  re-raising the last failure once `timeout_ms` (default 2_000) expires.
+  """
+  def eventually(fun, timeout_ms \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    poll(fun, deadline)
+  end
+
+  defp poll(fun, deadline) do
+    result = fun.()
+
+    if result do
+      result
+    else
+      retry_or_flunk(fun, deadline, fn ->
+        ExUnit.Assertions.flunk("eventually/2: condition still falsy after deadline")
+      end)
+    end
+  rescue
+    e in [ExUnit.AssertionError] ->
+      retry_or_flunk(fun, deadline, fn -> reraise e, __STACKTRACE__ end)
+  end
+
+  defp retry_or_flunk(fun, deadline, on_expiry) do
+    if System.monotonic_time(:millisecond) < deadline do
+      Process.sleep(10)
+      poll(fun, deadline)
+    else
+      on_expiry.()
+    end
+  end
+
+  @doc """
+  True when the OS process `os_pid` still exists AND is not a zombie.
+
+  `kill -0` alone is wrong in containerized CI: an orphan whose new parent
+  (a shell as PID 1) never reaps it stays a signalable zombie forever, so
+  "the child died" tests would hang on the probe. A zombie has already
+  exited — for every "did it die" question this helper answers, it is dead.
+  """
+  def os_pid_alive?(os_pid) do
+    case System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true) do
+      {_, 0} -> not zombie?(os_pid)
+      _ -> false
+    end
+  end
+
+  # /proc/<pid>/stat field 3 is the state character; "Z" is a zombie. macOS
+  # has no /proc, but also reaps orphans via launchd, so absence => not a
+  # zombie concern.
+  defp zombie?(os_pid) do
+    case File.read("/proc/#{os_pid}/stat") do
+      {:ok, stat} ->
+        # comm can contain spaces/parens; the state follows the LAST ")".
+        stat
+        |> String.split(")")
+        |> List.last()
+        |> String.trim_leading()
+        |> String.starts_with?("Z")
+
+      {:error, _} ->
+        false
+    end
+  end
+end

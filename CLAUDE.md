@@ -75,3 +75,24 @@ Shepherd→BEAM: `MSG_CHILD_STARTED(pid)`, `MSG_CHILD_EXITED(status)`, `MSG_ERRO
 - All public API functions have `@doc` and `@spec`
 - Tests are async where possible (`async: true`)
 - Credo strict mode enforced: max cyclomatic complexity 9, max nesting depth 2
+
+## Performance Rules (learned; details in `.claude/solutions/`)
+
+- **Never hand a large list/map to another process raw.** `Task.async`
+  closures and messages copy the whole structure into the receiving heap
+  (~20 ms per boundary for a 200k-cons list, and the refc bump per binary
+  is paid per element). Reduce to a few flat refc binaries in the sender
+  first — binaries cross process boundaries for free. See
+  `InputWriter.prepare/1` for the pattern; bisect suspect cases by running
+  the same code inline vs spawned.
+- **Verify achievable batch size before batching syscalls/messages.** The
+  cap is `pipe_capacity / read_size`: macOS pipes (64 KiB = read size)
+  yield 1-chunk batches, Linux (1 MiB shepherd-grown) up to 16. Instrument
+  with a batch-size histogram probe before trusting a message-count
+  projection, and bench on the platform the optimization targets.
+- **Bench discipline**: `MIX_ENV=prod mix run bench/perf.exs`, ≥3 runs,
+  compare medians, ~11% run-to-run spread is the noise floor; measure
+  BEFORE a fix lands so the gain is measured, not asserted; A/B on the
+  same machine state when a gate reads ambiguous. `@default_read_size`
+  and scheduler placement are benchmark-pinned DO-NOT-REOPEN
+  (`docs/decisions.md`).

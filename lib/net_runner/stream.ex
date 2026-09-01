@@ -24,24 +24,49 @@ defmodule NetRunner.Stream do
 
   Returns `{:ok, stream}` or `{:error, reason}`.
   """
+  # :timeout / :max_output_size are run/2-only: a lazy stream has no single
+  # wall-clock or collected size to bound, so they are rejected here rather
+  # than silently ignored.
+  @stream_opts [
+    :input,
+    :input_buffer,
+    :stderr,
+    :stderr_tail_bytes,
+    :pty,
+    :cgroup_path,
+    :kill_timeout,
+    :env,
+    :owner,
+    :name
+  ]
+
   def stream(cmd, args, opts) do
+    opts = Keyword.validate!(opts, @stream_opts)
     input = Keyword.get(opts, :input, nil)
+    input_buffer = validate_input_buffer!(Keyword.get(opts, :input_buffer, 0))
     # Pass the caller as :owner so the Process GenServer stops (and kills the OS
     # process) if nothing ever consumes the stream. build_stream/2 re-registers
     # the real consumer as owner once iteration starts.
     process_opts =
       opts
-      |> Keyword.drop([:input])
+      |> Keyword.drop([:input, :input_buffer])
       |> Keyword.put_new(:owner, self())
 
     case Proc.start(cmd, args, process_opts) do
       {:ok, pid} ->
-        stream = build_stream(pid, input)
+        stream = build_stream(pid, input, input_buffer)
         {:ok, stream}
 
       {:error, _} = error ->
         error
     end
+  end
+
+  defp validate_input_buffer!(bytes) when is_integer(bytes) and bytes >= 0, do: bytes
+
+  defp validate_input_buffer!(other) do
+    raise ArgumentError,
+          ":input_buffer must be a non-negative integer (bytes), got: #{inspect(other)}"
   end
 
   @doc """
@@ -50,11 +75,11 @@ defmodule NetRunner.Stream do
   def stream!(cmd, args, opts) do
     case stream(cmd, args, opts) do
       {:ok, s} -> s
-      {:error, reason} -> raise "failed to start process: #{inspect(reason)}"
+      {:error, reason} -> raise NetRunner.Error, reason: {:spawn_failed, reason}
     end
   end
 
-  defp build_stream(pid, input) do
+  defp build_stream(pid, input, input_buffer) do
     Stream.resource(
       fn ->
         # Re-register the owner here: this fun runs in the consumer, whereas the
@@ -64,7 +89,7 @@ defmodule NetRunner.Stream do
         # the monitor, so the spawn-time owner still covers the window before
         # the first consumption.
         Proc.set_owner(pid, self())
-        {:reading, InputWriter.start(pid, input)}
+        {:reading, InputWriter.start(pid, input, input_buffer)}
       end,
       fn acc -> read_next(pid, acc) end,
       fn
@@ -89,9 +114,13 @@ defmodule NetRunner.Stream do
   # abnormal writer exit already takes the consumer down before a poll could
   # observe it.
   defp read_next(pid, {:reading, writer} = acc) do
-    case Proc.read(pid) do
-      {:ok, data} ->
-        {[data], acc}
+    case Proc.read_batch(pid) do
+      # Whatever the batch collected becomes the stream's next elements —
+      # `{chunks, acc}` is the normal `Stream.resource` shape. Element sizes
+      # stay ≤ the read size and ordering is preserved; several elements may
+      # now be emitted per resource step.
+      {:ok, chunks} ->
+        {chunks, acc}
 
       # Distinct terminal accumulator: the after-fun uses it to tell a natural
       # end-of-stream apart from a consumer that halted mid-stream.
@@ -102,7 +131,7 @@ defmodule NetRunner.Stream do
         {:halt, {:done, writer}}
 
       {:error, reason} ->
-        raise "read error: #{inspect(reason)}"
+        raise NetRunner.Error, reason: {:read_error, reason}
     end
   end
 
@@ -127,34 +156,21 @@ defmodule NetRunner.Stream do
   defp reap_child(pid, :eof) do
     if Process.alive?(pid) do
       Proc.close_stdin(pid)
-      stop_process(pid, @eof_grace_ms)
+      Proc.shutdown(pid, @eof_grace_ms, 0)
     end
+
+    :ok
   catch
     :exit, _ -> :ok
   end
 
   defp reap_child(pid, :halted) do
     if Process.alive?(pid) do
-      Proc.kill(pid, :sigterm)
-      stop_process(pid, @halted_grace_ms)
+      Proc.shutdown(pid, @halted_grace_ms, 0)
     end
+
+    :ok
   catch
     :exit, _ -> :ok
-  end
-
-  defp stop_process(pid, grace_ms) do
-    case await_exit(pid, grace_ms) do
-      {:ok, _status} -> :ok
-      _ -> Proc.kill(pid, :sigkill)
-    end
-  end
-
-  # Proc.await_exit/2 is a GenServer.call, so exhausting the grace exits the
-  # consumer. Trap it here so the SIGKILL escalation in stop_process/2 is
-  # reachable instead of unwinding to the cleanup clauses' catch.
-  defp await_exit(pid, timeout) do
-    Proc.await_exit(pid, timeout)
-  catch
-    :exit, _ -> :timeout
   end
 end
