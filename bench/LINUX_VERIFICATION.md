@@ -15,8 +15,9 @@ M1 Max, OTP 29 / erts 17.0.3**. Four things cannot be verified on that host.
 This file is the instruction set for finishing them on Linux.
 
 Nothing here is speculative work — the code is written, the suite is green
-(184 passing), and the CHANGELOG already carries the caveats. What is missing
-is *evidence* for two claims and *coverage* for two tools.
+(236 tests / 4 properties as of 2026-08-31; the branch snapshot said 184),
+and the CHANGELOG already carries the caveats. What is missing is *evidence*
+for two claims and *coverage* for two tools.
 
 ---
 
@@ -24,7 +25,7 @@ is *evidence* for two claims and *coverage* for two tools.
 
 | | |
 |---|---|
-| `mix test` | 184 passed, 2 excluded (`:linux_only`) — on macOS |
+| `mix test` | green — 236 tests / 4 properties, 2 excluded (`:linux_only`) — on macOS (counts refreshed 2026-08-31; the original branch snapshot said 184) |
 | `mix compile --warnings-as-errors` / `format` / `credo` / `dialyzer` / `docs` | all clean |
 | `make clean && make all` | clean under `-Wall -Wextra -Werror` |
 | ASan/UBSan **build** | clean under `-Werror` |
@@ -32,8 +33,9 @@ is *evidence* for two claims and *coverage* for two tools.
 | Phase 3 (cgroup exit-status ordering) | **zero runtime evidence** (see Task A) |
 | Phase 2 (read size) on Linux | unmeasured (see Task B) |
 
-The two `:linux_only` tests excluded on macOS are in `test/leak_test.exs`
-(FD-count check via `/proc/self/fd`) and `test/cgroup_test.exs`.
+The two `:linux_only` tests excluded on macOS are both in
+`test/cgroup_test.exs`. (`test/leak_test.exs` now runs on both platforms:
+`/proc/self/fd` on Linux, `lsof -p` on macOS.)
 
 ---
 
@@ -43,7 +45,7 @@ The two `:linux_only` tests excluded on macOS are in `test/leak_test.exs`
 git checkout perf/io-pipelining-followup
 mix deps.get
 make clean && make all          # must be warning-free under -Werror
-mix test                        # expect 186 passing on Linux (the 2 :linux_only unlock)
+mix test                        # expect the full suite on Linux (the 2 :linux_only in cgroup_test.exs unlock)
 ```
 
 If `mix test` is not green **stop here** — something is Linux-specific in the
@@ -65,7 +67,7 @@ cgroup_cleanup();                          /* up to 10 x usleep(100000) */
 send_child_exited(uds_fd, child_status);
 ```
 
-and is now the other way round. `cgroup_cleanup()` (`shepherd.c:237-263`)
+and is now the other way round. `cgroup_cleanup()` (`c_src/shepherd.c`)
 writes `cgroup.kill`, then polls `rmdir` up to **ten times with
 `usleep(100000)` between** — so with `--cgroup-path` set, the caller's
 `await_exit` could block for up to a full second on a status the shepherd
@@ -150,7 +152,7 @@ case is not hitting `EBUSY` (see the trap above) or the claim is wrong — and
 
 ### Also check
 
-`kill_child()` (`shepherd.c:330-353`) still calls `cgroup_cleanup()` last, and
+`kill_child()` (`c_src/shepherd.c`) still calls `cgroup_cleanup()` last, and
 that is deliberate — on the kill path the cleanup *is* the point. Do not
 "consistency fix" it to match `event_loop`.
 
@@ -163,7 +165,8 @@ rationale in ADR-9 in `docs/decisions.md`). Measured on macOS: 64 MiB read goes
 from 1773–1834 chunks / 26–31 ms to **1024 chunks / 18–19 ms**, every round.
 
 Linux is expected to show a **smaller** win, because the shepherd sets
-`F_SETPIPE_SZ` to 1 MiB on all three pipes (`shepherd.c:794-797`), so a full
+`F_SETPIPE_SZ` to 1 MiB on all three pipes (the `fcntl(F_SETPIPE_SZ, 1 << 20)`
+calls in `shepherd.c`'s pipe-mode spawn path), so a full
 pipe already yields sixteen 64 KiB reads rather than one. The alignment
 argument largely evaporates there.
 

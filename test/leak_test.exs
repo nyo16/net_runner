@@ -1,6 +1,8 @@
 defmodule NetRunner.LeakTest do
   use ExUnit.Case, async: false
 
+  import NetRunner.TestHelpers
+
   alias NetRunner.Process, as: Proc
 
   describe "FD leak prevention" do
@@ -10,12 +12,11 @@ defmodule NetRunner.LeakTest do
       for _ <- 1..5 do
         {:ok, pid} = Proc.start("true", [])
         Proc.await_exit(pid)
+        GenServer.stop(pid, :normal)
       end
 
       :erlang.garbage_collect()
-      Process.sleep(500)
-
-      initial_fd_count = count_open_fds()
+      initial_fd_count = settled_fd_count()
 
       for _ <- 1..20 do
         {:ok, pid} = Proc.start("sleep", ["100"])
@@ -24,17 +25,22 @@ defmodule NetRunner.LeakTest do
         GenServer.stop(pid, :normal)
       end
 
-      # Allow GC and cleanup time
       :erlang.garbage_collect()
-      Process.sleep(1_000)
-      :erlang.garbage_collect()
-      Process.sleep(500)
 
-      final_fd_count = count_open_fds()
+      # A +30 margin over 20 cycles masked a 1-FD-per-cycle leak entirely
+      # (each spawn opens 4+ descriptors). +3 tolerates BEAM-internal FD
+      # churn, and polling (teardown is asynchronous) keeps it load-tolerant:
+      # a transient spike settles back under the bound, a real per-cycle leak
+      # (>= 20 FDs here) never can.
+      eventually(
+        fn ->
+          final_fd_count = count_open_fds()
 
-      # Allow margin for BEAM-internal FD activity
-      assert final_fd_count <= initial_fd_count + 30,
-             "FD leak detected: started with #{initial_fd_count}, ended with #{final_fd_count}"
+          assert final_fd_count <= initial_fd_count + 3,
+                 "FD leak detected: started with #{initial_fd_count}, ended with #{final_fd_count}"
+        end,
+        10_000
+      )
     end
 
     test "process exit before read gives clean error" do
@@ -104,17 +110,15 @@ defmodule NetRunner.LeakTest do
 
   describe "cgroup path validation" do
     test "rejects path traversal with .." do
-      assert {:error, {:invalid_cgroup_path, msg}} =
-               Proc.start("echo", ["test"], cgroup_path: "../../etc/evil")
-
-      assert msg =~ ".."
+      assert_raise ArgumentError, ~r/cannot contain '\.\.'/, fn ->
+        Proc.start("echo", ["test"], cgroup_path: "../../etc/evil")
+      end
     end
 
     test "rejects absolute cgroup path" do
-      assert {:error, {:invalid_cgroup_path, msg}} =
-               Proc.start("echo", ["test"], cgroup_path: "/sys/fs/cgroup/evil")
-
-      assert msg =~ "relative"
+      assert_raise ArgumentError, ~r/must be relative/, fn ->
+        Proc.start("echo", ["test"], cgroup_path: "/sys/fs/cgroup/evil")
+      end
     end
   end
 
@@ -179,6 +183,21 @@ defmodule NetRunner.LeakTest do
       attempts == 0 -> flunk("leaked #{now - baseline} processes")
       true -> Process.sleep(20) && settled_process_count(baseline, attempts - 1)
     end
+  end
+
+  # The baseline must not be sampled mid-teardown of the warm-up processes:
+  # a transiently high count would widen the effective leak margin. Two
+  # consecutive agreeing samples mean the count has stopped moving.
+  defp settled_fd_count do
+    eventually(
+      fn ->
+        first = count_open_fds()
+        second = count_open_fds()
+        assert first == second, "FD count still settling: #{first} -> #{second}"
+        first
+      end,
+      5_000
+    )
   end
 
   # Counts this BEAM's open FDs: /proc/self/fd on Linux, lsof -p on macOS

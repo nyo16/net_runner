@@ -43,7 +43,7 @@ defmodule NetRunner.Stream do
   def stream(cmd, args, opts) do
     opts = Keyword.validate!(opts, @stream_opts)
     input = Keyword.get(opts, :input, nil)
-    input_buffer = validate_input_buffer!(Keyword.get(opts, :input_buffer, 0))
+    input_buffer = InputWriter.validate_buffer!(Keyword.get(opts, :input_buffer, 0))
     # Pass the caller as :owner so the Process GenServer stops (and kills the OS
     # process) if nothing ever consumes the stream. build_stream/2 re-registers
     # the real consumer as owner once iteration starts.
@@ -60,13 +60,6 @@ defmodule NetRunner.Stream do
       {:error, _} = error ->
         error
     end
-  end
-
-  defp validate_input_buffer!(bytes) when is_integer(bytes) and bytes >= 0, do: bytes
-
-  defp validate_input_buffer!(other) do
-    raise ArgumentError,
-          ":input_buffer must be a non-negative integer (bytes), got: #{inspect(other)}"
   end
 
   @doc """

@@ -1,5 +1,9 @@
 defmodule NetRunner.Process.Stats do
-  @moduledoc false
+  @moduledoc """
+  Accumulated I/O and lifecycle statistics for one `NetRunner.Process`.
+
+  Returned by `NetRunner.Process.stats/1`.
+  """
 
   defstruct bytes_in: 0,
             bytes_out: 0,
@@ -10,6 +14,17 @@ defmodule NetRunner.Process.Stats do
             write_count: 0,
             exit_status: nil
 
+  @typedoc """
+  Per-process counters.
+
+    * `:bytes_in` — bytes written to the child's stdin
+    * `:bytes_out` — bytes read from the child's stdout
+    * `:bytes_err` — bytes read from the child's stderr (drained or explicit)
+    * `:started_at` — monotonic start time, milliseconds
+    * `:duration_ms` — set on exit: wall time from spawn to exit status
+    * `:read_count` / `:write_count` — number of `read(2)`/`write(2)` calls
+    * `:exit_status` — set on exit
+  """
   @type t :: %__MODULE__{
           bytes_in: non_neg_integer(),
           bytes_out: non_neg_integer(),

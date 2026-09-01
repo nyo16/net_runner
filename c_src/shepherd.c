@@ -88,6 +88,61 @@ static int set_cloexec(int fd) {
     return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
+/* Milliseconds on a monotonic clock, or -1 if the clock is unavailable. */
+static int64_t monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Bound on how long any single shepherd->BEAM frame may wait for socket
+ * buffer space before being dropped. */
+#define UDS_WRITE_TIMEOUT_MS 5000
+
+/*
+ * Write all of buf to the non-blocking UDS, polling POLLOUT for up to
+ * timeout_ms before giving up. Returns 0 on success, -1 on error/timeout.
+ *
+ * The UDS is deliberately non-blocking for writes: a BEAM that stops
+ * draining the socket must not park the shepherd in write(2) forever.
+ * The critical case is send_child_exited after the child was reaped — a
+ * shepherd wedged there never runs cgroup_cleanup(), leaking the cgroup
+ * and any processes still in it. On persistent EAGAIN we drop the frame
+ * instead: the peer is wedged or gone, it will observe the UDS close
+ * when we exit, and a lost frame is recoverable where a wedged shepherd
+ * is not.
+ */
+static int write_fully(int fd, const uint8_t *buf, size_t len,
+                       int timeout_ms) {
+    int64_t now = monotonic_ms();
+    int64_t deadline = (now < 0) ? -1 : now + timeout_ms;
+    size_t written = 0;
+
+    while (written < len) {
+        ssize_t n = write(fd, buf + written, len - written);
+        if (n > 0) {
+            written += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            int wait_ms = timeout_ms;
+            if (deadline >= 0) {
+                now = monotonic_ms();
+                if (now < 0 || now >= deadline) return -1;
+                wait_ms = (int)(deadline - now);
+            }
+            struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+            int pret = poll(&pfd, 1, wait_ms);
+            if (pret < 0 && errno != EINTR) return -1;
+            if (pret == 0) return -1; /* peer not draining: drop the frame */
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
 /*
  * Send file descriptors over UDS using SCM_RIGHTS.
  * Sends stdin_w, stdout_r, stderr_r to the BEAM.
@@ -120,7 +175,8 @@ static int send_fds(int uds_fd, int *fds, int nfds) {
     cmsg->cmsg_len = CMSG_LEN((size_t)nfds * sizeof(int));
     memcpy(CMSG_DATA(cmsg), fds, (size_t)nfds * sizeof(int));
 
-    /* Retry on EINTR; treat anything other than a full 1-byte send as error. */
+    /* Retry on EINTR; wait (bounded) for buffer space on EAGAIN — the UDS
+     * is non-blocking. Anything else, or a partial send, is an error. */
     for (;;) {
         ssize_t ret = sendmsg(uds_fd, &msg, 0);
         if (ret == 1) {
@@ -128,6 +184,16 @@ static int send_fds(int uds_fd, int *fds, int nfds) {
             return 0;
         }
         if (ret < 0 && errno == EINTR) continue;
+        if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd pfd = {.fd = uds_fd, .events = POLLOUT,
+                                 .revents = 0};
+            int pret = poll(&pfd, 1, UDS_WRITE_TIMEOUT_MS);
+            if (pret > 0 || (pret < 0 && errno == EINTR)) continue;
+            ERROR_LOG("sendmsg: no buffer space after %d ms",
+                      UDS_WRITE_TIMEOUT_MS);
+            free(cmsg_buf);
+            return -1;
+        }
         ERROR_LOG("sendmsg failed: ret=%zd errno=%s", ret, strerror(errno));
         free(cmsg_buf);
         return -1;
@@ -147,17 +213,7 @@ static int send_message(int uds_fd, uint8_t type, const void *payload,
         memcpy(buf + 1, payload, payload_len);
     }
 
-    ssize_t written = 0;
-    ssize_t total = (ssize_t)(1 + payload_len);
-    while (written < total) {
-        ssize_t n = write(uds_fd, buf + written, (size_t)(total - written));
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        written += n;
-    }
-    return 0;
+    return write_fully(uds_fd, buf, 1 + payload_len, UDS_WRITE_TIMEOUT_MS);
 }
 
 static int send_child_started(int uds_fd, pid_t pid) {
@@ -179,17 +235,7 @@ static int send_error(int uds_fd, const char *msg) {
     buf[2] = (uint8_t)(len & 0xFF);
     memcpy(buf + 3, msg, len);
 
-    ssize_t total = (ssize_t)(3 + len);
-    ssize_t written = 0;
-    while (written < total) {
-        ssize_t n = write(uds_fd, buf + written, (size_t)(total - written));
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        written += n;
-    }
-    return 0;
+    return write_fully(uds_fd, buf, 3 + len, UDS_WRITE_TIMEOUT_MS);
 }
 
 /* Configurable kill escalation timeout (set from CLI arg) */
@@ -201,6 +247,12 @@ static int pty_master_fd = -1;
 
 /* cgroup v2 support (Linux only) */
 static char cgroup_path[CGROUP_PATH_MAX] = {0};
+
+/* Human-readable reason for the most recent cgroup_setup() failure. The
+ * spawn paths send it to the BEAM as MSG_ERROR so the caller learns WHY
+ * isolation could not be established. Only ever written on Linux; the
+ * default covers the (unreachable) failure of the non-Linux stub. */
+static char cgroup_errmsg[256] = "cgroup setup failed";
 
 #ifdef __linux__
 /* Set only when this shepherd created the cgroup directory itself. A
@@ -222,27 +274,71 @@ static int cgroup_setup(pid_t child_pid) {
                      cgroup_path);
     if (n < 0 || (size_t)n >= sizeof(full_path)) {
         ERROR_LOG("cgroup path too long");
+        snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+                 "cgroup_setup: path too long");
         return -1;
     }
-    if (mkdir(full_path, 0755) == 0) {
+    /* 0700 — the cgroup directory has no reason to be group/world
+     * readable. A pre-existing directory is fatal: we cannot know who
+     * owns it, cgroup_cleanup() would refuse to tear it down
+     * (cgroup_owned stays 0), and silently degrading containment the
+     * caller explicitly requested is worse than failing the spawn. */
+    if (mkdir(full_path, 0700) == 0) {
         cgroup_owned = 1;
-    } else if (errno != EEXIST) {
-        ERROR_LOG("mkdir(%s) failed: %s", full_path, strerror(errno));
+    } else if (errno == EEXIST) {
+        ERROR_LOG("cgroup %s already exists; refusing to adopt it",
+                  full_path);
+        /* %.180s caps the interpolated path: cgroup_path may be up to 255
+         * bytes, and 14 + 180 + 44 + NUL must fit the 256-byte errmsg
+         * (gcc -Wformat-truncation under -Werror on glibc). */
+        snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+                 "cgroup_setup: %.180s already exists; teardown would not be owned",
+                 cgroup_path);
+        return -1;
+    } else {
+        int err = errno;
+        ERROR_LOG("mkdir(%s) failed: %s", full_path, strerror(err));
+        snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+                 "cgroup_setup: mkdir failed: %s", strerror(err));
         return -1;
     }
 
     n = snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs", full_path);
     if (n < 0 || (size_t)n >= sizeof(procs_path)) {
         ERROR_LOG("cgroup procs path too long");
+        snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+                 "cgroup_setup: procs path too long");
         return -1;
     }
     FILE *f = fopen(procs_path, "w");
     if (!f) {
-        ERROR_LOG("failed to open %s: %s", procs_path, strerror(errno));
+        int err = errno;
+        ERROR_LOG("failed to open %s: %s", procs_path, strerror(err));
+        snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+                 "cgroup_setup: open cgroup.procs failed: %s", strerror(err));
         return -1;
     }
-    fprintf(f, "%d\n", child_pid);
-    fclose(f);
+    if (fprintf(f, "%d\n", child_pid) < 0) {
+        int err = errno;
+        ERROR_LOG("write to %s failed: %s", procs_path, strerror(err));
+        fclose(f);
+        snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+                 "cgroup_setup: write to cgroup.procs failed: %s",
+                 strerror(err));
+        return -1;
+    }
+    /* The pid migration happens at write/flush time behind stdio
+     * buffering, so the real failures (EPERM without delegation, EBUSY on
+     * an inner node, ENOENT for a vanished cgroup) surface at fclose. An
+     * unchecked fclose here made isolation fail open. */
+    if (fclose(f) != 0) {
+        int err = errno;
+        ERROR_LOG("flush to %s failed: %s", procs_path, strerror(err));
+        snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+                 "cgroup_setup: write to cgroup.procs failed: %s",
+                 strerror(err));
+        return -1;
+    }
     return 0;
 }
 
@@ -280,13 +376,6 @@ static int cgroup_setup(pid_t child_pid) {
 }
 static void cgroup_cleanup(void) {}
 #endif
-
-/* Milliseconds on a monotonic clock, or -1 if the clock is unavailable. */
-static int64_t monotonic_ms(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
 
 /*
  * Wait up to timeout_ms for child_pid to be reaped. Returns 1 if it was reaped
@@ -557,11 +646,12 @@ static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
 }
 
 /*
- * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token <hex>] <cmd> [args...]
+ * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] <cmd> [args...]
  *
  *   uds_path:       Path to the UDS listener socket created by the BEAM
  *   --kill-timeout:  SIGTERM->SIGKILL escalation timeout in ms (default 5000)
- *   --token:        32-char hex handshake token, sent verbatim as the first
+ *   --token-fd:     read the 32-char hex handshake token from fd 3 (the
+ *                   BEAM port channel) and send it verbatim as the first
  *                   frame after connect so the BEAM can authenticate us
  *   cmd:            Command to execute
  *   args:           Arguments for the command
@@ -569,7 +659,7 @@ static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         fprintf(stderr,
-                "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token <hex>] <cmd> [args...]\n");
+                "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] <cmd> [args...]\n");
         return 1;
     }
 
@@ -711,21 +801,24 @@ int main(int argc, char *argv[]) {
 
     set_cloexec(uds_fd);
 
+    /* Writes to the UDS are non-blocking + bounded (see write_fully). The
+     * event-loop reads already tolerate EAGAIN. */
+    if (set_nonblocking(uds_fd) != 0) {
+        perror("fcntl(uds, O_NONBLOCK)");
+        close(uds_fd);
+        return 1;
+    }
+
     /* Authenticate: the BEAM handed us a per-spawn random token over fd 3
      * and accepts FDs only from the peer that echoes it back as the very
      * first frame. Without this, any same-uid process that wins the accept
      * race would receive the child's pipe FDs via SCM_RIGHTS. */
     if (token_from_fd) {
-        size_t sent = 0;
-        while (sent < TOKEN_HEX_LEN) {
-            ssize_t n = write(uds_fd, token + sent, TOKEN_HEX_LEN - sent);
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                perror("token write");
-                close(uds_fd);
-                return 1;
-            }
-            sent += (size_t)n;
+        if (write_fully(uds_fd, (const uint8_t *)token, TOKEN_HEX_LEN,
+                        UDS_WRITE_TIMEOUT_MS) != 0) {
+            fprintf(stderr, "error: token write failed\n");
+            close(uds_fd);
+            return 1;
         }
     }
 
@@ -737,6 +830,18 @@ int main(int argc, char *argv[]) {
         int master_fd, slave_fd;
         if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) != 0) {
             send_error(uds_fd, "openpty failed");
+            close(uds_fd);
+            return 1;
+        }
+
+        /* cgroup/exec ordering gate (used by the shepherd side below).
+         * Created only when a cgroup was requested, so non-cgroup spawns
+         * are byte-for-byte unchanged. */
+        int sync_pipe[2] = {-1, -1};
+        if (cgroup_path[0] != '\0' && pipe(sync_pipe) != 0) {
+            send_error(uds_fd, "failed to create cgroup sync pipe");
+            close(master_fd);
+            close(slave_fd);
             close(uds_fd);
             return 1;
         }
@@ -756,6 +861,26 @@ int main(int argc, char *argv[]) {
             close(signal_pipe[0]);
             close(signal_pipe[1]);
             close(master_fd);
+
+            /* Wait for the shepherd to place us in the requested cgroup
+             * before doing anything that can create more pids (execvp,
+             * and everything the exec'd program forks). cgroup.procs
+             * migration moves only the written pid, so a grandchild
+             * forked before migration would escape the cgroup's limits
+             * and its cgroup.kill teardown. Only async-signal-safe calls
+             * here (read/write/close/_exit). EOF or a non-'G' byte means
+             * the shepherd could not establish isolation: die without
+             * exec. */
+            if (sync_pipe[0] >= 0) {
+                close(sync_pipe[1]);
+                char go = 0;
+                ssize_t r;
+                do {
+                    r = read(sync_pipe[0], &go, 1);
+                } while (r < 0 && errno == EINTR);
+                close(sync_pipe[0]);
+                if (r != 1 || go != 'G') _exit(127);
+            }
 
             /* Create new session (required before acquiring controlling tty) */
             if (setsid() == (pid_t)-1) child_fail("setsid", NULL);
@@ -782,15 +907,40 @@ int main(int argc, char *argv[]) {
         pty_master_fd = master_fd;
         set_cloexec(master_fd);
 
-        /* Move child to cgroup (Linux only, no-op elsewhere). If the user
-         * requested a cgroup path and setup failed, isolation is not
-         * available — treat as fatal. */
+        /* Move child to cgroup (Linux only, no-op elsewhere). The child
+         * is parked on the sync pipe until the outcome is known, so
+         * nothing can exec — or fork grandchildren — outside the cgroup.
+         * If the user requested a cgroup path and setup failed, isolation
+         * is not available — treat as fatal. */
         if (cgroup_setup(child_pid) != 0) {
-            send_error(uds_fd, "cgroup setup failed");
+            if (sync_pipe[0] >= 0) {
+                /* EOF on the gate: the child _exit(127)s without exec. */
+                close(sync_pipe[0]);
+                close(sync_pipe[1]);
+            }
+            send_error(uds_fd, cgroup_errmsg);
             kill_child(child_pid);
             close(master_fd);
             close(uds_fd);
             return 1;
+        }
+        if (sync_pipe[0] >= 0) {
+            close(sync_pipe[0]);
+            char go = 'G';
+            ssize_t w;
+            do {
+                w = write(sync_pipe[1], &go, 1);
+            } while (w < 0 && errno == EINTR);
+            close(sync_pipe[1]);
+            if (w != 1) {
+                /* The child cannot exec without the go byte; treat as a
+                 * failed spawn rather than leave it parked forever. */
+                send_error(uds_fd, "cgroup sync pipe write failed");
+                kill_child(child_pid);
+                close(master_fd);
+                close(uds_fd);
+                return 1;
+            }
         }
 
         /* Send single master FD to BEAM (used for both read and write) */
@@ -870,6 +1020,17 @@ int main(int argc, char *argv[]) {
         (void)fcntl(stdin_pipe[1], F_SETPIPE_SZ, 1 << 20);
 #endif
 
+        /* cgroup/exec ordering gate — see the PTY path for rationale. */
+        int sync_pipe[2] = {-1, -1};
+        if (cgroup_path[0] != '\0' && pipe(sync_pipe) != 0) {
+            send_error(uds_fd, "failed to create cgroup sync pipe");
+            close(stdin_pipe[0]);  close(stdin_pipe[1]);
+            close(stdout_pipe[0]); close(stdout_pipe[1]);
+            close(stderr_pipe[0]); close(stderr_pipe[1]);
+            close(uds_fd);
+            return 1;
+        }
+
         child_pid = fork();
         if (child_pid < 0) {
             send_error(uds_fd, "fork failed");
@@ -888,6 +1049,19 @@ int main(int argc, char *argv[]) {
             close(stdin_pipe[1]);
             close(stdout_pipe[0]);
             close(stderr_pipe[0]);
+
+            /* Gate exec on cgroup placement — see the PTY child above.
+             * Only async-signal-safe calls (read/write/close/_exit). */
+            if (sync_pipe[0] >= 0) {
+                close(sync_pipe[1]);
+                char go = 0;
+                ssize_t r;
+                do {
+                    r = read(sync_pipe[0], &go, 1);
+                } while (r < 0 && errno == EINTR);
+                close(sync_pipe[0]);
+                if (r != 1 || go != 'G') _exit(127);
+            }
 
             if (dup2(stdin_pipe[0],  STDIN_FILENO)  != STDIN_FILENO ||
                 dup2(stdout_pipe[1], STDOUT_FILENO) != STDOUT_FILENO ||
@@ -913,17 +1087,44 @@ int main(int argc, char *argv[]) {
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
 
-        /* Move child to cgroup (Linux only, no-op elsewhere). If the user
-         * requested a cgroup path and setup failed, isolation is not
-         * available — treat as fatal. */
+        /* Move child to cgroup (Linux only, no-op elsewhere). The child
+         * is parked on the sync pipe until the outcome is known, so
+         * nothing can exec — or fork grandchildren — outside the cgroup.
+         * If the user requested a cgroup path and setup failed, isolation
+         * is not available — treat as fatal. */
         if (cgroup_setup(child_pid) != 0) {
-            send_error(uds_fd, "cgroup setup failed");
+            if (sync_pipe[0] >= 0) {
+                /* EOF on the gate: the child _exit(127)s without exec. */
+                close(sync_pipe[0]);
+                close(sync_pipe[1]);
+            }
+            send_error(uds_fd, cgroup_errmsg);
             kill_child(child_pid);
             close(stdin_pipe[1]);
             close(stdout_pipe[0]);
             close(stderr_pipe[0]);
             close(uds_fd);
             return 1;
+        }
+        if (sync_pipe[0] >= 0) {
+            close(sync_pipe[0]);
+            char go = 'G';
+            ssize_t w;
+            do {
+                w = write(sync_pipe[1], &go, 1);
+            } while (w < 0 && errno == EINTR);
+            close(sync_pipe[1]);
+            if (w != 1) {
+                /* The child cannot exec without the go byte; treat as a
+                 * failed spawn rather than leave it parked forever. */
+                send_error(uds_fd, "cgroup sync pipe write failed");
+                kill_child(child_pid);
+                close(stdin_pipe[1]);
+                close(stdout_pipe[0]);
+                close(stderr_pipe[0]);
+                close(uds_fd);
+                return 1;
+            }
         }
 
         int fds_to_send[3] = {stdin_pipe[1], stdout_pipe[0], stderr_pipe[0]};

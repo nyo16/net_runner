@@ -1,5 +1,11 @@
-defmodule NetRunner.Process.Nif do
+defmodule NetRunner.Nif do
   @moduledoc false
+
+  # Library-wide native substrate (signals, liveness probes, fd ops) — not a
+  # public API. These functions take unscoped raw descriptors and OS pids
+  # with no ownership check; misuse silently corrupts unrelated VM state
+  # (e.g. closing a live BEAM fd). Only NetRunner internals may call them.
+
   @on_load :load_nifs
 
   def load_nifs do

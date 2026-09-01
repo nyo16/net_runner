@@ -35,9 +35,10 @@ sequenceDiagram
     participant C as Child
 
     B->>B: Create UDS listener + spawn token
-    B->>S: Port.open(shepherd --token hex)
+    B->>S: Port.open(shepherd --token-fd)
+    B->>S: token via fd 3 (private port channel)
     S->>B: Connect to UDS
-    S->>B: token (32 bytes, first frame)
+    S->>B: token echoed back (32 bytes, first UDS frame)
     B->>B: Verify token (+ peer uid where supported)
     S->>S: fork()
     S->>C: execvp(command)
@@ -54,18 +55,28 @@ sequenceDiagram
     S->>S: exit(0)
 ```
 
+The token never appears on the command line: the shepherd is spawned with
+`--token-fd` and reads the 32-byte token from fd 3 — the `:nouse_stdio` port
+channel, private to the BEAM and the shepherd (`c_src/shepherd.c`, the
+`--token-fd` branch; `open_shepherd/5` + `send_token/2` in
+`lib/net_runner/process/exec.ex`). An argv token (`--token <hex>`) would be
+world-readable via `/proc/<pid>/cmdline` on Linux and same-uid readable via
+`KERN_PROCARGS2` on macOS — visible to exactly the same-uid attacker the
+token exists to stop. The shepherd echoes the token as the very first UDS
+frame, and the BEAM verifies it before accepting any FDs.
+
 ## Zombie Prevention (3 Layers)
 
 ```mermaid
 graph TD
     subgraph "Zombie Prevention"
         L1[Layer 1: Shepherd<br/>Detects BEAM death via POLLHUP<br/>SIGTERM → SIGKILL child]
-        L2[Layer 2: Watcher GenServer<br/>Detects Process GenServer death<br/>SIGTERM → SIGKILL via NIF]
-        L3[Layer 3: NIF Resource Destructor<br/>Closes FDs on GC<br/>Child sees broken pipe]
+        L2[Layer 2: Watcher GenServer<br/>Detects Process GenServer death<br/>single SIGTERM probe via NIF — no escalation]
+        L3[Layer 3: NIF owner monitor<br/>down callback closes FDs<br/>Child sees EOF/SIGPIPE]
     end
     L1 -->|Covers| BEAM_CRASH[BEAM SIGKILL/crash]
     L2 -->|Covers| GS_CRASH[GenServer crash]
-    L3 -->|Covers| LEAK[Resource leak/GC]
+    L3 -->|Covers| LEAK[Owner killed / FD leak]
 ```
 
 **Why all three layers?**
@@ -73,8 +84,23 @@ graph TD
 | Layer | Trigger | Mechanism | Covers |
 |-------|---------|-----------|--------|
 | Shepherd | BEAM process dies | UDS POLLHUP → kill child group | BEAM SIGKILL, OOM kill, segfault |
-| Watcher | GenServer crashes | Process.monitor → NIF kill | Elixir-level crashes, unhandled errors |
-| NIF destructor | FD resource GC'd | close(fd) → child SIGPIPE/EOF | Resource leaks, process table cleanup |
+| Watcher | GenServer crashes | Process.monitor → one SIGTERM probe via NIF | Elixir-level crashes, unhandled errors |
+| NIF owner monitor | Owner process dies | `down` callback + destructor close(fd) → child SIGPIPE/EOF | Owner killed without cleanup, FD leaks |
+
+The Watcher deliberately does **not** escalate SIGTERM → SIGKILL
+(`lib/net_runner/watcher.ex`): by the time a timed escalation would fire, the
+shepherd has usually seen POLLHUP, run its own SIGTERM→SIGKILL ladder and
+*reaped* the child — a later `alive?` → `kill` from a process with no reap
+authority is a check-then-act race against OS pid reuse and can SIGKILL an
+innocent process. Escalation is the shepherd's job (Layer 1); the Watcher's
+single probe only covers a shepherd that died before its ladder ran, where
+the orphaned child's pid stays occupied (unreaped) and the probe is safe.
+
+Layer 3 is likewise not garbage collection: a NIF resource with a live
+`enif_select` registration is never destructed, so the leak safety net is the
+owner-process monitor — `io_resource_down` in `c_src/net_runner_nif.c` closes
+the fd when the owning process dies without cleaning up; the destructor only
+covers resources that were never selected on.
 
 ## I/O Architecture
 

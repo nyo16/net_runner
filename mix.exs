@@ -39,13 +39,13 @@ defmodule NetRunner.MixProject do
   defp deps do
     [
       # Production dependencies
-      {:elixir_make, "~> 0.9", runtime: false},
+      {:elixir_make, "~> 0.10.0", runtime: false},
 
       # Development dependencies
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:stream_data, "~> 1.1", only: [:dev, :test]}
+      {:stream_data, "~> 1.1", only: :test}
     ]
   end
 

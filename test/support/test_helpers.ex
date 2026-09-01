@@ -11,12 +11,20 @@ defmodule NetRunner.TestHelpers do
   @doc """
   Polls `fun` until it returns a truthy value or passes its assertions,
   re-raising the last failure once `timeout_ms` (default 2_000) expires.
+
+  Besides `ExUnit.AssertionError`, transient exits are retried too: a polled
+  `GenServer.call` racing a Process mid-teardown exits with `:noproc` (or
+  `:timeout` while the server is briefly wedged) — exactly the in-between
+  states this helper exists to ride out. Any other exit propagates.
   """
   def eventually(fun, timeout_ms \\ 2_000) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     poll(fun, deadline)
   end
 
+  # The on_expiry closures passed to retry_or_flunk/3 deliberately never
+  # return (flunk/reraise/exit); dialyzer flags the closure creation site.
+  @dialyzer {:nowarn_function, poll: 2}
   defp poll(fun, deadline) do
     result = fun.()
 
@@ -30,7 +38,20 @@ defmodule NetRunner.TestHelpers do
   rescue
     e in [ExUnit.AssertionError] ->
       retry_or_flunk(fun, deadline, fn -> reraise e, __STACKTRACE__ end)
+  catch
+    :exit, reason ->
+      if transient_exit?(reason) do
+        retry_or_flunk(fun, deadline, fn -> exit(reason) end)
+      else
+        exit(reason)
+      end
   end
+
+  defp transient_exit?(:noproc), do: true
+  defp transient_exit?(:timeout), do: true
+  defp transient_exit?({:noproc, _}), do: true
+  defp transient_exit?({:timeout, _}), do: true
+  defp transient_exit?(_), do: false
 
   defp retry_or_flunk(fun, deadline, on_expiry) do
     if System.monotonic_time(:millisecond) < deadline do

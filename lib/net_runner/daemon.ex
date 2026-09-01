@@ -103,9 +103,17 @@ defmodule NetRunner.Daemon do
         stderr_drain_ref = start_drain(proc, :stderr, on_output)
         {forwarder, forwarder_ref} = start_forwarder(proc)
 
+        # The OS pid is immutable after spawn, so fetch it exactly once and
+        # answer os_pid/1 from Daemon state. Routing every call through a
+        # second synchronous hop into the Proc GenServer added avoidable
+        # tail latency and turned a wedged Proc into a Daemon :timeout crash
+        # — the exact coupling the write forwarder exists to avoid.
+        os_pid = Proc.os_pid(proc)
+
         {:ok,
          %{
            proc: proc,
+           os_pid: os_pid,
            on_output: on_output,
            drain_ref: drain_ref,
            stderr_drain_ref: stderr_drain_ref,
@@ -120,7 +128,7 @@ defmodule NetRunner.Daemon do
 
   @impl true
   def handle_call(:os_pid, _from, state) do
-    {:reply, Proc.os_pid(state.proc), state}
+    {:reply, state.os_pid, state}
   end
 
   def handle_call(:alive?, _from, state) do
@@ -274,10 +282,10 @@ defmodule NetRunner.Daemon do
   end
 
   defp await_exit_status(proc) do
-    case Proc.await_exit(proc) do
-      {:ok, status} -> {:exit_status, status}
-      other -> other
-    end
+    # await_exit only ever returns {:ok, status}; a timeout or dead server
+    # surfaces as an :exit from GenServer.call, caught below.
+    {:ok, status} = Proc.await_exit(proc)
+    {:exit_status, status}
   catch
     :exit, _ -> :unknown
   end

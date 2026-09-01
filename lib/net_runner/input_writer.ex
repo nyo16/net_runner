@@ -103,6 +103,21 @@ defmodule NetRunner.InputWriter do
   def prepare(list) when is_list(list), do: list_batches(list, @list_coalesce_bytes)
   def prepare(other), do: other
 
+  @doc """
+  Validates an `:input_buffer` option value, raising `ArgumentError` on a
+  malformed one. Returns the value.
+
+  Shared by both entry points (`NetRunner.run/2` and `NetRunner.Stream`) so
+  the accepted shapes and the error message cannot drift apart.
+  """
+  @spec validate_buffer!(term()) :: non_neg_integer()
+  def validate_buffer!(bytes) when is_integer(bytes) and bytes >= 0, do: bytes
+
+  def validate_buffer!(other) do
+    raise ArgumentError,
+          ":input_buffer must be a non-negative integer (bytes), got: #{inspect(other)}"
+  end
+
   # Chunks the enumerable's iodata elements into batches of up to `limit`
   # bytes (soft limit: the element that crosses it is included, so a batch
   # can reach `limit - 1 + element_size`; elements are never split) and

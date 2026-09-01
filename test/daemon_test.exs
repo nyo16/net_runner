@@ -89,20 +89,54 @@ defmodule NetRunner.DaemonTest do
     end
 
     test "a crashing on_output callback does not bring the Daemon down" do
-      # The drain task runs under Task.Supervisor.async_nolink, so an
-      # uncaught error in the callback must not take the Daemon with it.
+      # The callback runs inside the Daemon's drain task; safe_handle_output
+      # must contain the raise. Synchronize on the callback actually having
+      # fired — a fixed sleep could elapse before the drain even delivered
+      # the chunk, leaving the daemon trivially alive and the crash path
+      # never exercised (vacuous pass on loaded CI).
+      test_pid = self()
+
       {:ok, daemon} =
-        Daemon.start_link(cmd: "cat", args: [], on_output: fn _ -> raise "boom" end)
+        Daemon.start_link(
+          cmd: "cat",
+          args: [],
+          on_output: fn _ ->
+            send(test_pid, :callback_ran)
+            raise "boom"
+          end
+        )
 
-      assert :ok = Daemon.write(daemon, "trigger\n")
+      capture_log(fn ->
+        assert :ok = Daemon.write(daemon, "one\n")
+        assert_receive :callback_ran, 2_000
 
-      # Give the drain task time to read the chunk and raise.
-      Process.sleep(200)
+        # A second chunk proves the drain task survived the first raise —
+        # a dead stdout drain would disable draining AND stop-on-child-exit.
+        assert :ok = Daemon.write(daemon, "two\n")
+        assert_receive :callback_ran, 2_000
 
-      assert Process.alive?(daemon)
-      assert Daemon.alive?(daemon)
+        assert Process.alive?(daemon)
+        assert Daemon.alive?(daemon)
 
-      GenServer.stop(daemon)
+        GenServer.stop(daemon)
+      end)
+    end
+
+    test "a dead stdin forwarder stops the Daemon instead of stranding writers" do
+      # daemon.ex handles {:DOWN, forwarder_ref, ...}: every future write
+      # would be a fire-and-forget send to a dead pid whose caller hangs
+      # forever on an :infinity call, so the Daemon must stop with
+      # :forwarder_down (and log why) rather than linger looking healthy.
+      {:ok, daemon} = Daemon.start_link(cmd: "cat", args: [])
+      %{forwarder: forwarder} = :sys.get_state(daemon)
+
+      log =
+        capture_log(fn ->
+          Process.exit(forwarder, :kill)
+          assert_receive {:EXIT, ^daemon, {:shutdown, :forwarder_down}}, 5_000
+        end)
+
+      assert log =~ "stdin forwarder died"
     end
 
     test "daemon cleans up on crash" do

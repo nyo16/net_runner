@@ -4,8 +4,8 @@ defmodule NetRunner.TeardownTest do
   import NetRunner.TestHelpers
 
   alias NetRunner.Daemon
+  alias NetRunner.Nif
   alias NetRunner.Process, as: Proc
-  alias NetRunner.Process.Nif
 
   describe "Daemon drain loop" do
     # `rescue`/`catch` clauses on a `def` wrap the whole body in a try, which
@@ -16,8 +16,7 @@ defmodule NetRunner.TeardownTest do
     # how much it has drained.
     test "stack stays bounded no matter how much output is drained" do
       # Unbounded producer so the drain task is guaranteed to still be running
-      # when we sample it. At current throughput 600 ms is thousands of chunks,
-      # each of which used to retain a stack frame.
+      # when we sample it.
       {:ok, daemon} =
         Daemon.start_link(
           cmd: "sh",
@@ -25,12 +24,21 @@ defmodule NetRunner.TeardownTest do
           on_output: :discard
         )
 
-      Process.sleep(600)
+      # Poll until the stdout drain has moved a few MB — thousands of chunks,
+      # each of which used to retain a stack frame — instead of guessing a
+      # settle sleep.
+      proc = :sys.get_state(daemon).proc
+      eventually(fn -> assert Proc.stats(proc).bytes_out > 5_000_000 end, 10_000)
+
+      # Sample only the tasks THIS daemon owns (its monitors: two drain tasks
+      # and the stdin forwarder). Enumerating all of the globally shared
+      # NetRunner.TaskSupervisor under async: true asserted on sibling tests'
+      # tasks — and `stacks != []` could pass on a sibling's task even with
+      # this daemon's drain dead.
+      {:monitors, monitors} = Process.info(daemon, :monitors)
 
       stacks =
-        NetRunner.TaskSupervisor
-        |> Task.Supervisor.children()
-        |> Enum.flat_map(fn pid ->
+        Enum.flat_map(monitors, fn {:process, pid} ->
           case Process.info(pid, :stack_size) do
             {:stack_size, size} -> [size]
             nil -> []

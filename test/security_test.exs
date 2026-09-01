@@ -44,10 +44,21 @@ defmodule NetRunner.SecurityTest do
     end
 
     test "rejects malformed env maps" do
-      assert {:error, {:invalid_env, _}} = Proc.start("echo", ["x"], env: %{"A=B" => "x"})
-      assert {:error, {:invalid_env, _}} = Proc.start("echo", ["x"], env: %{"" => "x"})
-      assert {:error, {:invalid_env, _}} = Proc.start("echo", ["x"], env: %{"OK" => "a\0b"})
-      assert {:error, {:invalid_env, _}} = Proc.start("echo", ["x"], env: [{"OK", "x"}])
+      assert_raise ArgumentError, ~r/:env/, fn ->
+        Proc.start("echo", ["x"], env: %{"A=B" => "x"})
+      end
+
+      assert_raise ArgumentError, ~r/:env/, fn ->
+        Proc.start("echo", ["x"], env: %{"" => "x"})
+      end
+
+      assert_raise ArgumentError, ~r/:env/, fn ->
+        Proc.start("echo", ["x"], env: %{"OK" => "a\0b"})
+      end
+
+      assert_raise ArgumentError, ~r/:env/, fn ->
+        Proc.start("echo", ["x"], env: [{"OK", "x"}])
+      end
     end
   end
 
@@ -68,10 +79,9 @@ defmodule NetRunner.SecurityTest do
 
   describe ":stderr_tail_bytes cap (SEC-11)" do
     test "rejects a tail above 1 MiB" do
-      assert {:error, {:invalid_stderr_tail_bytes, msg}} =
-               Proc.start("echo", ["x"], stderr_tail_bytes: 1_048_577)
-
-      assert msg =~ "1048576"
+      assert_raise ArgumentError, ~r/1048576/, fn ->
+        Proc.start("echo", ["x"], stderr_tail_bytes: 1_048_577)
+      end
 
       # The maximum itself is accepted.
       {:ok, pid} = Proc.start("echo", ["x"], stderr_tail_bytes: 1_048_576)

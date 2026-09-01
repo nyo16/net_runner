@@ -7,11 +7,11 @@ defmodule NetRunner.CgroupTest do
     @tag :linux_only
     test "cgroup_path option is plumbed through to the shepherd" do
       # On Linux, spawning with a cgroup_path requires write access under
-      # /sys/fs/cgroup/. In a privileged environment the child is moved into
-      # the cgroup and runs to completion; in CI (no privileges) the shepherd
-      # rejects the setup and returns an error — which proves the option was
-      # actually seen and validated by the C side. Either outcome confirms
-      # the plumbing.
+      # /sys/fs/cgroup/. In a privileged environment (CI delegates
+      # /sys/fs/cgroup/net_runner) the child is moved into the cgroup and runs
+      # to completion; unprivileged, the shepherd fails the spawn closed with
+      # its MSG_ERROR diagnostic — which still proves the option was seen and
+      # acted on by the C side.
       path = "net_runner/test_#{:rand.uniform(1_000_000)}"
 
       case Proc.start("echo", ["hello"], cgroup_path: path) do
@@ -21,20 +21,24 @@ defmodule NetRunner.CgroupTest do
           assert data =~ "hello"
           assert {:ok, 0} = Proc.await_exit(pid)
 
-        {:error, _reason} ->
-          # Unprivileged run — the shepherd refused to proceed without
-          # the requested isolation. That is the correct behaviour when
-          # a user explicitly asks for a cgroup they cannot use.
-          :ok
+        {:error, reason} ->
+          # Fail-closed contract: a cgroup the caller asked for but cannot
+          # have must fail the spawn with the shepherd's diagnostic, never
+          # degrade silently. Visible marker so a CI leg where the positive
+          # path silently stopped executing can be spotted in the log.
+          assert match?({:shepherd_error, _}, reason),
+                 "expected a shepherd MSG_ERROR, got: #{inspect(reason)}"
+
+          IO.puts("[degraded] cgroup plumbing test ran fail-closed path: #{inspect(reason)}")
       end
     end
 
     @tag :linux_only
-    test "a pre-existing cgroup directory survives teardown (ownership guard)" do
-      # SEC-1: the shepherd must only cgroup.kill/rmdir a cgroup directory it
-      # created itself. Pre-create the directory; if this environment can
-      # write /sys/fs/cgroup at all, spawn through it and assert the
-      # directory is still there after the child is reaped.
+    test "a pre-existing cgroup leaf dir fails the spawn closed and survives (ownership guard)" do
+      # SEC-1: the shepherd only cgroup.kill/rmdir a directory it created
+      # itself, so a pre-existing leaf is fatal — adopting it would mean a
+      # teardown it does not own, and silently degrading containment the
+      # caller explicitly requested is worse than failing the spawn.
       path = "net_runner/preexisting_#{:rand.uniform(1_000_000)}"
       full = "/sys/fs/cgroup/#{path}"
 
@@ -42,23 +46,18 @@ defmodule NetRunner.CgroupTest do
         :ok ->
           on_exit(fn -> File.rmdir(full) end)
 
-          case Proc.start("echo", ["hello"], cgroup_path: path) do
-            {:ok, pid} ->
-              assert {:ok, 0} = Proc.await_exit(pid)
-              GenServer.stop(pid)
-              # Give the shepherd time to run its (now no-op) cleanup.
-              Process.sleep(300)
-              assert File.dir?(full), "shepherd removed a cgroup dir it did not create"
+          # mkdir(2) reports EEXIST regardless of privileges once the leaf is
+          # there, so with the dir created above this branch asserts hard.
+          assert {:error, {:shepherd_error, msg}} =
+                   Proc.start("echo", ["hello"], cgroup_path: path)
 
-            {:error, _} ->
-              # cgroup.procs not writable in this environment — plumbing is
-              # covered by the test above.
-              :ok
-          end
+          assert msg =~ "already exists"
+          assert File.dir?(full), "shepherd removed a cgroup dir it did not create"
 
-        {:error, _} ->
-          # No cgroup v2 write access at all; nothing to assert here.
-          :ok
+        {:error, reason} ->
+          # No cgroup v2 write access at all in this environment; the
+          # validation plumbing is covered by the test above.
+          IO.puts("[degraded] cgroup fail-closed test skipped: mkdir #{full}: #{inspect(reason)}")
       end
     end
 
@@ -70,21 +69,23 @@ defmodule NetRunner.CgroupTest do
     end
 
     test "rejects invalid cgroup paths (traversal / absolute)" do
-      assert {:error, {:invalid_cgroup_path, _}} =
-               Proc.start("echo", ["x"], cgroup_path: "/absolute/nope")
+      assert_raise ArgumentError, ~r/must be relative/, fn ->
+        Proc.start("echo", ["x"], cgroup_path: "/absolute/nope")
+      end
 
-      assert {:error, {:invalid_cgroup_path, _}} =
-               Proc.start("echo", ["x"], cgroup_path: "net_runner/some/../evil")
+      assert_raise ArgumentError, ~r/cannot contain '\.\.'/, fn ->
+        Proc.start("echo", ["x"], cgroup_path: "net_runner/some/../evil")
+      end
     end
 
     test "rejects cgroup paths outside the net_runner/ prefix" do
-      assert {:error, {:invalid_cgroup_path, msg}} =
-               Proc.start("echo", ["x"], cgroup_path: "system.slice/evil")
+      assert_raise ArgumentError, ~r/net_runner\//, fn ->
+        Proc.start("echo", ["x"], cgroup_path: "system.slice/evil")
+      end
 
-      assert msg =~ "net_runner/"
-
-      assert {:error, {:invalid_cgroup_path, _}} =
-               Proc.start("echo", ["x"], cgroup_path: "net_runner/")
+      assert_raise ArgumentError, ~r/net_runner\//, fn ->
+        Proc.start("echo", ["x"], cgroup_path: "net_runner/")
+      end
     end
 
     test "rejects over-length cgroup paths instead of truncating" do
@@ -92,10 +93,9 @@ defmodule NetRunner.CgroupTest do
       # different cgroup than the one that was validated.
       long = "net_runner/" <> String.duplicate("a", 300)
 
-      assert {:error, {:invalid_cgroup_path, msg}} =
-               Proc.start("echo", ["x"], cgroup_path: long)
-
-      assert msg =~ "256"
+      assert_raise ArgumentError, ~r/256/, fn ->
+        Proc.start("echo", ["x"], cgroup_path: long)
+      end
     end
   end
 end

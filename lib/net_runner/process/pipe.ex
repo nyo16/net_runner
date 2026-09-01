@@ -1,7 +1,7 @@
 defmodule NetRunner.Process.Pipe do
   @moduledoc false
 
-  alias NetRunner.Process.Nif
+  alias NetRunner.Nif
 
   defstruct [:resource]
 

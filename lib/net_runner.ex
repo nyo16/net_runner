@@ -34,8 +34,12 @@ defmodule NetRunner do
   With `stderr: :capture` the shape becomes `{output, exit_status, stderr}`,
   where `stderr` is the retained stderr tail.
 
-  Unknown options raise `ArgumentError` (`Keyword.validate!/2`) instead of
-  being silently ignored.
+  Malformed options are programmer errors and raise `ArgumentError` — unknown
+  keys (`Keyword.validate!/2`) as well as invalid values (`:output`,
+  `:input_buffer`, `:stderr`, `:stderr_tail_bytes`, `:cgroup_path`, `:env`).
+  Runtime spawn failures (an invalid command, shepherd errors) return
+  `{:error, reason}` instead. This convention holds at every NetRunner entry
+  point.
 
   ## Options
 
@@ -135,7 +139,7 @@ defmodule NetRunner do
     # Lists coalesce here, in the caller, before the input is captured by any
     # task closure (see InputWriter.prepare/1).
     input = InputWriter.prepare(Keyword.get(opts, :input, nil))
-    input_buffer = validate_input_buffer!(Keyword.get(opts, :input_buffer, 0))
+    input_buffer = InputWriter.validate_buffer!(Keyword.get(opts, :input_buffer, 0))
     timeout = Keyword.get(opts, :timeout, nil)
     max_output_size = Keyword.get(opts, :max_output_size, nil)
     output = validate_output!(Keyword.get(opts, :output, :binary))
@@ -177,13 +181,6 @@ defmodule NetRunner do
       {:error, _reason} = error ->
         error
     end
-  end
-
-  defp validate_input_buffer!(bytes) when is_integer(bytes) and bytes >= 0, do: bytes
-
-  defp validate_input_buffer!(other) do
-    raise ArgumentError,
-          ":input_buffer must be a non-negative integer (bytes), got: #{inspect(other)}"
   end
 
   defp validate_output!(mode) when mode in [:binary, :iodata], do: mode
@@ -278,7 +275,9 @@ defmodule NetRunner do
   end
 
   def stream!([], _opts) do
-    raise NetRunner.Error, reason: {:invalid_cmd, "empty command"}
+    # Wrapped in :spawn_failed like every other spawn-stage failure raised
+    # by the bang variants, so callers branching on e.reason see one shape.
+    raise NetRunner.Error, reason: {:spawn_failed, {:invalid_cmd, "empty command"}}
   end
 
   def stream!([cmd | args], opts) do
