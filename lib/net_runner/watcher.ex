@@ -3,20 +3,25 @@ defmodule NetRunner.Watcher do
 
   use GenServer
 
-  alias NetRunner.Process.Nif
+  alias NetRunner.Nif
   alias NetRunner.Signal
 
-  def start_link(genserver_pid, os_pid) do
-    GenServer.start_link(__MODULE__, {genserver_pid, os_pid})
+  def start_link(genserver_pid, os_pid, shepherd_port) do
+    GenServer.start_link(__MODULE__, {genserver_pid, os_pid, shepherd_port})
   end
 
   @doc """
   Starts a watcher under the WatcherSupervisor for the given process.
+
+  `shepherd_port` lets the probe stand down while the shepherd is alive:
+  the shepherd holds the child as a zombie until it reaps, so the OS pid is
+  not recyclable while it lives — and the shepherd, not this process, owns
+  signalling for that window.
   """
-  def watch(genserver_pid, os_pid) do
+  def watch(genserver_pid, os_pid, shepherd_port \\ nil) do
     DynamicSupervisor.start_child(
       NetRunner.WatcherSupervisor,
-      {__MODULE__, {genserver_pid, os_pid}}
+      {__MODULE__, {genserver_pid, os_pid, shepherd_port}}
     )
   end
 
@@ -29,18 +34,25 @@ defmodule NetRunner.Watcher do
     GenServer.cast(watcher, :stand_down)
   end
 
-  def child_spec({genserver_pid, os_pid}) do
+  def child_spec({genserver_pid, os_pid, shepherd_port}) do
     %{
       id: {__MODULE__, genserver_pid},
-      start: {__MODULE__, :start_link, [genserver_pid, os_pid]},
+      start: {__MODULE__, :start_link, [genserver_pid, os_pid, shepherd_port]},
       restart: :temporary
     }
   end
 
   @impl true
-  def init({genserver_pid, os_pid}) do
+  def init({genserver_pid, os_pid, shepherd_port}) do
     ref = Process.monitor(genserver_pid)
-    {:ok, %{genserver_pid: genserver_pid, os_pid: os_pid, monitor_ref: ref}}
+
+    {:ok,
+     %{
+       genserver_pid: genserver_pid,
+       os_pid: os_pid,
+       shepherd_port: shepherd_port,
+       monitor_ref: ref
+     }}
   end
 
   @impl true
@@ -59,13 +71,21 @@ defmodule NetRunner.Watcher do
     # innocent process. Escalation is the shepherd's job; this probe only
     # covers a shepherd that died before its ladder ran, where the orphaned
     # child's pid stays occupied (unreaped) and the probe window is narrow.
-    case Nif.nif_is_os_pid_alive(state.os_pid) do
-      true ->
-        {:ok, sigterm} = Signal.resolve(:sigterm)
-        Nif.nif_kill(state.os_pid, sigterm)
+    #
+    # While the shepherd port is still alive the probe is skipped entirely:
+    # the shepherd holds the child as a zombie until it reaps, so the pid is
+    # not recyclable and the shepherd's own POLLHUP ladder covers teardown —
+    # an alive?→kill from here would be the exact check-then-act race the
+    # missing escalation avoids.
+    unless shepherd_alive?(state.shepherd_port) do
+      case Nif.nif_is_os_pid_alive(state.os_pid) do
+        true ->
+          {:ok, sigterm} = Signal.resolve(:sigterm)
+          Nif.nif_kill(state.os_pid, sigterm)
 
-      false ->
-        :ok
+        false ->
+          :ok
+      end
     end
 
     {:stop, :normal, state}
@@ -74,4 +94,6 @@ defmodule NetRunner.Watcher do
   def handle_info(_msg, state) do
     {:noreply, state}
   end
+
+  defp shepherd_alive?(port), do: is_port(port) and Port.info(port) != nil
 end

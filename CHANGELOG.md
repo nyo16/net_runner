@@ -9,6 +9,65 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 Performance follow-up cycle (from the 2026-08-31 `/phx:perf` reports; numbers
 are medians on an Apple M1 Max, `MIX_ENV=prod`, harness under `bench/`).
 
+Audit-remediation cycle (2026-08-31 project-health audit, second pass: all 39
+remaining findings across shepherd/NIF, lib, tests, docs, and CI).
+
+### Security
+
+- **cgroup isolation fails closed.** `cgroup_setup` now checks the
+  `cgroup.procs` write *and* flush (migration errors like EPERM/EBUSY surface
+  at `fclose` behind stdio buffering) and fails the spawn with a descriptive
+  `MSG_ERROR` instead of silently running the child unconfined. A
+  pre-existing cgroup leaf directory is now fatal too (teardown would not be
+  owned), and the directory is created `0700`.
+- **cgroup attach no longer races `execvp`.** The child blocks on a sync
+  pipe after `fork` and only execs once the shepherd has migrated it into
+  the cgroup — descendants can no longer escape limits or `cgroup.kill`
+  teardown. Non-cgroup spawns are byte-for-byte unchanged.
+- **Pid-reuse guard on direct kills.** `Nif.nif_kill` fallbacks in
+  `NetRunner.Process` and the Watcher probe only fire when the shepherd port
+  is dead; while the shepherd lives it holds the child as a zombie, making
+  it the only safe signaller.
+- **`nif_read` can no longer expose uninitialized heap.** The shrink of a
+  >64 KiB read buffer now handles `enif_realloc_binary` failure with an
+  alloc+copy fallback.
+
+### Fixed
+
+- **EINTR is retried** in the NIF `read(2)`/`write(2)` loops and shepherd
+  I/O; a transient signal can no longer permanently wedge a drain loop.
+- **Shepherd diagnostics surface.** A spawn-stage `MSG_ERROR` (cgroup
+  failure, fork failure, …) now returns `{:error, {:shepherd_error, msg}}`
+  to the caller instead of a misleading fd-count mismatch; post-spawn errors
+  are logged and recorded in state.
+- **Shepherd UDS writes are nonblocking** with a bounded `poll(POLLOUT)`
+  deadline, so a wedged peer cannot park the shepherd after reap and skip
+  cgroup cleanup.
+
+### Changed
+
+- **`NetRunner.Process.Nif` renamed to `NetRunner.Nif`** (internal,
+  `@moduledoc false`, but referenced in tests/benches).
+- **Option-validation convention unified.** Malformed options (unknown keys,
+  bad values for `:stderr`, `:stderr_tail_bytes`, `:cgroup_path`, `:env`,
+  `:output`, `:input_buffer`) raise `ArgumentError` at every entry point;
+  runtime spawn failures keep `{:error, reason}` returns, and `stream!/2`
+  uniformly wraps spawn-stage reasons as
+  `%NetRunner.Error{reason: {:spawn_failed, reason}}`.
+- **Wire protocol centralized** in `NetRunner.Process.Protocol` (constants,
+  parser, encoders); no inline frame bytes remain in `Process`/`Exec`.
+- **`Daemon.os_pid/1`** answers from cached daemon state instead of a
+  blocking double GenServer hop.
+- **Docs corrected**: `--token-fd` handshake (never argv), Watcher's
+  deliberate single-SIGTERM/no-escalation design, Layer-3 cleanup via the
+  NIF owner monitor (not GC), write-budget loop exit in `backpressure.md`;
+  `Process.read/2` documents the 1 MiB cap and non-FIFO reader wakeup.
+- **CI supply chain**: Dependabot now covers GitHub Actions; every workflow
+  action is SHA-pinned; `.credo.exs` committed; `mix deps.unlock
+  --check-unused` gate added; musl container pinned by digest; the Linux
+  test job delegates `/sys/fs/cgroup/net_runner` so cgroup positive-path
+  tests actually execute.
+
 ### Added
 
 - **`NetRunner.Process.read_batch/3` and `read_stderr_batch/3`.** Read up to

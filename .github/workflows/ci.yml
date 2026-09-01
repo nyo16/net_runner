@@ -26,15 +26,15 @@ jobs:
     env:
       WERROR: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps & build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             deps
@@ -44,6 +44,7 @@ jobs:
             ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
       - run: mix deps.get
+      - run: mix deps.unlock --check-unused
       - run: mix hex.audit
       - run: mix deps.compile
 
@@ -54,15 +55,15 @@ jobs:
     name: Formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: deps
           key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
@@ -76,15 +77,15 @@ jobs:
     name: Credo
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps & build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             deps
@@ -124,15 +125,15 @@ jobs:
             elixir: "1.18.4"
             otp: "28.3.3"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: ${{ matrix.elixir }}
           otp-version: ${{ matrix.otp }}
 
       - name: Cache deps & build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             deps
@@ -144,16 +145,31 @@ jobs:
       - run: mix deps.get
       - run: mix deps.compile
       - run: mix compile
+      # Delegate a cgroup v2 subtree to the runner user so the positive-path
+      # cgroup tests (test/cgroup_test.exs) exercise the privileged branch.
+      # The shepherd hardcodes /sys/fs/cgroup/<path> and the Elixir side only
+      # accepts paths under net_runner/, so no env var is needed — just a
+      # writable net_runner/ subtree. Root cgroup.procs must also be writable
+      # to migrate a process across the common ancestor (cgroup v2 delegation
+      # containment rule).
+      - name: Delegate cgroup v2 subtree for cgroup tests
+        if: runner.os == 'Linux'
+        run: |
+          sudo mkdir -p /sys/fs/cgroup/net_runner
+          sudo chown -R "$(whoami)" /sys/fs/cgroup/net_runner
+          sudo chown "$(whoami)" /sys/fs/cgroup/cgroup.procs
       - run: mix test
 
   test-alpine:
     name: Tests (Alpine / musl)
     runs-on: ubuntu-latest
-    container: alpine:3.22
+    # Digest-pinned (alpine:3.22 at time of pinning); Dependabot does not scan
+    # `container:` keys, so bump this digest manually when moving minors.
+    container: alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
     env:
       WERROR: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install build toolchain and Erlang/Elixir
         run: apk add --no-cache build-base git erlang elixir
@@ -173,9 +189,9 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
@@ -191,9 +207,9 @@ jobs:
     name: Package tarball compiles
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
@@ -216,15 +232,15 @@ jobs:
     name: Dialyzer
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps & build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             deps
@@ -234,7 +250,7 @@ jobs:
             ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
       - name: Cache PLTs
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: priv/plts
           key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
@@ -252,15 +268,15 @@ jobs:
     env:
       WERROR: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps & build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             deps

@@ -4,9 +4,11 @@
 /*
  * Shepherd <-> BEAM protocol over Unix domain socket.
  *
- * Handshake: when spawned with --token <hex>, the shepherd writes the
- * TOKEN_HEX_LEN-byte hex token verbatim as the very first frame after
- * connect. The BEAM verifies it before accepting any FDs.
+ * Handshake: when spawned with --token-fd, the shepherd reads the
+ * TOKEN_HEX_LEN-byte hex token from fd 3 (the BEAM port's :nouse_stdio
+ * channel — never argv, which is world/same-uid readable) and writes it
+ * verbatim as the very first frame after connect. The BEAM verifies it
+ * before accepting any FDs.
  *
  * Direction: BEAM -> Shepherd
  *   CMD_KILL         [0x01] [signal_number: 1 byte]

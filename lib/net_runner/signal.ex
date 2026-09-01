@@ -1,7 +1,7 @@
 defmodule NetRunner.Signal do
   @moduledoc false
 
-  alias NetRunner.Process.Nif
+  alias NetRunner.Nif
 
   @doc """
   Resolves a signal atom to its platform-specific number.

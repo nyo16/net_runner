@@ -325,7 +325,14 @@ static ERL_NIF_TERM nif_read(ErlNifEnv *env, int argc,
     }
     int fd = res->fd;
 
-    ssize_t n = read(fd, dst, (size_t)max_bytes);
+    /* Retry EINTR at the syscall: callers treat any result other than ok /
+     * eagain as terminal without re-arming enif_select, so a stray signal
+     * must not permanently kill a drain loop. O_NONBLOCK means the retry
+     * cannot sleep. */
+    ssize_t n;
+    do {
+        n = read(fd, dst, (size_t)max_bytes);
+    } while (n < 0 && errno == EINTR);
     int saved_errno = errno;
 
     if (n > 0) {
@@ -336,8 +343,19 @@ static ERL_NIF_TERM nif_read(ErlNifEnv *env, int argc,
                                         MAKE_ATOM(env, "alloc_failed"));
             }
             memcpy(bin.data, stackbuf, (size_t)n);
-        } else {
-            enif_realloc_binary(&bin, (size_t)n);
+        } else if (!enif_realloc_binary(&bin, (size_t)n)) {
+            /* Shrink failed: bin still spans max_bytes with only n valid
+             * bytes. Never hand Erlang the uninitialized tail — copy the
+             * n bytes into an exactly-sized binary instead. */
+            ErlNifBinary exact;
+            if (!enif_alloc_binary((size_t)n, &exact)) {
+                enif_release_binary(&bin);
+                return enif_make_tuple2(env, atom_error,
+                                        MAKE_ATOM(env, "alloc_failed"));
+            }
+            memcpy(exact.data, bin.data, (size_t)n);
+            enif_release_binary(&bin);
+            bin = exact;
         }
         consume_bytes_timeslice(env, (size_t)n);
         return enif_make_tuple2(env, atom_ok, enif_make_binary(env, &bin));
@@ -396,7 +414,11 @@ static ERL_NIF_TERM nif_write(ErlNifEnv *env, int argc,
     }
     int fd = res->fd;
 
-    ssize_t n = write(fd, bin.data, bin.size);
+    /* Retry EINTR at the syscall — see nif_read. */
+    ssize_t n;
+    do {
+        n = write(fd, bin.data, bin.size);
+    } while (n < 0 && errno == EINTR);
     int saved_errno = errno;
 
     if (n > 0) {
@@ -515,7 +537,10 @@ static ERL_NIF_TERM nif_close_fd(ErlNifEnv *env, int argc,
         return enif_make_badarg(env);
     }
 
-    if (close(fd) == 0) {
+    /* EINTR: POSIX leaves the fd state unspecified, but on Linux and macOS
+     * the descriptor is already freed. Reporting an error would invite the
+     * caller to close again and race whatever recycled the number. */
+    if (close(fd) == 0 || errno == EINTR) {
         return atom_ok;
     }
     return enif_make_tuple2(env, atom_error,
@@ -682,4 +707,4 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_signal_number", 1, nif_signal_number, 0}
 };
 
-ERL_NIF_INIT(Elixir.NetRunner.Process.Nif, nif_funcs, load, NULL, NULL, NULL)
+ERL_NIF_INIT(Elixir.NetRunner.Nif, nif_funcs, load, NULL, NULL, NULL)

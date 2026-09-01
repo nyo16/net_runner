@@ -1,12 +1,10 @@
 defmodule NetRunner.Process.Exec do
   @moduledoc false
 
-  alias NetRunner.Process.{Nif, Pipe, State}
+  alias NetRunner.Nif
+  alias NetRunner.Process.{Pipe, Protocol, State}
 
   @accept_timeout 10_000
-  @msg_child_started 0x80
-  @msg_child_exited 0x81
-  @msg_error 0x82
   @uds_base_dir_key {__MODULE__, :uds_base_dir}
   # Upper bound on the retained stderr tail. Above this the "bounded
   # diagnostic tail" turns into an unbounded-ish per-process buffer.
@@ -32,10 +30,6 @@ defmodule NetRunner.Process.Exec do
 
     result =
       with :ok <- validate_cmd_and_args(cmd, args),
-           :ok <- validate_stderr_mode(Keyword.get(opts, :stderr, :consume), pty_mode),
-           :ok <- validate_stderr_tail_bytes(Keyword.get(opts, :stderr_tail_bytes, 8_192)),
-           :ok <- validate_cgroup_path(Keyword.get(opts, :cgroup_path, nil)),
-           :ok <- validate_env(Keyword.get(opts, :env, nil)),
            {:ok, listen_socket} <- create_uds_listener(uds_path),
            {:ok, shepherd_port} <- open_shepherd(uds_path, token, cmd, args, opts),
            {:ok, conn_socket} <-
@@ -211,7 +205,7 @@ defmodule NetRunner.Process.Exec do
   end
 
   defp extract_started_or_close(conn_socket, iov_rest, fds) do
-    case extract_child_started(conn_socket, iov_rest) do
+    case Protocol.extract_child_started(conn_socket, iov_rest, @accept_timeout) do
       {:ok, _os_pid, _carry} = ok ->
         ok
 
@@ -260,75 +254,95 @@ defmodule NetRunner.Process.Exec do
     _, _ -> :ok
   end
 
+  @doc """
+  Validates spawn option *values*, raising `ArgumentError` on any malformed
+  one. Returns `opts`.
+
+  Called on the client by `NetRunner.Process.start/3` / `start_link/3`, so
+  every entry point (`NetRunner.run/2`, `stream!/2`, `Daemon`, direct
+  `Process.start/3`) shares one convention: malformed options are programmer
+  errors and raise in the caller; `{:error, reason}` is reserved for runtime
+  spawn failures.
+  """
+  def validate_opts!(opts) do
+    pty_mode = Keyword.get(opts, :pty, false)
+    validate_stderr_mode!(Keyword.get(opts, :stderr, :consume), pty_mode)
+    validate_stderr_tail_bytes!(Keyword.get(opts, :stderr_tail_bytes, 8_192))
+    validate_cgroup_path!(Keyword.get(opts, :cgroup_path, nil))
+    validate_env!(Keyword.get(opts, :env, nil))
+    opts
+  end
+
   # In PTY mode stderr is folded into the bidirectional master FD, so the
   # :stderr option is ignored. In pipe mode only :consume (drained internally
   # to avoid blocking the child on a full pipe) and :disabled are supported.
-  defp validate_stderr_mode(_mode, true), do: :ok
-  defp validate_stderr_mode(mode, false) when mode in [:consume, :disabled], do: :ok
+  defp validate_stderr_mode!(_mode, true), do: :ok
+  defp validate_stderr_mode!(mode, false) when mode in [:consume, :disabled], do: :ok
 
-  defp validate_stderr_mode(mode, false) do
-    {:error, {:invalid_stderr, "must be :consume or :disabled, got: #{inspect(mode)}"}}
+  defp validate_stderr_mode!(mode, false) do
+    raise ArgumentError, ":stderr must be :consume or :disabled, got: #{inspect(mode)}"
   end
 
   # The bounded stderr tail cap. 0 disables retention (drain-and-drop) while
   # still draining the pipe so the child never blocks. Capped above so callers
   # cannot turn the diagnostic tail into an unbounded buffer.
-  defp validate_stderr_tail_bytes(bytes)
+  defp validate_stderr_tail_bytes!(bytes)
        when is_integer(bytes) and bytes >= 0 and bytes <= @stderr_tail_bytes_max,
        do: :ok
 
-  defp validate_stderr_tail_bytes(bytes) do
-    {:error,
-     {:invalid_stderr_tail_bytes,
-      "must be an integer in 0..#{@stderr_tail_bytes_max}, got: #{inspect(bytes)}"}}
+  defp validate_stderr_tail_bytes!(bytes) do
+    raise ArgumentError,
+          ":stderr_tail_bytes must be an integer in 0..#{@stderr_tail_bytes_max}, " <>
+            "got: #{inspect(bytes)}"
   end
 
   # Optional :env map: name => value sets, name => nil unsets. Names/values
   # travel through Port.open's env: option as charlists; reject shapes that
   # would corrupt the environment block.
-  defp validate_env(nil), do: :ok
+  defp validate_env!(nil), do: :ok
 
-  defp validate_env(env) when is_map(env) do
-    Enum.find_value(env, :ok, fn
+  defp validate_env!(env) when is_map(env) do
+    Enum.each(env, fn
       {k, v} when is_binary(k) and (is_binary(v) or is_nil(v)) ->
         cond do
           k == "" or String.contains?(k, ["=", <<0>>]) ->
-            {:error, {:invalid_env, "invalid variable name: #{inspect(k)}"}}
+            raise ArgumentError, ":env has an invalid variable name: #{inspect(k)}"
 
           is_binary(v) and String.contains?(v, <<0>>) ->
-            {:error, {:invalid_env, "value for #{k} must not contain NUL bytes"}}
+            raise ArgumentError, ":env value for #{k} must not contain NUL bytes"
 
           true ->
-            nil
+            :ok
         end
 
       {k, _v} ->
-        {:error, {:invalid_env, "entry #{inspect(k)} must map a binary name to a binary or nil"}}
+        raise ArgumentError,
+              ":env entry #{inspect(k)} must map a binary name to a binary or nil"
     end)
   end
 
-  defp validate_env(env) do
-    {:error, {:invalid_env, "must be a map of names to binaries or nil, got: #{inspect(env)}"}}
+  defp validate_env!(env) do
+    raise ArgumentError, ":env must be a map of names to binaries or nil, got: #{inspect(env)}"
   end
 
-  defp validate_cgroup_path(nil), do: :ok
+  defp validate_cgroup_path!(nil), do: :ok
 
-  defp validate_cgroup_path(path) do
+  defp validate_cgroup_path!(path) do
     path_str = to_string(path)
 
     cond do
       String.starts_with?(path_str, "/") ->
-        {:error, {:invalid_cgroup_path, "must be relative, got: #{path_str}"}}
+        raise ArgumentError, ":cgroup_path must be relative, got: #{path_str}"
 
       String.contains?(path_str, "..") ->
-        {:error, {:invalid_cgroup_path, "cannot contain '..', got: #{path_str}"}}
+        raise ArgumentError, ":cgroup_path cannot contain '..', got: #{path_str}"
 
       byte_size(path_str) >= 256 ->
-        {:error, {:invalid_cgroup_path, "must be under 256 bytes"}}
+        raise ArgumentError, ":cgroup_path must be under 256 bytes"
 
       not String.starts_with?(path_str, "net_runner/") or path_str == "net_runner/" ->
-        {:error,
-         {:invalid_cgroup_path, "must sit under the net_runner/ prefix, got: #{path_str}"}}
+        raise ArgumentError,
+              ":cgroup_path must sit under the net_runner/ prefix, got: #{path_str}"
 
       true ->
         :ok
@@ -536,13 +550,25 @@ defmodule NetRunner.Process.Exec do
         if length(fds) == expected do
           {:ok, fds, iov_rest}
         else
-          # Whatever arrived is unusable but real — close it or it leaks.
-          Enum.each(fds, &Nif.nif_close_fd/1)
-          {:error, {:unexpected_fd_count, length(fds)}}
+          handle_fd_count_mismatch(socket, fds, iov_data)
         end
 
       {:error, reason} ->
         {:error, {:recvmsg_failed, reason}}
+    end
+  end
+
+  # Whatever arrived is unusable but real — close it or it leaks. Every
+  # pre-send_fds shepherd failure ("cgroup setup failed", "fork failed", ...)
+  # sends a bare MSG_ERROR frame in place of the SCM_RIGHTS filler byte, so
+  # the raw iov starts the frame. Surface that diagnostic instead of a
+  # misleading fd-count mismatch.
+  defp handle_fd_count_mismatch(socket, fds, iov_data) do
+    Enum.each(fds, &Nif.nif_close_fd/1)
+
+    case Protocol.recv_shepherd_error(socket, iov_data, @accept_timeout) do
+      {:ok, msg} -> {:error, {:shepherd_error, msg}}
+      :no_error -> {:error, {:unexpected_fd_count, length(fds)}}
     end
   end
 
@@ -614,78 +640,4 @@ defmodule NetRunner.Process.Exec do
   end
 
   defp decode_native_int32s(<<>>), do: []
-
-  @doc """
-  Extracts MSG_CHILD_STARTED from `iov_rest`, or reads it from the socket.
-
-  Returns `{:ok, os_pid, carry}`, where `carry` is whatever followed the
-  MSG_CHILD_STARTED frame. The UDS is a byte stream, so the shepherd's three
-  writes (the 1-byte SCM_RIGHTS filler, MSG_CHILD_STARTED and later
-  MSG_CHILD_EXITED) can coalesce into a single `recvmsg`. A child that exits
-  before the BEAM reads therefore delivers its exit status *inside* this
-  buffer; discarding the tail loses it permanently and strands the caller on
-  the force-exit timeout with a synthetic status.
-  """
-  def extract_child_started(socket, iov_rest) do
-    case iov_rest do
-      <<@msg_child_started, pid::big-unsigned-32, rest::binary>> ->
-        {:ok, pid, rest}
-
-      <<@msg_error, len::big-unsigned-16, msg::binary-size(len), _::binary>> ->
-        {:error, {:shepherd_error, msg}}
-
-      <<@msg_child_exited, status::big-unsigned-32, _::binary>> ->
-        {:error, {:child_exited_immediately, status}}
-
-      _ ->
-        # MSG_CHILD_STARTED wasn't in the iov_rest, read from socket
-        read_child_started_from_socket(socket)
-    end
-  end
-
-  defp read_child_started_from_socket(socket) do
-    case :socket.recv(socket, 5, [], @accept_timeout) do
-      {:ok, <<@msg_child_started, pid::big-unsigned-32>>} ->
-        {:ok, pid, <<>>}
-
-      {:ok, <<@msg_error, rest::binary>>} ->
-        {:error, {:shepherd_error, rest}}
-
-      {:ok, <<@msg_child_exited, status::big-unsigned-32>>} ->
-        {:error, {:child_exited_immediately, status}}
-
-      {:ok, other} ->
-        {:error, {:unexpected_message, other}}
-
-      {:error, reason} ->
-        {:error, {:recv_failed, reason}}
-    end
-  end
-
-  @doc """
-  Parses a single frame out of a buffer without touching the socket.
-
-  Returns `{:ok, result, rest}`, `:incomplete` when more bytes are needed, or
-  `{:error, {:unknown_message, byte}}` for an unrecognised opcode.
-  """
-  def parse_uds_message(<<@msg_child_exited, status::big-unsigned-32, rest::binary>>) do
-    {:ok, {:child_exited, status}, rest}
-  end
-
-  def parse_uds_message(<<@msg_error, len::big-unsigned-16, msg::binary-size(len), rest::binary>>) do
-    {:ok, {:shepherd_error, msg}, rest}
-  end
-
-  # A second MSG_CHILD_STARTED should never arrive, but skipping it keeps the
-  # parser making progress instead of stalling on a byte it will never consume.
-  def parse_uds_message(<<@msg_child_started, _pid::big-unsigned-32, rest::binary>>) do
-    parse_uds_message(rest)
-  end
-
-  def parse_uds_message(<<byte, _::binary>>)
-      when byte not in [@msg_child_started, @msg_child_exited, @msg_error] do
-    {:error, {:unknown_message, byte}}
-  end
-
-  def parse_uds_message(_partial), do: :incomplete
 end

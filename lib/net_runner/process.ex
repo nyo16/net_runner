@@ -21,7 +21,8 @@ defmodule NetRunner.Process do
 
   use GenServer
 
-  alias NetRunner.Process.{Exec, Nif, Operations, Pipe, Stats}
+  alias NetRunner.Nif
+  alias NetRunner.Process.{Exec, Operations, Pipe, Protocol, Stats}
   alias NetRunner.Signal
 
   # Exactly the size of nif_read's stack buffer, and one macOS pipe buffer
@@ -73,16 +74,41 @@ defmodule NetRunner.Process do
     :env
   ]
 
+  @doc """
+  Starts the process GenServer linked to the caller.
+
+  Malformed options — unknown keys or invalid values for `:stderr`,
+  `:stderr_tail_bytes`, `:cgroup_path` or `:env` — are programmer errors and
+  raise `ArgumentError` here, in the caller, matching every other NetRunner
+  entry point. `{:error, reason}` is reserved for runtime spawn failures
+  (invalid command bytes, shepherd handshake errors, ...).
+  """
+  @spec start_link(String.t(), [String.t()], keyword()) :: GenServer.on_start()
   def start_link(cmd, args \\ [], opts \\ []) do
-    opts = Keyword.validate!(opts, @process_opts)
+    opts = validate_opts!(opts)
     gen_opts = Keyword.take(opts, [:name])
     GenServer.start_link(__MODULE__, {cmd, args, opts}, gen_opts)
   end
 
+  @doc """
+  Like `start_link/3` but without a link. Same option convention: malformed
+  options raise `ArgumentError`; runtime spawn failures return
+  `{:error, reason}`.
+  """
+  @spec start(String.t(), [String.t()], keyword()) :: GenServer.on_start()
   def start(cmd, args \\ [], opts \\ []) do
-    opts = Keyword.validate!(opts, @process_opts)
+    opts = validate_opts!(opts)
     gen_opts = Keyword.take(opts, [:name])
     GenServer.start(__MODULE__, {cmd, args, opts}, gen_opts)
+  end
+
+  # Client-side option validation: unknown keys (Keyword.validate!) and bad
+  # option values (Exec.validate_opts!) raise ArgumentError in the caller —
+  # one convention for every entry point — rather than poisoning init/1.
+  defp validate_opts!(opts) do
+    opts
+    |> Keyword.validate!(@process_opts)
+    |> Exec.validate_opts!()
   end
 
   @doc """
@@ -108,12 +134,26 @@ defmodule NetRunner.Process do
     :exit, _ -> :ok
   end
 
-  @doc "Read from stdout. Blocks until data available or EOF."
+  @doc """
+  Read from stdout. Blocks until data available or EOF.
+
+  `max_bytes` is a request cap, not a promise: the NIF caps a single read at
+  1 MiB (1_048_576 bytes), so a larger `max_bytes` still yields at most 1 MiB
+  per call. Reads are "up to" `max_bytes` anyway, so the cap only shows up as
+  extra round trips when a caller sizes reads to a >1 MiB pipe.
+
+  With several callers parked reading the *same* pipe, wakeup order on
+  readiness is arbitrary-but-sticky (map iteration order), not FIFO — the
+  same bounded unfairness documented for concurrent `write/2` interleaving.
+  """
+  @spec read(GenServer.server(), pos_integer()) :: {:ok, binary()} | :eof | {:error, term()}
   def read(process, max_bytes \\ @default_read_size) do
     GenServer.call(process, {:read, :stdout, max_bytes}, :infinity)
   end
 
-  @doc "Read from stderr."
+  @doc "Read from stderr. Same `max_bytes` cap and wakeup order as `read/2`."
+  @spec read_stderr(GenServer.server(), pos_integer()) ::
+          {:ok, binary()} | :eof | {:error, term()}
   def read_stderr(process, max_bytes \\ @default_read_size) do
     GenServer.call(process, {:read, :stderr, max_bytes}, :infinity)
   end
@@ -127,7 +167,11 @@ defmodule NetRunner.Process do
   Returns `{:ok, chunks}` with chunks in read order. `:eof` (and read errors)
   are only returned when no data was collected in this call — a batch cut
   short by EOF is delivered and the *next* call returns `:eof`.
+
+  `max_bytes` is capped at 1 MiB per chunk by the NIF, like `read/2`.
   """
+  @spec read_batch(GenServer.server(), pos_integer(), pos_integer()) ::
+          {:ok, [binary()]} | :eof | {:error, term()}
   def read_batch(process, max_bytes \\ @default_read_size, max_chunks \\ @stderr_drain_chunks) do
     GenServer.call(process, {:read_batch, :stdout, max_bytes, max_chunks}, :infinity)
   end
@@ -139,6 +183,8 @@ defmodule NetRunner.Process do
   :disabled` — how `Daemon` drains); under `stderr: :consume` an external
   batch reader is safe but races the internal drain for chunks.
   """
+  @spec read_stderr_batch(GenServer.server(), pos_integer(), pos_integer()) ::
+          {:ok, [binary()]} | :eof | {:error, term()}
   def read_stderr_batch(
         process,
         max_bytes \\ @default_read_size,
@@ -156,16 +202,19 @@ defmodule NetRunner.Process do
   chunks. Serialise externally (as `Daemon` does via its forwarder) when
   payload atomicity matters.
   """
+  @spec write(GenServer.server(), iodata()) :: :ok | {:error, term()}
   def write(process, data) do
     GenServer.call(process, {:write, IO.iodata_to_binary(data)}, :infinity)
   end
 
   @doc "Close stdin pipe."
+  @spec close_stdin(GenServer.server()) :: :ok | {:error, term()}
   def close_stdin(process) do
     GenServer.call(process, :close_stdin)
   end
 
   @doc "Send a signal to the OS process."
+  @spec kill(GenServer.server(), atom() | pos_integer(), timeout()) :: :ok | {:error, term()}
   def kill(process, signal \\ :sigterm, timeout \\ 5_000) do
     GenServer.call(process, {:kill, signal}, timeout)
   end
@@ -211,30 +260,33 @@ defmodule NetRunner.Process do
   end
 
   defp safe_await_exit(process, timeout) do
-    case await_exit(process, timeout) do
-      {:ok, _} = ok -> ok
-      _ -> :timeout
-    end
+    # await_exit only ever returns {:ok, status}; a timeout surfaces as an
+    # :exit from GenServer.call, caught below.
+    await_exit(process, timeout)
   catch
     :exit, _ -> :timeout
   end
 
   @doc "Wait for the process to exit. Returns `{:ok, exit_status}`."
+  @spec await_exit(GenServer.server(), timeout()) :: {:ok, non_neg_integer()}
   def await_exit(process, timeout \\ :infinity) do
     GenServer.call(process, :await_exit, timeout)
   end
 
   @doc "Get the OS PID."
+  @spec os_pid(GenServer.server()) :: non_neg_integer() | nil
   def os_pid(process) do
     GenServer.call(process, :os_pid)
   end
 
   @doc "Check if the process is alive."
+  @spec alive?(GenServer.server()) :: boolean()
   def alive?(process) do
     GenServer.call(process, :alive?)
   end
 
-  @doc "Get accumulated stats."
+  @doc "Get accumulated stats. See `NetRunner.Process.Stats.t/0`."
+  @spec stats(GenServer.server()) :: Stats.t()
   def stats(process) do
     GenServer.call(process, :stats)
   end
@@ -260,6 +312,8 @@ defmodule NetRunner.Process do
   Set PTY window size (rows, cols). Only works in PTY mode. Values outside
   0..65535 do not fit the 2-byte protocol fields and are rejected.
   """
+  @spec set_window_size(GenServer.server(), non_neg_integer(), non_neg_integer()) ::
+          :ok | {:error, term()}
   def set_window_size(process, rows, cols)
       when is_integer(rows) and rows in 0..65_535 and is_integer(cols) and cols in 0..65_535 do
     GenServer.call(process, {:set_window_size, rows, cols})
@@ -301,7 +355,7 @@ defmodule NetRunner.Process do
         # once the exit status is delivered the Watcher is told to stand down,
         # so it can never signal a reused OS pid after the child was reaped.
         watcher =
-          case NetRunner.Watcher.watch(self(), state.os_pid) do
+          case NetRunner.Watcher.watch(self(), state.os_pid, state.shepherd_port) do
             {:ok, pid} -> pid
             _ -> nil
           end
@@ -402,7 +456,7 @@ defmodule NetRunner.Process do
       end
 
     # Also tell shepherd to close its copy
-    send_shepherd_command(state, <<0x02>>)
+    send_shepherd_command(state, Protocol.close_stdin())
 
     # Fail parked writes eagerly: an EAGAIN-parked writer registered select
     # on the resource that was just closed, so no readiness event will ever
@@ -424,9 +478,10 @@ defmodule NetRunner.Process do
       {:ok, sig_num} ->
         if state.os_pid do
           # Send through shepherd protocol for process group kill
-          send_shepherd_command(state, <<0x01, sig_num::8>>)
-          # Also direct NIF kill as belt-and-suspenders
-          Nif.nif_kill(state.os_pid, sig_num)
+          send_shepherd_command(state, Protocol.kill(sig_num))
+
+          maybe_direct_kill(state, sig_num)
+
           {:reply, :ok, maybe_mark_exiting(state, signal)}
         else
           {:reply, {:error, :no_pid}, state}
@@ -462,7 +517,7 @@ defmodule NetRunner.Process do
   end
 
   def handle_call({:set_window_size, rows, cols}, _from, state) do
-    send_shepherd_command(state, <<0x03, rows::big-16, cols::big-16>>)
+    send_shepherd_command(state, Protocol.set_winsize(rows, cols))
     {:reply, :ok, state}
   end
 
@@ -606,8 +661,9 @@ defmodule NetRunner.Process do
     if state.os_pid do
       case Signal.resolve(:sigkill) do
         {:ok, sig_num} ->
-          send_shepherd_command(state, <<0x01, sig_num::8>>)
-          Nif.nif_kill(state.os_pid, sig_num)
+          send_shepherd_command(state, Protocol.kill(sig_num))
+
+          maybe_direct_kill(state, sig_num)
 
         _ ->
           :ok
@@ -615,6 +671,17 @@ defmodule NetRunner.Process do
     end
 
     {:stop, :normal, state}
+  end
+
+  # The shepherd owns the reap, so while it lives it is the only safe
+  # signaller: it holds the child as a zombie until waitpid, so the pid
+  # cannot be recycled while CMD_KILL is serviceable. Only when the shepherd
+  # is gone (child orphaned and un-reaped — pid still not recyclable) does
+  # the direct NIF kill take over.
+  defp maybe_direct_kill(state, sig_num) do
+    unless shepherd_alive?(state) do
+      Nif.nif_kill(state.os_pid, sig_num)
+    end
   end
 
   @impl true
@@ -1048,6 +1115,14 @@ defmodule NetRunner.Process do
     end
   end
 
+  # A live shepherd port means a live shepherd: it still holds the child as
+  # a zombie until waitpid, so the OS pid cannot be recycled and CMD_KILL
+  # over the UDS is the safe signalling path. Direct NIF kills must wait
+  # until this is false — the BEAM has no reap authority over the pid.
+  defp shepherd_alive?(state) do
+    is_port(state.shepherd_port) and Port.info(state.shepherd_port) != nil
+  end
+
   defp maybe_read_exit_status(%{status: :exited} = state), do: state
 
   defp maybe_read_exit_status(state) do
@@ -1108,7 +1183,7 @@ defmodule NetRunner.Process do
 
   # Parses buffered bytes only — never reads the socket, so it cannot block.
   defp drain_uds_carry(state) do
-    case Exec.parse_uds_message(state.uds_carry) do
+    case Protocol.parse_uds_message(state.uds_carry) do
       {:ok, msg, rest} ->
         drain_uds_carry(apply_uds_message(%{state | uds_carry: rest}, msg))
 
@@ -1127,7 +1202,9 @@ defmodule NetRunner.Process do
     require Logger
 
     Logger.warning("[NetRunner] shepherd reported error: #{inspect(msg)}")
-    state
+    # Recorded (not just logged) so a caller inspecting the server after a
+    # degraded spawn can see what the shepherd reported.
+    %{state | last_shepherd_error: msg}
   end
 
   defp finish_exit(state, exit_status) do

@@ -1,6 +1,8 @@
 defmodule NetRunner.StderrTailTest do
   use ExUnit.Case, async: true
 
+  import NetRunner.TestHelpers
+
   alias NetRunner.Daemon
   alias NetRunner.Process, as: Proc
 
@@ -126,13 +128,15 @@ defmodule NetRunner.StderrTailTest do
 
   describe "validation" do
     test "rejects a negative :stderr_tail_bytes at start" do
-      assert {:error, {:invalid_stderr_tail_bytes, _}} =
-               Proc.start("echo", ["hi"], stderr_tail_bytes: -1)
+      assert_raise ArgumentError, ~r/:stderr_tail_bytes/, fn ->
+        Proc.start("echo", ["hi"], stderr_tail_bytes: -1)
+      end
     end
 
     test "rejects a non-integer :stderr_tail_bytes at start" do
-      assert {:error, {:invalid_stderr_tail_bytes, _}} =
-               Proc.start("echo", ["hi"], stderr_tail_bytes: :lots)
+      assert_raise ArgumentError, ~r/:stderr_tail_bytes/, fn ->
+        Proc.start("echo", ["hi"], stderr_tail_bytes: :lots)
+      end
     end
   end
 
@@ -191,17 +195,11 @@ defmodule NetRunner.StderrTailTest do
   # Polls until at least `expected` stderr bytes have been drained, so the
   # retained tail is final before we assert on it (avoids racing the
   # select-driven consumer against the OS process exit notification).
-  defp wait_until_drained(pid, expected, attempts \\ 100) do
-    if Proc.stats(pid).bytes_err >= expected do
-      :ok
-    else
-      if attempts == 0 do
-        flunk("stderr not fully drained: #{Proc.stats(pid).bytes_err}/#{expected}")
-      else
-        Process.sleep(20)
-        wait_until_drained(pid, expected, attempts - 1)
-      end
-    end
+  defp wait_until_drained(pid, expected) do
+    eventually(fn ->
+      drained = Proc.stats(pid).bytes_err
+      assert drained >= expected, "stderr not fully drained: #{drained}/#{expected}"
+    end)
   end
 
   # Accumulates chunks until `expected` is fully received (chunking is

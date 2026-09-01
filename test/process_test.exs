@@ -87,7 +87,7 @@ defmodule NetRunner.ProcessTest do
       {:ok, pid} = Proc.start("sh", ["-c", "sleep 0.5; printf abc"])
 
       task = Task.async(fn -> Proc.read_batch(pid) end)
-      assert wait_until(fn -> map_size(:sys.get_state(pid).operations.pending) == 1 end)
+      eventually(fn -> assert map_size(:sys.get_state(pid).operations.pending) == 1 end)
 
       assert {:ok, chunks} = Task.await(task, 5_000)
       assert IO.iodata_to_binary(chunks) == "abc"
@@ -122,20 +122,6 @@ defmodule NetRunner.ProcessTest do
     end
   end
 
-  # Polls `fun` (~5ms period) until truthy or ~1s elapses; returns the last
-  # result so callers can `assert wait_until(...)`.
-  defp wait_until(fun, attempts \\ 200)
-  defp wait_until(fun, 0), do: fun.()
-
-  defp wait_until(fun, attempts) do
-    if fun.() do
-      true
-    else
-      Process.sleep(5)
-      wait_until(fun, attempts - 1)
-    end
-  end
-
   describe "multi-writer fan-in" do
     test "4 concurrent writers complete with exact byte accounting" do
       # The child sleeps first so the writers EAGAIN-park behind a full
@@ -147,7 +133,7 @@ defmodule NetRunner.ProcessTest do
       payload = :binary.copy(<<1>>, 1_048_576)
 
       tasks = for _ <- 1..4, do: Task.async(fn -> Proc.write(pid, payload) end)
-      assert wait_until(fn -> map_size(:sys.get_state(pid).operations.pending) > 0 end)
+      eventually(fn -> assert map_size(:sys.get_state(pid).operations.pending) > 0 end)
 
       results = Task.await_many(tasks, 15_000)
 
@@ -172,10 +158,13 @@ defmodule NetRunner.ProcessTest do
 
       # All four writers must actually be parked before the kill is issued,
       # or the occupancy bound below is a trivial pass.
-      assert wait_until(fn ->
-               :sys.get_state(pid).operations.pending
-               |> Enum.count(fn {_ref, {type, _f, _c, _m}} -> type == :write end) == 4
-             end)
+      eventually(fn ->
+        parked_writes =
+          :sys.get_state(pid).operations.pending
+          |> Enum.count(fn {_ref, {type, _f, _c, _m}} -> type == :write end)
+
+        assert parked_writes == 4
+      end)
 
       t0 = System.monotonic_time(:millisecond)
       assert :ok = Proc.kill(pid, :sigkill)

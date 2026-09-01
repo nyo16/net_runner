@@ -34,6 +34,10 @@ defmodule NetRunner.Process.State do
     # yields so a retry pass over N parked writes queues one resume message,
     # not N.
     continue_writes_scheduled?: false,
+    # Most recent MSG_ERROR diagnostic from the shepherd (e.g. a failed
+    # cgroup setup) — recorded, not just logged, so a degraded spawn can be
+    # diagnosed after the fact.
+    last_shepherd_error: nil,
     status: :running,
     stats: %Stats{}
   ]
@@ -58,6 +62,7 @@ defmodule NetRunner.Process.State do
           stderr_tail_bytes: non_neg_integer(),
           uds_carry: binary(),
           continue_writes_scheduled?: boolean(),
+          last_shepherd_error: binary() | nil,
           status: status(),
           stats: Stats.t()
         }

@@ -3,7 +3,7 @@ defmodule NetRunner.Phase2Test do
 
   import NetRunner.TestHelpers
 
-  alias NetRunner.Process.Nif
+  alias NetRunner.Nif
 
   describe "run/2 timeout" do
     test "kills process on timeout" do

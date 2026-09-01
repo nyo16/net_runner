@@ -117,38 +117,42 @@ defmodule NetRunner.IOPipeliningTest do
     # the message is dropped, stderr stops draining, and the child deadlocks on
     # a full stderr pipe: this test then fails on await_exit, not on latency.
     test "a concurrent handle_call stays responsive during a 64 MB stderr flood" do
+      # Two identical probes run SIMULTANEOUSLY: one against the flooded
+      # Process, one against a quiet twin on the same schedulers. Absolute
+      # thresholds flaked whenever sibling async tests pushed their own MiB
+      # floods; the quiet probe measures exactly that ambient load, so the
+      # ratio isolates the drain's own queueing. A systematically unbounded
+      # drain parks every call behind megabytes of stderr (100x-1000x), which
+      # no ambient-load factor explains away.
+      quiet = start_proc("sleep", ["60"])
       pid = start_proc("sh", ["-c", "dd if=/dev/zero bs=1048576 count=64 status=none >&2"])
-      parent = self()
 
-      spawn_link(fn ->
-        samples =
-          Enum.map(1..200, fn _ ->
-            {us, _} = :timer.tc(fn -> Proc.os_pid(pid) end)
-            Process.sleep(1)
-            us
-          end)
-
-        send(parent, {:samples, samples})
-      end)
+      probe_latency(pid, :flood_samples)
+      probe_latency(quiet, :quiet_samples)
 
       assert {:ok, 0} = Proc.await_exit(pid, 60_000)
 
-      samples =
-        receive do
-          {:samples, samples} -> samples
-        after
-          30_000 -> flunk("latency probe never finished")
-        end
+      flood = await_samples(:flood_samples)
+      quiet_samples = await_samples(:quiet_samples)
+
+      Proc.kill(quiet, :sigkill)
 
       # Percentiles, not worst-of-200: a single scheduler hiccup on a loaded
       # CI runner must not fail the test, but a systematically unbounded
       # drain (every call queued behind megabytes of stderr) still does.
-      sorted = Enum.sort(samples)
-      median = Enum.at(sorted, div(length(sorted), 2))
-      p90 = Enum.at(sorted, div(length(sorted) * 9, 10))
+      {median, p90} = percentiles(flood)
+      {quiet_median, quiet_p90} = percentiles(quiet_samples)
 
-      assert median < 10_000, "median concurrent handle_call was #{median} us"
-      assert p90 < 50_000, "p90 concurrent handle_call was #{p90} us"
+      # 20x the same-moment baseline, floored at the old absolute bounds so a
+      # fast idle machine does not turn the ratio into a hair trigger.
+      median_bound = max(quiet_median * 20, 10_000)
+      p90_bound = max(quiet_p90 * 20, 50_000)
+
+      assert median < median_bound,
+             "median concurrent handle_call was #{median} us (quiet baseline #{quiet_median} us)"
+
+      assert p90 < p90_bound,
+             "p90 concurrent handle_call was #{p90} us (quiet baseline #{quiet_p90} us)"
 
       # And the flood really was drained, not abandoned.
       assert Proc.stats(pid).bytes_err == 64 * 1_048_576
@@ -184,6 +188,36 @@ defmodule NetRunner.IOPipeliningTest do
       {:ok, data} -> read_all_chunks(pid, [data | acc])
       _stop -> Enum.reverse(acc)
     end
+  end
+
+  # 200 samples of a cheap handle_call's round-trip latency, ~1 ms apart,
+  # delivered to the test mailbox tagged so two probes can run concurrently.
+  defp probe_latency(pid, tag) do
+    parent = self()
+
+    spawn_link(fn ->
+      send(parent, {tag, Enum.map(1..200, fn _ -> sample_latency_us(pid) end)})
+    end)
+  end
+
+  # One cheap handle_call round-trip, timed.
+  defp sample_latency_us(pid) do
+    {us, _} = :timer.tc(fn -> Proc.os_pid(pid) end)
+    Process.sleep(1)
+    us
+  end
+
+  defp await_samples(tag) do
+    receive do
+      {^tag, samples} -> samples
+    after
+      30_000 -> flunk("latency probe #{tag} never finished")
+    end
+  end
+
+  defp percentiles(samples) do
+    sorted = Enum.sort(samples)
+    {Enum.at(sorted, div(length(sorted), 2)), Enum.at(sorted, div(length(sorted) * 9, 10))}
   end
 
   defp start_proc(cmd, args, opts \\ []) do

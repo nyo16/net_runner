@@ -4,6 +4,7 @@ defmodule NetRunner.RobustnessTest do
   import NetRunner.TestHelpers
 
   alias NetRunner.Process, as: Proc
+  alias NetRunner.Process.Pipe
 
   describe "shepherd crash (TEST-1)" do
     test "a SIGKILLed shepherd surfaces a synthetic exit and the child does not leak" do
@@ -87,7 +88,41 @@ defmodule NetRunner.RobustnessTest do
 
     test "on an empty command" do
       e = assert_raise NetRunner.Error, fn -> NetRunner.stream!([]) end
-      assert {:invalid_cmd, _} = e.reason
+      assert {:spawn_failed, {:invalid_cmd, _}} = e.reason
+    end
+
+    test "on a mid-stream read error, and the after-fun still cleans up" do
+      # The stream contract (stream.ex read_next/2): :eof and
+      # {:error, :process_exited} halt cleanly, any OTHER read error raises
+      # NetRunner.Error{reason: {:read_error, _}}. Sabotage the stdout fd out
+      # from under a live stream — nif_close makes the next read_batch return
+      # {:error, :closed}. The :name option gives the test a handle on the
+      # backing GenServer; the close runs in the consumer between resource
+      # steps, so the GenServer is idle and nothing can park on the dead fd.
+      # Stream.run (not Enum.take/2): on Linux the shepherd grows the pipe to
+      # 1 MiB and reads are batched, so the FIRST resource step can yield
+      # enough chunks to satisfy a fixed take before any read ever touches
+      # the closed fd — the stream would halt cleanly and nothing would
+      # raise. Running to exhaustion guarantees a post-close read.
+      stream = NetRunner.stream!(~w(yes), name: NRMidStreamError)
+      proc = Process.whereis(NRMidStreamError)
+      os_pid = Proc.os_pid(proc)
+
+      e =
+        assert_raise NetRunner.Error, fn ->
+          stream
+          |> Stream.each(fn _chunk ->
+            Pipe.close(:sys.get_state(proc).stdout)
+          end)
+          |> Stream.run()
+        end
+
+      assert e.reason == {:read_error, :closed}
+
+      # The raise propagated through Stream.resource's after-fun, which must
+      # still reap: GenServer stopped, child killed, nothing leaked.
+      eventually(fn -> not Process.alive?(proc) end)
+      eventually(fn -> not os_pid_alive?(os_pid) end, 5_000)
     end
   end
 

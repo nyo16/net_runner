@@ -3,8 +3,8 @@ defmodule NetRunner.ZombieTest do
 
   import NetRunner.TestHelpers
 
+  alias NetRunner.Nif
   alias NetRunner.Process, as: Proc
-  alias NetRunner.Process.Nif
 
   describe "zombie prevention" do
     test "OS process dies when GenServer is killed" do
