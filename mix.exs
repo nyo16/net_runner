@@ -19,7 +19,10 @@ defmodule NetRunner.MixProject do
       package: package(),
       docs: docs(),
       name: "NetRunner",
-      source_url: @source_url
+      source_url: @source_url,
+      # test/support is compiled in :test (where dialyzer runs in CI) and
+      # calls ExUnit.Assertions.flunk/1; ExUnit is not in the default PLT.
+      dialyzer: [plt_add_apps: [:ex_unit]]
     ]
   end
 
