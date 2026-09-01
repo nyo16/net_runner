@@ -1,6 +1,8 @@
 defmodule NetRunner.ZombieTest do
   use ExUnit.Case, async: false
 
+  import NetRunner.TestHelpers
+
   alias NetRunner.Process, as: Proc
   alias NetRunner.Process.Nif
 
@@ -15,11 +17,8 @@ defmodule NetRunner.ZombieTest do
       # Kill the GenServer (not graceful)
       Process.exit(pid, :kill)
 
-      # Wait for watcher to clean up
-      Process.sleep(1_000)
-
-      # OS process should be dead
-      assert Nif.nif_is_os_pid_alive(os_pid) == false
+      # Watcher: SIGTERM immediately; sleep dies on it.
+      eventually(fn -> Nif.nif_is_os_pid_alive(os_pid) == false end, 5_000)
     end
 
     test "OS process dies on normal GenServer exit" do
@@ -29,11 +28,7 @@ defmodule NetRunner.ZombieTest do
       # Stop GenServer normally
       GenServer.stop(pid, :normal)
 
-      # Wait briefly
-      Process.sleep(500)
-
-      # OS process should be dead
-      assert Nif.nif_is_os_pid_alive(os_pid) == false
+      eventually(fn -> Nif.nif_is_os_pid_alive(os_pid) == false end, 5_000)
     end
 
     test "no zombie after process finishes normally" do
@@ -42,11 +37,8 @@ defmodule NetRunner.ZombieTest do
 
       {:ok, 0} = Proc.await_exit(pid)
 
-      # Short wait
-      Process.sleep(200)
-
       # OS process should be fully reaped
-      assert Nif.nif_is_os_pid_alive(os_pid) == false
+      eventually(fn -> Nif.nif_is_os_pid_alive(os_pid) == false end)
     end
   end
 end

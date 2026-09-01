@@ -22,7 +22,11 @@ defmodule NetRunner.Command do
       # Pass to NetRunner API:
       NetRunner.run(cmd)
       NetRunner.run(cmd, timeout: 30_000)
-      NetRunner.stream!(cmd)
+
+      # A command's opts must fit the entry point it is used with: :timeout
+      # is run/2-only, so stream the :rg command (no :timeout) instead —
+      # NetRunner.stream!(curl_cmd) would raise ArgumentError.
+      NetRunner.stream!(MyApp.Commands.rg(["TODO"]))
 
       # Introspection:
       MyApp.Commands.__commands__()

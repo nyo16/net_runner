@@ -11,6 +11,8 @@ defmodule NetRunner.Process.Nif do
   def nif_read(_resource, _max_bytes), do: :erlang.nif_error(:not_loaded)
   def nif_write(_resource, _data), do: :erlang.nif_error(:not_loaded)
   def nif_close(_resource), do: :erlang.nif_error(:not_loaded)
+  def nif_close_fd(_fd), do: :erlang.nif_error(:not_loaded)
+  def nif_mkdir_private(_path), do: :erlang.nif_error(:not_loaded)
   def nif_kill(_os_pid, _signal), do: :erlang.nif_error(:not_loaded)
   def nif_is_os_pid_alive(_os_pid), do: :erlang.nif_error(:not_loaded)
   def nif_dup_fd(_fd), do: :erlang.nif_error(:not_loaded)

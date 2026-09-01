@@ -10,7 +10,7 @@
 - (+) Detects BEAM death via UDS `POLLHUP` — guaranteed child cleanup even under `SIGKILL`
 - (+) Can relay commands (kill signals, stdin close, window size) to the child
 - (-) Costs one extra process per command (~100KB resident memory)
-- (-) Slightly more complex C code (~500 lines vs ~200)
+- (-) Slightly more complex C code (~950 lines vs ~200)
 
 ## ADR-2: UDS + SCM_RIGHTS (vs Named Pipes)
 
@@ -48,7 +48,7 @@
 - (+) No additional toolchain required — `gcc`/`clang` available everywhere
 - (+) Fast compilation (<1 second)
 - (+) Direct access to POSIX APIs without FFI layers
-- (+) ~850 lines total, easy to audit
+- (+) ~1600 lines of C total (shepherd + NIF), easy to audit
 - (-) Manual memory management (mitigated by simple allocation patterns)
 - (-) No type safety beyond what C provides
 

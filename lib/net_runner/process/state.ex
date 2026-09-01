@@ -14,6 +14,9 @@ defmodule NetRunner.Process.State do
     :cmd,
     :args,
     :owner_ref,
+    # Belt-and-suspenders Watcher pid; told to stand down once the exit
+    # status is delivered so it can never signal a reused OS pid.
+    :watcher,
     operations: %Operations{},
     awaiting_exit: [],
     stderr_mode: :consume,
@@ -27,11 +30,15 @@ defmodule NetRunner.Process.State do
     # a frame boundary is not a read boundary. Anything not yet parsed lives
     # here until the next read completes it.
     uds_carry: <<>>,
-    status: :starting,
+    # True while a :continue_writes self-send is in flight; dedupes budget
+    # yields so a retry pass over N parked writes queues one resume message,
+    # not N.
+    continue_writes_scheduled?: false,
+    status: :running,
     stats: %Stats{}
   ]
 
-  @type status :: :starting | :running | :exiting | :exited
+  @type status :: :running | :exiting | :exited
   @type t :: %__MODULE__{
           shepherd_port: port() | nil,
           uds_socket: :socket.socket() | nil,
@@ -43,12 +50,15 @@ defmodule NetRunner.Process.State do
           cmd: String.t(),
           args: [String.t()],
           owner_ref: reference() | nil,
+          watcher: pid() | nil,
           operations: Operations.t(),
           awaiting_exit: [GenServer.from()],
           stderr_mode: :consume | :disabled,
           stderr_tail: binary(),
           stderr_tail_bytes: non_neg_integer(),
           uds_carry: binary(),
-          status: status()
+          continue_writes_scheduled?: boolean(),
+          status: status(),
+          stats: Stats.t()
         }
 end

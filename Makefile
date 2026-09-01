@@ -23,23 +23,36 @@ CC ?= cc
 #
 # Requires LD_PRELOAD of libasan at runtime on Linux when the BEAM isn't
 # built with sanitizers; see ci.yml for the invocation.
+
+# -Werror is opt-in: CI sets WERROR=1, while package consumers compile
+# warning-tolerant (newer compilers keep growing new warnings).
+WERROR ?= 0
+
+WARNINGS = -Wall -Wextra -Wformat-security -Wvla -Wshadow
+ifeq ($(WERROR),1)
+	WARNINGS += -Werror
+endif
+
 ifeq ($(SANITIZE),1)
 	# _FORTIFY_SOURCE is incompatible with ASan (ASan already intercepts
 	# memcpy/etc.). Disable optimisation to -O1 and skip FORTIFY.
 	SAN_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer -g
-	CFLAGS_BASE = -O1 -Wall -Wextra -Werror -std=c99 -fstack-protector-strong $(SAN_FLAGS)
+	CFLAGS_BASE = -O1 $(WARNINGS) -std=c99 -fstack-protector-strong $(SAN_FLAGS)
 else
-	CFLAGS_BASE = -O2 -Wall -Wextra -Werror -std=c99 -fstack-protector-strong -D_FORTIFY_SOURCE=2
+	# -U first: some toolchains predefine _FORTIFY_SOURCE and a bare -D
+	# redefinition is itself a warning (fatal under -Werror).
+	CFLAGS_BASE = -O2 $(WARNINGS) -std=c99 -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
 endif
 
 ifeq ($(UNAME_S),Darwin)
 	# macOS needs _DARWIN_C_SOURCE for SCM_RIGHTS, CMSG_SPACE, etc.
-	CFLAGS = $(CFLAGS_BASE) -D_DARWIN_C_SOURCE
+	# += so packager-provided CFLAGS are honored, not clobbered.
+	CFLAGS += $(CFLAGS_BASE) -D_DARWIN_C_SOURCE
 	NIF_LDFLAGS = -dynamiclib -undefined dynamic_lookup
 	SHEPHERD_LDFLAGS = -fPIE
 	NIF_EXT = .so
 else
-	CFLAGS = $(CFLAGS_BASE) -D_GNU_SOURCE
+	CFLAGS += $(CFLAGS_BASE) -D_GNU_SOURCE
 	NIF_LDFLAGS = -shared -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 	SHEPHERD_LDFLAGS = -fPIE -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 	NIF_EXT = .so
@@ -80,14 +93,14 @@ $(PRIV_DIR):
 
 # Shepherd binary
 $(SHEPHERD): $(SHEPHERD_OBJ)
-	$(CC) $(SHEPHERD_LDFLAGS) -o $@ $<
+	$(CC) $(SHEPHERD_LDFLAGS) $(LDFLAGS) -o $@ $<
 
 $(SHEPHERD_OBJ): $(SHEPHERD_SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -I$(C_SRC_DIR) -c -o $@ $<
 
 # NIF shared library
 $(NIF_LIB): $(NIF_OBJ)
-	$(CC) $(NIF_LDFLAGS) -o $@ $<
+	$(CC) $(NIF_LDFLAGS) $(LDFLAGS) -o $@ $<
 
 $(NIF_OBJ): $(NIF_SRC) $(HEADERS)
 	$(CC) $(NIF_CFLAGS) -c -o $@ $<

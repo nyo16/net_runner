@@ -9,8 +9,14 @@ NetRunner provides safe OS process execution for Elixir by combining NIF-based a
 ```mermaid
 graph TD
     A[User Code] --> B[NetRunner API]
+    A --> K[NetRunner.Daemon<br/>supervised long-running child]
     B --> C[NetRunner.Stream]
+    B --> W[NetRunner.InputWriter<br/>concurrent stdin writer]
+    C --> W
+    K --> D
     B --> D[NetRunner.Process GenServer]
+    C --> D
+    W --> D
     D --> E[Exec: Port + UDS]
     D --> F[NIF: enif_select I/O]
     D --> G[Watcher: Zombie Prevention]
@@ -28,14 +34,16 @@ sequenceDiagram
     participant S as Shepherd
     participant C as Child
 
-    B->>B: Create UDS listener
-    B->>S: Port.open(shepherd)
+    B->>B: Create UDS listener + spawn token
+    B->>S: Port.open(shepherd --token hex)
     S->>B: Connect to UDS
+    S->>B: token (32 bytes, first frame)
+    B->>B: Verify token (+ peer uid where supported)
     S->>S: fork()
     S->>C: execvp(command)
     S->>B: sendmsg(SCM_RIGHTS: stdin_w, stdout_r, stderr_r)
     S->>B: MSG_CHILD_STARTED(pid)
-    B->>B: NIF: create_fd(stdin), create_fd(stdout)
+    B->>B: NIF: create_fd(stdin), create_fd(stdout), create_fd(stderr)
 
     loop I/O
         B->>B: NIF read/write on FDs (enif_select)
@@ -140,10 +148,14 @@ When `pty: true` is passed:
 
 ## cgroup Support (Linux Only)
 
-When `cgroup_path:` is set:
-- Shepherd creates `/sys/fs/cgroup/{path}` directory
+When `cgroup_path:` is set (must sit under a `net_runner/` prefix, < 256
+bytes):
+- Shepherd creates `/sys/fs/cgroup/{path}` and records whether *it* created
+  the directory
 - Moves child PID to `cgroup.procs`
-- On cleanup, writes `1` to `cgroup.kill` and removes the directory
+- On cleanup — only for a directory it created itself — writes `1` to
+  `cgroup.kill` and removes the directory; a pre-existing directory is left
+  untouched
 - No-op on macOS/BSD
 
 ## Parallelism Model

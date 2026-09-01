@@ -148,6 +148,10 @@ defmodule NetRunner.StderrTailTest do
 
   describe "Daemon stderr ownership" do
     test "on_output receives the full stderr stream, in order" do
+      # The child exits immediately, so the Daemon stops itself with
+      # {:shutdown, {:exit_status, 0}} — trap it or the linked exit kills
+      # this test in a race with collect_output/GenServer.stop.
+      Process.flag(:trap_exit, true)
       test_pid = self()
       handler = fn data -> send(test_pid, {:out, data}) end
 
@@ -162,7 +166,7 @@ defmodule NetRunner.StderrTailTest do
       # to an internal consumer racing it.
       assert collect_output("a\nb\nc\n") == "a\nb\nc\n"
 
-      GenServer.stop(daemon)
+      assert_receive {:EXIT, ^daemon, {:shutdown, {:exit_status, 0}}}, 5_000
     end
   end
 

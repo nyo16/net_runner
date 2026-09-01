@@ -1,6 +1,8 @@
 defmodule NetRunner.TeardownTest do
   use ExUnit.Case, async: true
 
+  import NetRunner.TestHelpers
+
   alias NetRunner.Daemon
   alias NetRunner.Process, as: Proc
   alias NetRunner.Process.Nif
@@ -45,16 +47,28 @@ defmodule NetRunner.TeardownTest do
       # `use GenServer` gives the Daemon a 5_000 ms shutdown budget. If
       # terminate/2 spends all of it waiting for a SIGTERM the child ignores,
       # the supervisor brutal-kills the Daemon before the SIGKILL is ever sent.
+      # The ready-file sync matters: signalling before the trap is installed
+      # kills the shell with the default TERM disposition and the escalation
+      # path is never exercised (vacuous pass). The loop (vs a single sleep)
+      # matters too: the group SIGTERM kills the inner sleep, but the
+      # TERM-ignoring shell keeps looping until SIGKILL.
+      ready = Path.join(System.tmp_dir!(), "nr_teardown_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm(ready) end)
+
       {:ok, daemon} =
-        Daemon.start_link(cmd: "sh", args: ["-c", "trap '' TERM; sleep 30"])
+        Daemon.start_link(
+          cmd: "sh",
+          args: ["-c", "trap '' TERM; : > #{ready}; while :; do sleep 0.2; done"]
+        )
 
       os_pid = Daemon.os_pid(daemon)
+      eventually(fn -> File.exists?(ready) end)
+
       {us, :ok} = :timer.tc(fn -> GenServer.stop(daemon) end)
 
       assert us < 5_000_000, "terminate took #{div(us, 1000)}ms, over the 5s budget"
 
-      Process.sleep(200)
-      refute os_pid_alive?(os_pid)
+      eventually(fn -> not os_pid_alive?(os_pid) end)
     end
   end
 
@@ -135,13 +149,6 @@ defmodule NetRunner.TeardownTest do
       {:ok, pid} = Proc.start("/bin/sh", ["-c", "sleep 1"], [])
       assert is_integer(Proc.os_pid(pid))
       Proc.kill(pid, :sigkill)
-    end
-  end
-
-  defp os_pid_alive?(os_pid) do
-    case System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true) do
-      {_, 0} -> true
-      _ -> false
     end
   end
 end

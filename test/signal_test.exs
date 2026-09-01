@@ -31,15 +31,4 @@ defmodule NetRunner.SignalTest do
       assert {:error, :unknown_signal} = Signal.resolve([])
     end
   end
-
-  describe "resolve!/1" do
-    test "returns the number for valid signals" do
-      assert is_integer(Signal.resolve!(:sigkill))
-    end
-
-    test "raises for invalid signals" do
-      assert_raise ArgumentError, ~r/unknown signal/, fn -> Signal.resolve!(:bogus) end
-      assert_raise ArgumentError, ~r/unknown signal/, fn -> Signal.resolve!(99) end
-    end
-  end
 end

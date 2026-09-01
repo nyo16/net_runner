@@ -6,15 +6,44 @@ Communication between the BEAM and the shepherd binary occurs over a Unix domain
 
 ## Connection Lifecycle
 
-1. BEAM creates a UDS listener at a random temp path
-2. BEAM spawns shepherd via `Port.open` with the UDS path as argv[1]
-3. Shepherd connects to the UDS
-4. Shepherd forks the child process
-5. Shepherd sends pipe FDs via `SCM_RIGHTS` (1 message)
-6. Shepherd sends `MSG_CHILD_STARTED` (may be in same recv as FDs)
-7. Bidirectional command/notification flow begins
-8. On child exit: `MSG_CHILD_EXITED`, shepherd exits
-9. On BEAM death: shepherd sees `POLLHUP`, kills child
+1. BEAM creates a UDS listener at a random temp path (inside a per-VM 0700
+   directory) and generates a per-spawn 16-byte random token
+2. BEAM spawns shepherd via `Port.open` with the UDS path as argv[1] and the
+   `--token-fd` flag, then writes the 32-byte hex token to the shepherd over
+   the private fd-3 port channel
+3. Shepherd reads the token from fd 3, connects to the UDS and writes the
+   32 hex bytes verbatim as its very first frame
+4. BEAM verifies the token (and, where the platform exposes peer
+   credentials, the peer uid); a failed or stalling connection is closed and
+   the BEAM keeps accepting until the deadline
+5. Shepherd forks the child process
+6. Shepherd sends pipe FDs via `SCM_RIGHTS` (1 message)
+7. Shepherd sends `MSG_CHILD_STARTED` (may be in same recv as FDs)
+8. Bidirectional command/notification flow begins
+9. On child exit: `MSG_CHILD_EXITED`, shepherd exits
+10. On BEAM death: shepherd sees `POLLHUP`, kills child
+
+## Authentication Handshake
+
+The token authenticates the connecting peer as the shepherd this BEAM just
+spawned. Without it, any same-uid process that won the `accept` race would
+receive the child's pipe FDs via `SCM_RIGHTS`. The token is:
+
+- 16 random bytes (`:crypto.strong_rand_bytes/1`), hex-encoded to 32 ASCII
+  chars (`TOKEN_HEX_LEN` in `protocol.h`)
+- delivered over the `:nouse_stdio` port channel (fd 3), **never argv**:
+  `/proc/<pid>/cmdline` is world-readable on Linux and `KERN_PROCARGS2` is
+  same-uid readable on macOS, so an argv token would be visible to exactly
+  the attacker it exists to stop
+- written by the shepherd as the first 32 bytes on the socket, before any
+  FD or message
+
+A connection that fails authentication (wrong bytes, wrong peer uid, or a
+stall past the accept deadline) is closed and the listener keeps accepting,
+so an impostor costs only its own connection.
+
+The shepherd binary and the Elixir library always ship together, so there is
+no compatibility shim for token-less shepherds.
 
 ## FD Passing (SCM_RIGHTS)
 

@@ -4,9 +4,14 @@
 /*
  * Shepherd <-> BEAM protocol over Unix domain socket.
  *
+ * Handshake: when spawned with --token <hex>, the shepherd writes the
+ * TOKEN_HEX_LEN-byte hex token verbatim as the very first frame after
+ * connect. The BEAM verifies it before accepting any FDs.
+ *
  * Direction: BEAM -> Shepherd
  *   CMD_KILL         [0x01] [signal_number: 1 byte]
  *   CMD_CLOSE_STDIN  [0x02] (no payload)
+ *   CMD_SET_WINSIZE  [0x03] [rows: 2 bytes] [cols: 2 bytes] (big-endian)
  *
  * Direction: Shepherd -> BEAM
  *   MSG_CHILD_STARTED [0x80] [pid: 4 bytes, big-endian]
@@ -30,6 +35,9 @@
 
 /* Max cgroup path length */
 #define CGROUP_PATH_MAX 256
+
+/* Handshake token: 16 random bytes, hex-encoded to 32 ASCII chars */
+#define TOKEN_HEX_LEN 32
 
 /* Default kill escalation timeout: SIGTERM -> wait -> SIGKILL */
 #define DEFAULT_KILL_TIMEOUT_MS 5000

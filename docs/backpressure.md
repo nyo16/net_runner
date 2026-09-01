@@ -72,10 +72,16 @@ Without immediate retry, a partial write would park the caller, but `enif_select
 
 The OS pipe buffer acts as the natural flow control mechanism:
 
-| Platform | Default Pipe Buffer | Effect |
-|----------|-------------------|--------|
-| Linux | 64 KB (configurable up to 1 MB via `fcntl(F_SETPIPE_SZ)`) | Child blocks on `write()` when buffer full |
-| macOS | 64 KB | Same blocking behavior |
+| Platform | Pipe Buffer | Effect |
+|----------|-------------|--------|
+| Linux | 1 MB — the shepherd grows each pipe from the 64 KB default via `fcntl(F_SETPIPE_SZ, 1 << 20)` (best effort; capped by `/proc/sys/fs/pipe-max-size` and may be refused for unprivileged processes, in which case 64 KB stands) | Child blocks on `write()` when buffer full |
+| macOS | 64 KB (no equivalent knob) | Same blocking behavior |
+
+The Linux growth is a throughput optimisation: every buffer-sized chunk costs
+the BEAM a read → `EAGAIN` → `enif_select` → message round trip, so a 16x
+bigger buffer cuts round trips per MiB by ~16x. Reads still happen 64 KB at a
+time (`@default_read_size`, sized to the NIF's stack fast path) — a saturated
+1 MB pipe simply drains over ~16 consecutive reads.
 
 When the Elixir consumer stops reading:
 1. OS pipe buffer fills up

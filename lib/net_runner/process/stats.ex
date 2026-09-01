@@ -25,8 +25,11 @@ defmodule NetRunner.Process.Stats do
     %__MODULE__{started_at: System.monotonic_time(:millisecond)}
   end
 
-  def record_read(%__MODULE__{} = stats, bytes) do
-    %{stats | bytes_out: stats.bytes_out + bytes, read_count: stats.read_count + 1}
+  # `count` is the number of read(2) calls the bytes took (a batched read
+  # folds its whole pass into one update without changing what `read_count`
+  # means).
+  def record_read(%__MODULE__{} = stats, bytes, count \\ 1) do
+    %{stats | bytes_out: stats.bytes_out + bytes, read_count: stats.read_count + count}
   end
 
   def record_read_stderr(%__MODULE__{} = stats, bytes) do

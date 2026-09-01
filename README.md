@@ -436,17 +436,30 @@ end, max_concurrency: 20)
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `:input` | binary \| list \| `Stream` | `nil` | Data to write to stdin. Written concurrently with reading stdout, so an input larger than the OS pipe buffers does not deadlock. Stdin is closed after the last chunk. |
-| `:timeout` | integer | `nil` | Wall-clock timeout in ms |
-| `:max_output_size` | integer | `nil` | Max bytes to collect |
-| `:stderr` | atom | `:consume` | `:consume` (drained internally) or `:disabled` |
+| `:input` | binary \| `Enumerable` of iodata | `nil` | Data to write to stdin. Written concurrently with reading stdout, so an input larger than the OS pipe buffers does not deadlock. Stdin is closed after the last chunk. |
+| `:input_buffer` | integer | `0` | Bytes of stdin coalescing for a *lazy* `:input` enumerable. `0` writes through element-by-element (what interactive stdin wants); a positive value batches elements into writes of up to that many bytes (elements are never split), e.g. `input_buffer: 65_536` for `File.stream!` line input. Eager lists always coalesce; a plain binary is a single write. |
+| `:timeout` | integer | `nil` | Wall-clock timeout in ms (`run/2` only) |
+| `:max_output_size` | integer | `nil` | Max bytes to collect (`run/2` only) |
+| `:output` | atom | `:binary` | Result shape for collected stdout (`run/2` only): `:binary` concatenates chunks into one binary; `:iodata` returns the collected chunks as iodata and skips the final flatten (an extra full-size allocation + copy for large outputs). The `max_output_exceeded` partial is always a binary. |
+| `:stderr` | atom | `:consume` | `:consume` (drained internally), `:capture` (drained, and the retained tail is returned as a third tuple element: `{output, exit_status, stderr}`) or `:disabled` |
+| `:stderr_tail_bytes` | integer | `8192` | Cap on the retained stderr tail; `0..1_048_576`. `0` retains nothing. |
+| `:env` | map | `nil` | Environment variables for the child: `%{"NAME" => "value"}` sets, `%{"NAME" => nil}` unsets. The child's executable is resolved against the **modified** environment, so an `:env`-supplied `PATH` changes which binary runs — pass absolute command paths when `:env` comes from untrusted input. |
 | `:pty` | boolean | `false` | Use pseudo-terminal |
 | `:kill_timeout` | integer | `5000` | SIGTERM→SIGKILL escalation timeout in ms |
-| `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only) |
+| `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only); must sit under a `net_runner/` prefix and be under 256 bytes |
+
+Unknown options raise `ArgumentError` (`Keyword.validate!/2`) instead of being
+silently ignored. `stream!/2` accepts the same options minus `:timeout`,
+`:max_output_size`, and `:output`, and raises `NetRunner.Error` (with the original reason in
+`:reason`) on spawn failure or a mid-stream read error.
 
 ### `NetRunner.Process.start/3`
 
-Accepts all options above except `:input`, `:timeout`, and `:max_output_size`.
+Accepts all options above except `:input`, `:input_buffer`, `:timeout`,
+`:max_output_size`, `:output`, and `:stderr` `:capture` (use `:consume` +
+`NetRunner.Process.stderr_tail/1`).
+`NetRunner.Process.shutdown/3` owns the SIGTERM→await→SIGKILL escalation for
+callers that manage processes directly.
 
 ## Architecture
 

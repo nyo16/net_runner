@@ -51,8 +51,9 @@ static ErlNifResourceType *io_resource_type = NULL;
 static void io_resource_dtor(ErlNifEnv *env, void *obj) {
     (void)env;
     io_resource_t *res = (io_resource_t *)obj;
-    /* Close fd even if mutex construction failed — otherwise ENOMEM during
-     * nif_create_fd would leak the underlying FD. */
+    /* Normal-path safety net: a resource dropped without nif_close still
+     * releases its fd here. create_fd failure paths neutralise fd/closed
+     * before release, so this never double-closes a caller-owned fd. */
     if (res->lock) {
         enif_mutex_lock(res->lock);
     }
@@ -71,10 +72,18 @@ static void io_resource_dtor(ErlNifEnv *env, void *obj) {
 static void io_resource_stop(ErlNifEnv *env, void *obj, ErlNifEvent event,
                              int is_direct_call) {
     (void)env;
-    (void)obj;
     (void)is_direct_call;
+    io_resource_t *res = (io_resource_t *)obj;
     /* BEAM guarantees no further use of this event by the NIF is in flight
-     * when this callback runs. Safe to close the underlying fd here. */
+     * when this callback runs. Mark the resource closed under the lock
+     * before closing, so the dtor (or any late caller) can never observe a
+     * still-open-looking fd and close it a second time. */
+    if (res->lock) {
+        enif_mutex_lock(res->lock);
+        res->closed = 1;
+        res->fd = -1;
+        enif_mutex_unlock(res->lock);
+    }
     if ((int)event >= 0) {
         close((int)event);
     }
@@ -228,7 +237,13 @@ static ERL_NIF_TERM nif_create_fd(ErlNifEnv *env, int argc,
     res->monitor_active = 0;
 
     if (!res->lock) {
-        /* Mutex allocation failed — release resource (dtor will close fd) */
+        /* Mutex allocation failed. Contract: on ANY create_fd failure the
+         * caller retains ownership of the fd and closes it via nif_close_fd
+         * — so neutralise the resource before releasing it, or the dtor
+         * would close here AND the caller would close again, racing a
+         * recycled fd. */
+        res->fd = -1;
+        res->closed = 1;
         enif_release_resource(res);
         return enif_make_tuple2(env, atom_error,
                                 MAKE_ATOM(env, "mutex_failed"));
@@ -240,7 +255,9 @@ static ERL_NIF_TERM nif_create_fd(ErlNifEnv *env, int argc,
      * the lifetime of the VM. Refuse to hand out a resource we cannot clean
      * up. */
     if (enif_monitor_process(env, res, &owner, &res->monitor) != 0) {
-        enif_release_resource(res); /* dtor closes the fd */
+        res->fd = -1; /* caller keeps ownership, see mutex_failed above */
+        res->closed = 1;
+        enif_release_resource(res);
         return enif_make_tuple2(env, atom_error,
                                 MAKE_ATOM(env, "monitor_failed"));
     }
@@ -363,13 +380,11 @@ static ERL_NIF_TERM nif_write(ErlNifEnv *env, int argc,
     }
 
     ErlNifBinary bin;
-    if (!enif_inspect_binary(env, argv[1], &bin) &&
-        !enif_inspect_iolist_as_binary(env, argv[1], &bin)) {
+    /* Binaries only. Iolists are normalised to a binary at the Elixir API
+     * boundary (NetRunner.Process.write/2); accepting them here duplicated
+     * that flattening logic and hid an extra copy inside the NIF. */
+    if (!enif_inspect_binary(env, argv[1], &bin)) {
         return enif_make_badarg(env);
-    }
-
-    if (bin.size == 0) {
-        return enif_make_tuple2(env, atom_ok, enif_make_int(env, 0));
     }
 
     /* Hold the lock across write() + enif_select so that a concurrent
@@ -482,6 +497,63 @@ static ERL_NIF_TERM nif_dup_fd(ErlNifEnv *env, int argc,
     }
 
     return enif_make_tuple2(env, atom_ok, enif_make_int(env, new_fd));
+}
+
+/*
+ * nif_close_fd(fd_int) -> :ok | {:error, reason}
+ *
+ * Closes a raw FD that was never wrapped in an io_resource. Used on spawn
+ * error paths to release FDs received via SCM_RIGHTS that would otherwise
+ * leak for the lifetime of the VM.
+ */
+static ERL_NIF_TERM nif_close_fd(ErlNifEnv *env, int argc,
+                                 const ERL_NIF_TERM argv[]) {
+    ASSERT_ARGC(env, argc, 1);
+
+    int fd;
+    if (!enif_get_int(env, argv[0], &fd) || fd < 0) {
+        return enif_make_badarg(env);
+    }
+
+    if (close(fd) == 0) {
+        return atom_ok;
+    }
+    return enif_make_tuple2(env, atom_error,
+                            MAKE_ATOM(env, errno_to_atom(errno)));
+}
+
+/*
+ * nif_mkdir_private(path) -> :ok | {:error, reason}
+ *
+ * Raw mkdir(path, 0700). Unlike File.mkdir_p! + File.chmod!, the directory
+ * is never observable with wider permissions, and an existing directory
+ * (whoever owns it) is reported as :eexist instead of being adopted.
+ */
+static ERL_NIF_TERM nif_mkdir_private(ErlNifEnv *env, int argc,
+                                      const ERL_NIF_TERM argv[]) {
+    ASSERT_ARGC(env, argc, 1);
+
+    ErlNifBinary path_bin;
+    if (!enif_inspect_binary(env, argv[0], &path_bin) ||
+        path_bin.size == 0 || path_bin.size > 4095) {
+        return enif_make_badarg(env);
+    }
+
+    char path[4096];
+    memcpy(path, path_bin.data, path_bin.size);
+    path[path_bin.size] = '\0';
+    if (strlen(path) != path_bin.size) {
+        return enif_make_badarg(env); /* embedded NUL */
+    }
+
+    if (mkdir(path, 0700) == 0) {
+        return atom_ok;
+    }
+    if (errno == EEXIST) {
+        return enif_make_tuple2(env, atom_error, MAKE_ATOM(env, "eexist"));
+    }
+    return enif_make_tuple2(env, atom_error,
+                            MAKE_ATOM(env, errno_to_atom(errno)));
 }
 
 /*
@@ -603,6 +675,8 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_write", 2, nif_write, 0},
     {"nif_close", 1, nif_close, 0},
     {"nif_dup_fd", 1, nif_dup_fd, 0},
+    {"nif_close_fd", 1, nif_close_fd, 0},
+    {"nif_mkdir_private", 1, nif_mkdir_private, 0},
     {"nif_kill", 2, nif_kill, 0},
     {"nif_is_os_pid_alive", 1, nif_is_os_pid_alive, 0},
     {"nif_signal_number", 1, nif_signal_number, 0}
