@@ -14,8 +14,7 @@ defmodule NetRunner.RobustnessTest do
       {:ok, pid} = Proc.start("yes", [])
       os_pid = Proc.os_pid(pid)
 
-      {shepherd_pid_out, 0} = System.cmd("ps", ["-o", "ppid=", "-p", to_string(os_pid)])
-      shepherd_pid = shepherd_pid_out |> String.trim() |> String.to_integer()
+      shepherd_pid = parent_pid!(os_pid)
       assert shepherd_pid > 1
 
       System.cmd("kill", ["-KILL", to_string(shepherd_pid)])
@@ -26,6 +25,21 @@ defmodule NetRunner.RobustnessTest do
 
       Proc.stop(pid)
       eventually(fn -> not os_pid_alive?(os_pid) end, 5_000)
+    end
+  end
+
+  # Parent-pid lookup that works on busybox too: Alpine's `ps` supports
+  # neither `-p` nor `ppid=`, but /proc is always there on Linux; macOS has
+  # no /proc and a full BSD ps.
+  defp parent_pid!(os_pid) do
+    case File.read("/proc/#{os_pid}/status") do
+      {:ok, status} ->
+        [_, ppid] = Regex.run(~r/^PPid:\s+(\d+)$/m, status)
+        String.to_integer(ppid)
+
+      {:error, _} ->
+        {out, 0} = System.cmd("ps", ["-o", "ppid=", "-p", to_string(os_pid)])
+        out |> String.trim() |> String.to_integer()
     end
   end
 

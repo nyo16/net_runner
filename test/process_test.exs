@@ -159,11 +159,14 @@ defmodule NetRunner.ProcessTest do
     end
 
     test "kill/2 during a parked multi-writer fan-in replies promptly" do
-      # Occupancy bound: with 4 parked 1 MiB writers the server must still
+      # Occupancy bound: with 4 parked 2 MiB writers the server must still
       # interleave a kill/2 call instead of spending 4 full write budgets
-      # per resume pass.
+      # per resume pass. Each payload EXCEEDS every platform's pipe capacity
+      # (macOS 64 KiB, Linux 1 MiB shepherd-grown) so no writer can complete
+      # before parking — a 1 MiB payload fit the Linux pipe exactly and the
+      # first writer sailed through, leaving only 3 parked (CI failure).
       {:ok, pid} = Proc.start("sleep", ["100"])
-      payload = :binary.copy(<<1>>, 1_048_576)
+      payload = :binary.copy(<<1>>, 2 * 1_048_576)
 
       tasks = for _ <- 1..4, do: Task.async(fn -> Proc.write(pid, payload) end)
 
