@@ -99,7 +99,7 @@ real status.
 |------|---------|---------|-------------|
 | `0x80` | `MSG_CHILD_STARTED` | `pid` (4 bytes, big-endian) | Child process PID after successful fork+exec |
 | `0x81` | `MSG_CHILD_EXITED` | `status` (4 bytes, big-endian) | Child exit status (exit code or 128+signal) |
-| `0x82` | `MSG_ERROR` | `length` (2 bytes, big-endian) + `message` (N bytes) | Error message string |
+| `0x82` | `MSG_ERROR` | `length` (2 bytes, big-endian) + `message` (N bytes) | Error text (up to 255 bytes). Before FD passing, this frame has no FDs |
 
 ## Exit Status Encoding
 
