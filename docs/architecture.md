@@ -195,7 +195,11 @@ The `env:` option has this flow:
 - `nil` and `""` both remove a variable
 - Names and values must contain valid UTF-8
 
-See ADR-11 in `decisions.md`.
+Replacement mode also passes the selected names in a shepherd allowlist. After
+authentication, the shepherd removes all other variables before `fork()`. The
+BEAM environment does not change.
+
+See ADR-11 and ADR-12 in `decisions.md`.
 
 ## cgroup Support (Linux Only)
 

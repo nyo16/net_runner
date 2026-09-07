@@ -102,6 +102,12 @@ remaining findings across shepherd/NIF, lib, tests, docs, and CI).
   and values must contain valid UTF-8. Character lists fix the double encoding
   of non-ASCII values. See ADR-11 in `docs/decisions.md`.
 
+- **`env: {:replace, environment}` defines the complete child environment.**
+  The shepherd removes every unselected variable before it forks. An empty map
+  or list gives the child an empty environment. The child uses only the
+  selected `PATH` to resolve its executable. Untagged `env:` remains an
+  overlay. See ADR-12 in `docs/decisions.md`.
+
 ### Changed
 
 - **Internal read batching.** `run/2`, `stream!/2`, and `Daemon` drain

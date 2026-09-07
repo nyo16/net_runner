@@ -84,7 +84,9 @@ defmodule NetRunner do
       pairs. A binary value sets a variable. `nil` and `""` remove it. Names
       and values must contain valid UTF-8 and no NUL. Names must not contain
       `=`. The child uses the modified `PATH` to resolve its executable. Use
-      an absolute command path when `:env` comes from untrusted input.
+      an absolute command path when `:env` comes from untrusted input. Wrap the
+      input in `{:replace, environment}` to remove every unselected variable.
+      Other mode tags raise `ArgumentError`.
 
   Also accepted and passed through to the underlying process: `:pty`,
   `:cgroup_path`, `:kill_timeout`.

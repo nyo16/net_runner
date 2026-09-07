@@ -17,12 +17,14 @@ Communication between the BEAM and the shepherd binary occurs over a Unix domain
    credentials, the peer uid); a failed or stalling connection is closed and
    the BEAM keeps accepting until the deadline
 5. Shepherd enters `--cwd` when present (`MSG_ERROR` and exit on failure)
-6. Shepherd forks the child process
-7. Shepherd sends pipe FDs via `SCM_RIGHTS` (1 message)
-8. Shepherd sends `MSG_CHILD_STARTED` (may be in same recv as FDs)
-9. Bidirectional command/notification flow begins
-10. On child exit: `MSG_CHILD_EXITED`, shepherd exits
-11. On BEAM death: shepherd sees `POLLHUP`, kills child
+6. For a replacement environment, shepherd removes every variable outside the
+   selected-name allowlist
+7. Shepherd forks the child process
+8. Shepherd sends pipe FDs via `SCM_RIGHTS` (1 message)
+9. Shepherd sends `MSG_CHILD_STARTED` (can share the FD receive)
+10. Bidirectional command/notification flow starts
+11. On child exit: `MSG_CHILD_EXITED`, shepherd exits
+12. On BEAM death: shepherd sees `POLLHUP`, kills child
 
 ## Authentication Handshake
 

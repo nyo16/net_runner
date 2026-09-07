@@ -210,3 +210,20 @@ the BEAM.
 - Invalid entries raise `ArgumentError` before NetRunner starts the shepherd.
 - An environment over the platform limit returns
   `{:shepherd_spawn_failed, reason}`.
+
+## ADR-12: Filter Replacement Environments in the Shepherd
+
+**Context**: An overlay cannot remove inherited variables that the caller does
+not know about. Some callers need to define the complete child environment.
+
+**Decision**: Add `env: {:replace, environment}`. Pass values through the port
+environment and names through a shepherd allowlist. The shepherd removes all
+other variables before `fork()`. Untagged `env:` remains an overlay.
+
+**Consequences**:
+- Replacement mode filters the environment that the shepherd received.
+- Values use the same port transport and validation in both modes.
+- Selected names also appear in the shepherd command line.
+- Without `PATH`, the shepherd prevents `execvp` from using a default search
+  path.
+- Selected names count toward both the argument and environment size limits.

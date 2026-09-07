@@ -68,6 +68,41 @@ static void child_fail(const char *tag, const char *detail) {
     _exit(127);
 }
 
+static void exec_child(char *cmd, char **args, int allow_execvp) {
+    if (!allow_execvp) child_fail("execvp", cmd);
+    execvp(cmd, args);
+    child_fail("execvp", cmd);
+}
+
+extern char **environ;
+
+static char **kept_environment_names = NULL;
+static size_t kept_environment_name_count = 0;
+
+static int keep_environment_entry(const char *entry) {
+    const char *equals = strchr(entry, '=');
+    if (equals == NULL) return 0;
+
+    size_t name_len = (size_t)(equals - entry);
+    for (size_t i = 0; i < kept_environment_name_count; i++) {
+        const char *kept = kept_environment_names[i];
+        if (strlen(kept) == name_len && memcmp(entry, kept, name_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void restrict_environment(void) {
+    if (kept_environment_names == NULL) return;
+
+    char **write = environ;
+    for (char **read = environ; *read != NULL; read++) {
+        if (keep_environment_entry(*read)) *write++ = *read;
+    }
+    *write = NULL;
+}
+
 static void sigchld_handler(int sig) {
     (void)sig;
     int saved_errno = errno;
@@ -646,8 +681,7 @@ static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
 }
 
 /*
- * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--cwd <dir>]
- *                 <cmd> [args...]
+ * Usage: shepherd <uds_path> [options] <cmd> [args...]
  *
  *   uds_path:       Path to the UDS listener socket created by the BEAM
  *   --kill-timeout:  SIGTERM->SIGKILL escalation timeout in ms (default 5000)
@@ -655,6 +689,7 @@ static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
  *                   BEAM port channel) and send it verbatim as the first
  *                   frame after connect so the BEAM can authenticate us
  *   --cwd:          Directory to run the child in (default: inherited)
+ *   --replace-env:  Count followed by the environment names the child keeps
  *   cmd:            Command to execute
  *   args:           Arguments for the command
  */
@@ -662,7 +697,8 @@ int main(int argc, char *argv[]) {
     if (argc < 3) {
         fprintf(stderr,
                 "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] "
-                "[--cwd <dir>] <cmd> [args...]\n");
+                "[--cwd <dir>] [--replace-env <count> <names...>] "
+                "<cmd> [args...]\n");
         return 1;
     }
 
@@ -700,6 +736,18 @@ int main(int argc, char *argv[]) {
             }
             child_cwd = argv[cmd_idx + 1];
             cmd_idx += 2;
+        } else if (strcmp(argv[cmd_idx], "--replace-env") == 0 && cmd_idx + 1 < argc) {
+            char *endptr;
+            long count = strtol(argv[cmd_idx + 1], &endptr, 10);
+            long available = (long)argc - cmd_idx - 3;
+            if (*endptr != '\0' || endptr == argv[cmd_idx + 1] ||
+                count < 0 || count > available) {
+                fprintf(stderr, "error: invalid --replace-env count\n");
+                return 1;
+            }
+            kept_environment_names = &argv[cmd_idx + 2];
+            kept_environment_name_count = (size_t)count;
+            cmd_idx += 2 + (int)count;
         } else if (strcmp(argv[cmd_idx], "--cgroup-path") == 0 && cmd_idx + 1 < argc) {
             const char *path = argv[cmd_idx + 1];
             /* Reject path traversal: no ".." components, no leading "/" */
@@ -843,6 +891,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    restrict_environment();
+
+    /* A missing PATH normally enables an execvp default. Replacement mode must not. */
+    int allow_execvp = kept_environment_names == NULL ||
+                       strchr(cmd, '/') != NULL || getenv("PATH") != NULL;
+
     pid_t child_pid;
     int shepherd_stdin_w = -1;
 
@@ -919,8 +973,7 @@ int main(int argc, char *argv[]) {
             signal(SIGPIPE, SIG_DFL);
 
             setpgid(0, 0);
-            execvp(cmd, cmd_args);
-            child_fail("execvp", cmd);
+            exec_child(cmd, cmd_args, allow_execvp);
         }
 
         /* === Shepherd (PTY) === */
@@ -1099,8 +1152,7 @@ int main(int argc, char *argv[]) {
             signal(SIGPIPE, SIG_DFL);
 
             setpgid(0, 0);
-            execvp(cmd, cmd_args);
-            child_fail("execvp", cmd);
+            exec_child(cmd, cmd_args, allow_execvp);
         }
 
         /* === Shepherd (pipe) === */

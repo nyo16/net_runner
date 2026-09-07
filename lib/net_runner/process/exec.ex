@@ -334,8 +334,8 @@ defmodule NetRunner.Process.Exec do
   end
 
   @doc """
-  Validates spawn option *values*, raising `ArgumentError` on any malformed
-  one. Returns `opts`.
+  Parses spawn option values, raising `ArgumentError` on malformed input.
+  Returns normalized options.
 
   Called on the client by `NetRunner.Process.start/3` / `start_link/3`, so
   every entry point (`NetRunner.run/2`, `stream!/2`, `Daemon`, direct
@@ -348,9 +348,12 @@ defmodule NetRunner.Process.Exec do
     validate_stderr_mode!(Keyword.get(opts, :stderr, :consume), pty_mode)
     validate_stderr_tail_bytes!(Keyword.get(opts, :stderr_tail_bytes, 8_192))
     validate_cgroup_path!(Keyword.get(opts, :cgroup_path, nil))
-    validate_env!(Keyword.get(opts, :env, nil))
     validate_cwd!(Keyword.get(opts, :cwd, nil))
-    opts
+
+    case normalize_env!(Keyword.get(opts, :env, nil)) do
+      nil -> Keyword.delete(opts, :env)
+      environment -> Keyword.put(opts, :env, environment)
+    end
   end
 
   # In PTY mode stderr is folded into the bidirectional master FD, so the
@@ -376,42 +379,55 @@ defmodule NetRunner.Process.Exec do
             "got: #{inspect(bytes)}"
   end
 
-  defp validate_env!(nil), do: :ok
+  defp normalize_env!(nil), do: nil
 
-  defp validate_env!(env) when is_map(env) and not is_struct(env) do
-    Enum.each(env, &validate_env_entry!/1)
+  defp normalize_env!({:replace, environment}) do
+    {:replace, normalize_environment!(environment)}
   end
 
-  defp validate_env!(env) when is_list(env), do: validate_env_list!(env)
-
-  defp validate_env!(env) do
+  defp normalize_env!({tag, _environment}) when is_atom(tag) do
     raise ArgumentError,
-          ":env must be a map or a list of {name, value} pairs, got: #{inspect(env)}"
+          ":env got #{inspect(tag)}, which is not an environment mode; " <>
+            "the only tagged form is {:replace, environment}"
   end
 
-  defp validate_env_list!([]), do: :ok
+  defp normalize_env!(env), do: normalize_environment!(env)
 
-  defp validate_env_list!([entry | rest]) do
-    validate_env_entry!(entry)
-    validate_env_list!(rest)
+  defp normalize_environment!(environment)
+       when is_map(environment) and not is_struct(environment) do
+    normalize_env_entries!(Map.to_list(environment), %{})
   end
 
-  defp validate_env_list!(tail) do
-    raise ArgumentError, ":env must be a proper list, got tail: #{inspect(tail)}"
+  defp normalize_environment!(environment) when is_list(environment) do
+    normalize_env_entries!(environment, %{})
   end
 
-  defp validate_env_entry!({k, v}) when is_binary(k) and (is_binary(v) or is_nil(v)) do
+  defp normalize_environment!(environment) do
+    raise ArgumentError,
+          ":env must be a map or a list of {name, value} pairs, got: #{inspect(environment)}"
+  end
+
+  defp normalize_env_entries!([], environment), do: Map.to_list(environment)
+
+  defp normalize_env_entries!([{k, v} | rest], environment)
+       when is_binary(k) and (is_binary(v) or is_nil(v)) do
     validate_env_name!(k)
     validate_env_value!(k, v)
+    value = if v == "", do: nil, else: v
+    normalize_env_entries!(rest, Map.put(environment, k, value))
   end
 
-  defp validate_env_entry!({k, _v}) do
+  defp normalize_env_entries!([{k, _v} | _rest], _environment) do
     raise ArgumentError,
           ":env entry #{inspect(k)} must map a binary name to a binary or nil"
   end
 
-  defp validate_env_entry!(other) do
+  defp normalize_env_entries!([other | _rest], _environment) do
     raise ArgumentError, ":env entry must be a {name, value} pair, got: #{inspect(other)}"
+  end
+
+  defp normalize_env_entries!(tail, _environment) do
+    raise ArgumentError, ":env must be a proper list, got tail: #{inspect(tail)}"
   end
 
   defp validate_env_name!(name) do
@@ -604,7 +620,10 @@ defmodule NetRunner.Process.Exec do
 
     shepherd_flags = if cwd, do: shepherd_flags ++ ["--cwd", cwd], else: shepherd_flags
 
-    port_args = [uds_path | shepherd_flags] ++ [cmd | args]
+    {environment_flags, port_environment} =
+      environment_options(Keyword.get(opts, :env, nil))
+
+    port_args = [uds_path | shepherd_flags ++ environment_flags] ++ [cmd | args]
 
     port_opts = [
       :nouse_stdio,
@@ -613,11 +632,7 @@ defmodule NetRunner.Process.Exec do
       args: port_args
     ]
 
-    port_opts =
-      case Keyword.get(opts, :env, nil) do
-        nil -> port_opts
-        env -> [{:env, format_env(env)} | port_opts]
-      end
+    port_opts = if port_environment, do: [{:env, port_environment} | port_opts], else: port_opts
 
     # Port.open raises (e.g. shepherd binary missing from priv). Convert to a
     # value so spawn_process's error path still reclaims the listener and the
@@ -649,6 +664,16 @@ defmodule NetRunner.Process.Exec do
       {name, value} -> {String.to_charlist(name), String.to_charlist(value)}
     end)
   end
+
+  defp environment_options(nil), do: {[], nil}
+
+  defp environment_options({:replace, environment}) do
+    kept_names = for {name, value} <- environment, value != nil, do: name
+    flags = ["--replace-env", Integer.to_string(length(kept_names)) | kept_names]
+    {flags, format_env(environment)}
+  end
+
+  defp environment_options(environment), do: {[], format_env(environment)}
 
   defp shepherd_executable do
     app_dir = :code.priv_dir(:net_runner)
