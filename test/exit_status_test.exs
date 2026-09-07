@@ -4,6 +4,8 @@ defmodule NetRunner.ExitStatusTest do
   alias NetRunner.Process, as: Proc
   alias NetRunner.Process.Protocol
 
+  @echo System.find_executable("echo") || raise("these tests require `echo`")
+
   # The shepherd writes three separate segments into a SOCK_STREAM: the 1-byte
   # SCM_RIGHTS filler, MSG_CHILD_STARTED, and later MSG_CHILD_EXITED. A child
   # that exits before the BEAM's recvmsg gets all three coalesced into one
@@ -12,7 +14,7 @@ defmodule NetRunner.ExitStatusTest do
   # and report a synthetic 137 instead of the real status.
   describe "fast-exiting children (coalesced MSG_CHILD_EXITED)" do
     test "reports the real exit status, not a synthetic 137" do
-      assert {"hi\n", 0} = NetRunner.run(["/bin/echo", "hi"])
+      assert {"hi\n", 0} = NetRunner.run([@echo, "hi"])
     end
 
     test "preserves a non-zero status" do
@@ -22,7 +24,7 @@ defmodule NetRunner.ExitStatusTest do
     test "does not wait for the force-exit backstop" do
       # The backstop is 5 s. Anything near it means the status came from the
       # timeout rather than from the shepherd.
-      {us, {"hi\n", 0}} = :timer.tc(fn -> NetRunner.run(["/bin/echo", "hi"]) end)
+      {us, {"hi\n", 0}} = :timer.tc(fn -> NetRunner.run([@echo, "hi"]) end)
       assert us < 1_000_000
     end
 
