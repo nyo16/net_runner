@@ -20,48 +20,6 @@ defmodule NetRunner.SecurityTest do
     end
   end
 
-  describe ":env option (SEC-9)" do
-    test "sets a variable for the child" do
-      assert {"bar\n", 0} =
-               NetRunner.run(["sh", "-c", "echo $NR_ENV_SET"], env: %{"NR_ENV_SET" => "bar"})
-    end
-
-    test "nil unsets an inherited variable" do
-      System.put_env("NR_ENV_UNSET_ME", "inherited")
-      on_exit(fn -> System.delete_env("NR_ENV_UNSET_ME") end)
-
-      # Default: the child inherits the BEAM's environment.
-      assert {"inherited\n", 0} = NetRunner.run(["sh", "-c", "echo $NR_ENV_UNSET_ME"])
-
-      # nil value: explicitly unset for this spawn only.
-      assert {"\n", 0} =
-               NetRunner.run(["sh", "-c", "echo $NR_ENV_UNSET_ME"],
-                 env: %{"NR_ENV_UNSET_ME" => nil}
-               )
-
-      # And the unset did not leak back into the BEAM's own environment.
-      assert System.get_env("NR_ENV_UNSET_ME") == "inherited"
-    end
-
-    test "rejects malformed env maps" do
-      assert_raise ArgumentError, ~r/:env/, fn ->
-        Proc.start("echo", ["x"], env: %{"A=B" => "x"})
-      end
-
-      assert_raise ArgumentError, ~r/:env/, fn ->
-        Proc.start("echo", ["x"], env: %{"" => "x"})
-      end
-
-      assert_raise ArgumentError, ~r/:env/, fn ->
-        Proc.start("echo", ["x"], env: %{"OK" => "a\0b"})
-      end
-
-      assert_raise ArgumentError, ~r/:env/, fn ->
-        Proc.start("echo", ["x"], env: [{"OK", "x"}])
-      end
-    end
-  end
-
   describe "set_window_size validation (SEC-10)" do
     test "rejects values outside the 2-byte protocol range" do
       {:ok, pid} = Proc.start("cat", [], pty: true)

@@ -184,6 +184,19 @@ The `cwd:` option has this flow:
 
 See ADR-10 in `decisions.md`.
 
+## Environment
+
+The `env:` option has this flow:
+- BEAM validates each name and value and passes them to the `Port.open` `env`
+  option
+- The shepherd and child inherit the resulting environment
+- The values do not appear in the shepherd command line
+- The child uses its `PATH` to resolve the executable
+- `nil` and `""` both remove a variable
+- Names and values must contain valid UTF-8
+
+See ADR-11 in `decisions.md`.
+
 ## cgroup Support (Linux Only)
 
 When `cgroup_path:` is set (must sit under a `net_runner/` prefix, < 256

@@ -189,3 +189,24 @@ after authentication and before `fork()`.
 - A child-side `chdir()` failure would look like an exit status from the child.
 - The selected directory controls relative paths and relative executables.
 - The shepherd also changes directory. Its later filesystem paths are absolute.
+
+## ADR-11: Pass the Environment through the Port
+
+**Context**: Callers need to change the environment that the child inherits.
+NetRunner can pass these values through the shepherd command line or through
+the `Port.open` `env:` option.
+
+**Decision**: Use the `Port.open` `env:` option. Validate each name and value in
+the BEAM.
+
+**Consequences**:
+- Environment values do not appear in the shepherd command line.
+- The shepherd and child receive the same environment. `execvp` uses its
+  `PATH` to resolve the executable.
+- A port cannot set a variable to an empty value. `""` and `nil` both remove
+  the variable.
+- Port environment entries are character lists, so names and values must be
+  valid UTF-8.
+- Invalid entries raise `ArgumentError` before NetRunner starts the shepherd.
+- An environment over the platform limit returns
+  `{:shepherd_spawn_failed, reason}`.

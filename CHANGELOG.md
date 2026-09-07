@@ -97,6 +97,11 @@ remaining findings across shepherd/NIF, lib, tests, docs, and CI).
   Relative paths use the BEAM working directory. This option does not change
   `PWD`. See ADR-10 in `docs/decisions.md`.
 
+- **`:env` accepts maps and lists of `{name, value}` pairs.** A `nil` or empty
+  value removes the variable because a port cannot set an empty value. Names
+  and values must contain valid UTF-8. Character lists fix the double encoding
+  of non-ASCII values. See ADR-11 in `docs/decisions.md`.
+
 ### Changed
 
 - **Internal read batching.** `run/2`, `stream!/2`, and `Daemon` drain
@@ -178,8 +183,8 @@ cycle below (numbers are medians on an Apple M1 Max, OTP 29 / erts 17.0.3,
 
 - **`:env` option** (`run/2`, `stream!/2`, `Process.start/3`): a map of
   environment variables for the child; a binary value sets, `nil` unsets.
-  PATH resolution happens before `:env` applies — pass absolute command
-  paths when overriding `PATH`.
+  The child's executable uses the modified `PATH`. Pass an
+  absolute command path when `:env` comes from outside your trust boundary.
 - **`stderr: :capture` for `run/2`** — returns the retained stderr tail as a
   third tuple element: `{output, exit_status, stderr}`.
 - **`NetRunner.Error`** exception with the original reason in `:reason`;
@@ -208,7 +213,9 @@ cycle below (numbers are medians on an Apple M1 Max, OTP 29 / erts 17.0.3,
   empty; rejecting beats silently returning `""`.
 - **`:env` values travel as raw bytes** (`execve` semantics): non-UTF-8
   values no longer raise from inside spawn, and UTF-8 values are no longer
-  transcoded to codepoints.
+  transcoded to codepoints. The Unreleased rules replace this behavior. Port
+  environment entries are characters, so NetRunner now rejects non-UTF-8
+  values.
 - **`Daemon` stops when its child exits**, with
   `{:shutdown, {:exit_status, n}}`, so `restart: :permanent` supervisors
   restart it; previously it lingered as a healthy-looking GenServer over a

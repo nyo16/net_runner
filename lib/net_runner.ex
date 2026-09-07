@@ -80,12 +80,11 @@ defmodule NetRunner do
       that flatten is an extra full-size allocation and copy. Pass the
       iodata straight to `File.write!/2`, a socket, or
       `IO.iodata_to_binary/1` when you do need a binary.
-    * `:env` - map of environment variables for the child: a binary value sets
-      the variable, `nil` unsets it. **The child's executable is resolved
-      against the modified environment**, so `env: %{"PATH" => ...}` changes
-      which binary runs — never build `PATH` from untrusted input, and pass an
-      absolute command path whenever `:env` comes from outside your trust
-      boundary.
+    * `:env` - child environment changes as a map or a list of `{name, value}`
+      pairs. A binary value sets a variable. `nil` and `""` remove it. Names
+      and values must contain valid UTF-8 and no NUL. Names must not contain
+      `=`. The child uses the modified `PATH` to resolve its executable. Use
+      an absolute command path when `:env` comes from untrusted input.
 
   Also accepted and passed through to the underlying process: `:pty`,
   `:cgroup_path`, `:kill_timeout`.

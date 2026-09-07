@@ -376,33 +376,70 @@ defmodule NetRunner.Process.Exec do
             "got: #{inspect(bytes)}"
   end
 
-  # Optional :env map: name => value sets, name => nil unsets. Names/values
-  # travel through Port.open's env: option as charlists; reject shapes that
-  # would corrupt the environment block.
   defp validate_env!(nil), do: :ok
 
-  defp validate_env!(env) when is_map(env) do
-    Enum.each(env, fn
-      {k, v} when is_binary(k) and (is_binary(v) or is_nil(v)) ->
-        cond do
-          k == "" or String.contains?(k, ["=", <<0>>]) ->
-            raise ArgumentError, ":env has an invalid variable name: #{inspect(k)}"
-
-          is_binary(v) and String.contains?(v, <<0>>) ->
-            raise ArgumentError, ":env value for #{k} must not contain NUL bytes"
-
-          true ->
-            :ok
-        end
-
-      {k, _v} ->
-        raise ArgumentError,
-              ":env entry #{inspect(k)} must map a binary name to a binary or nil"
-    end)
+  defp validate_env!(env) when is_map(env) and not is_struct(env) do
+    Enum.each(env, &validate_env_entry!/1)
   end
 
+  defp validate_env!(env) when is_list(env), do: validate_env_list!(env)
+
   defp validate_env!(env) do
-    raise ArgumentError, ":env must be a map of names to binaries or nil, got: #{inspect(env)}"
+    raise ArgumentError,
+          ":env must be a map or a list of {name, value} pairs, got: #{inspect(env)}"
+  end
+
+  defp validate_env_list!([]), do: :ok
+
+  defp validate_env_list!([entry | rest]) do
+    validate_env_entry!(entry)
+    validate_env_list!(rest)
+  end
+
+  defp validate_env_list!(tail) do
+    raise ArgumentError, ":env must be a proper list, got tail: #{inspect(tail)}"
+  end
+
+  defp validate_env_entry!({k, v}) when is_binary(k) and (is_binary(v) or is_nil(v)) do
+    validate_env_name!(k)
+    validate_env_value!(k, v)
+  end
+
+  defp validate_env_entry!({k, _v}) do
+    raise ArgumentError,
+          ":env entry #{inspect(k)} must map a binary name to a binary or nil"
+  end
+
+  defp validate_env_entry!(other) do
+    raise ArgumentError, ":env entry must be a {name, value} pair, got: #{inspect(other)}"
+  end
+
+  defp validate_env_name!(name) do
+    cond do
+      name == "" or String.contains?(name, ["=", <<0>>]) ->
+        raise ArgumentError, ":env has an invalid variable name: #{inspect(name)}"
+
+      not String.valid?(name) ->
+        raise ArgumentError, ":env variable name #{inspect(name)} must be UTF-8 text"
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_env_value!(_name, nil), do: :ok
+
+  defp validate_env_value!(name, value) do
+    cond do
+      String.contains?(value, <<0>>) ->
+        raise ArgumentError, ":env value for #{name} must not contain NUL bytes"
+
+      not String.valid?(value) ->
+        raise ArgumentError, ":env value for #{name} must be UTF-8 text"
+
+      true ->
+        :ok
+    end
   end
 
   defp validate_cgroup_path!(nil), do: :ok
@@ -605,13 +642,11 @@ defmodule NetRunner.Process.Exec do
     :error, :badarg -> :ok
   end
 
-  # Environment entries as raw byte lists: execve consumes bytes, and
-  # String.to_charlist/1 would (a) raise UnicodeConversionError on non-UTF-8
-  # values validate_env accepted and (b) transcode UTF-8 bytes to codepoints.
+  # Port environment entries are character lists. Byte lists double-encode UTF-8.
   defp format_env(env) do
     Enum.map(env, fn
-      {name, nil} -> {:binary.bin_to_list(name), false}
-      {name, value} -> {:binary.bin_to_list(name), :binary.bin_to_list(value)}
+      {name, nil} -> {String.to_charlist(name), false}
+      {name, value} -> {String.to_charlist(name), String.to_charlist(value)}
     end)
   end
 

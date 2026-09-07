@@ -354,6 +354,33 @@ if the child requires it:
 NetRunner.run(~w(git status), cwd: dir, env: [{"PWD", dir}])
 ```
 
+## Environment
+
+`env:` adds, overrides, or removes variables in the inherited environment. It
+accepts a map or the same list format as `System.cmd/3`:
+
+```elixir
+NetRunner.run(~w(codex), env: [{"CODEX_HOME", "/srv/agents/7"}, {"SSH_AUTH_SOCK", nil}])
+```
+
+A `nil` or empty value removes a variable. The BEAM cannot set an empty value
+through a port.
+
+Names must be non-empty UTF-8 binaries without `=` or NUL. Values must be UTF-8
+binaries without NUL, or `nil`. Invalid entries raise `ArgumentError`.
+
+The port option keeps environment values out of the shepherd command line. The
+shepherd and child receive the same environment. The child uses its `PATH` to
+resolve the executable:
+
+```elixir
+{"found\n", 0} = NetRunner.run(["only_on_this_path"], env: [{"PATH", "/srv/tools"}])
+```
+
+The operating system limits the environment size. NetRunner returns
+`{:error, {:shepherd_spawn_failed, reason}}` if the environment exceeds that
+limit.
+
 ## cgroup Support (Linux)
 
 Isolate child processes in a cgroup v2 hierarchy for resource control:
@@ -469,7 +496,7 @@ end, max_concurrency: 20)
 | `:output` | atom | `:binary` | Result shape for collected stdout (`run/2` only): `:binary` concatenates chunks into one binary; `:iodata` returns the collected chunks as iodata and skips the final flatten (an extra full-size allocation + copy for large outputs). The `max_output_exceeded` partial is always a binary. |
 | `:stderr` | atom | `:consume` | `:consume` (drained internally), `:capture` (drained, and the retained tail is returned as a third tuple element: `{output, exit_status, stderr}`) or `:disabled` |
 | `:stderr_tail_bytes` | integer | `8192` | Cap on the retained stderr tail; `0..1_048_576`. `0` retains nothing. |
-| `:env` | map | `nil` | Environment variables for the child: `%{"NAME" => "value"}` sets, `%{"NAME" => nil}` unsets. The child's executable is resolved against the **modified** environment, so an `:env`-supplied `PATH` changes which binary runs — pass absolute command paths when `:env` comes from untrusted input. |
+| `:env` | map \| list of pairs | `nil` | Child environment changes. A binary value sets a variable. `nil` removes it. The child uses the modified `PATH` to resolve its executable. |
 | `:pty` | boolean | `false` | Use pseudo-terminal |
 | `:kill_timeout` | integer | `5000` | SIGTERM→SIGKILL escalation timeout in ms |
 | `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only); must sit under a `net_runner/` prefix and be under 256 bytes |
