@@ -173,6 +173,11 @@ alias NetRunner.Process, as: Proc
 # All three processes (sh + both sleeps) are killed
 ```
 
+`kill/2` asks the shepherd to signal the child process group. `:ok` confirms
+that NetRunner wrote the request to the shepherd socket. The result does not
+confirm signal delivery. A recorded exit returns `{:error, :not_running}`. A
+failed write returns `{:error, :transport_closed}`.
+
 Supported signals: `:sigterm`, `:sigkill`, `:sigint`, `:sighup`, `:sigusr1`, `:sigusr2`, `:sigstop`, `:sigcont`, `:sigquit`, `:sigpipe`.
 
 ### Checking process state
