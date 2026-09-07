@@ -54,16 +54,22 @@
 
 ## ADR-5: Watcher + Shepherd Dual Safety
 
-**Context**: Need to guarantee no zombies under all failure modes.
+**Context**: The shepherd handles BEAM failure. The watcher handles Process
+GenServer failure. Both can outlive the child. The kernel can reuse a numeric
+PID after the parent reaps it.
 
-**Decision**: Use both a shepherd binary (C) and a Watcher GenServer (Elixir).
+**Decision**: Send normal kill requests only through the shepherd. The watcher
+sends one direct SIGTERM only when the Process GenServer dies and the shepherd
+stops. Stop the watcher after any recorded exit status.
 
 **Consequences**:
-- (+) Shepherd covers BEAM crash (SIGKILL, OOM, segfault)
-- (+) Watcher covers GenServer crash (Elixir-level errors)
-- (+) NIF destructors provide a third layer (GC-based cleanup)
-- (-) Slightly redundant — both may try to kill the same process
-- (-) Requires careful handling of the race (both use `kill()` which is idempotent)
+- The shepherd covers BEAM failure and owns normal signaling.
+- The watcher covers a Process GenServer failure after the shepherd stops.
+- A watcher probe still uses a numeric PID. A stable process handle would
+  remove this remaining race.
+- A synthetic exit status can leave an orphan alive. Later use of its PID could
+  signal an unrelated process.
+- `kill/2` reports request transport, not signal delivery.
 
 ## ADR-6: Normal Schedulers for All NIFs
 

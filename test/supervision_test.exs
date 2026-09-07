@@ -94,15 +94,15 @@ defmodule NetRunner.SupervisionTest do
       GenServer.stop(pid)
     end
 
-    test "the Watcher stands down once the exit status is delivered" do
-      {:ok, pid} = Proc.start("true", [])
+    test "the Watcher stands down once the exit is observed" do
+      # Keep the child alive until the test captures the watcher PID.
+      {:ok, pid} = Proc.start("/bin/sh", ["-c", "read line; exit 0"])
       %{watcher: watcher} = :sys.get_state(pid)
       assert is_pid(watcher)
 
+      :ok = Proc.close_stdin(pid)
       assert {:ok, 0} = Proc.await_exit(pid)
 
-      # Exit status in hand -> stand_down cast -> the Watcher stops, so a
-      # later Process crash can never trigger a probe of a reused OS pid.
       eventually(fn -> not Process.alive?(watcher) end)
 
       GenServer.stop(pid)
