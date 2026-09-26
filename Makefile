@@ -9,8 +9,6 @@ C_SRC_DIR = c_src
 
 # Erlang NIF include paths
 ERTS_INCLUDE_DIR ?= $(shell erl -noshell -eval "io:format(\"~ts/erts-~ts/include\", [code:root_dir(), erlang:system_info(version)])." -s init stop)
-ERL_INTERFACE_INCLUDE_DIR ?= $(shell erl -noshell -eval "io:format(\"~ts\", [code:lib_dir(erl_interface, include)])." -s init stop)
-ERL_INTERFACE_LIB_DIR ?= $(shell erl -noshell -eval "io:format(\"~ts\", [code:lib_dir(erl_interface, lib)])." -s init stop)
 
 # Platform detection
 UNAME_S := $(shell uname -s)
