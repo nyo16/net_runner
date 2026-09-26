@@ -59,6 +59,18 @@ else
 	NIF_EXT = .so
 endif
 
+# SHEPHERD_STATIC=1 links the shepherd as a static PIE. The NIF does not need
+# this, because it uses the libc that the BEAM loads.
+ifeq ($(SHEPHERD_STATIC),1)
+ifeq ($(UNAME_S),Darwin)
+$(error SHEPHERD_STATIC=1 is Linux-only: macOS has no static libc)
+endif
+ifeq ($(SANITIZE),1)
+$(error SHEPHERD_STATIC=1 cannot be combined with SANITIZE=1: the sanitizer runtimes do not link statically)
+endif
+	SHEPHERD_LDFLAGS += -static-pie
+endif
+
 ifeq ($(SANITIZE),1)
 	NIF_LDFLAGS += $(SAN_FLAGS)
 	SHEPHERD_LDFLAGS += $(SAN_FLAGS)

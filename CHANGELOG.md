@@ -75,6 +75,8 @@ remaining findings across shepherd/NIF, lib, tests, docs, and CI).
 
 ### Added
 
+- **`SHEPHERD_STATIC=1`** links the shepherd as a static PIE (Linux only), for
+  a release that runs where the build's libc may be absent.
 - **`NetRunner.Process.read_batch/3` and `read_stderr_batch/3`.** Read up to
   `max_chunks` pipe chunks in one GenServer round trip. A batch never waits
   once it has data (it ends at the first EAGAIN), and an EOF/error after ≥1

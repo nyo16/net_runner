@@ -189,6 +189,13 @@ jobs:
       - run: mix compile
       - run: mix test
 
+      - name: Link the shepherd as a static PIE
+        run: |
+          make all SHEPHERD_STATIC=1 PRIV_DIR=/tmp/static
+          readelf -h /tmp/static/shepherd | grep -q 'DYN'
+          if readelf -l /tmp/static/shepherd | grep -q INTERP; then exit 1; fi
+          /tmp/static/shepherd 2>&1 | grep -q '^usage: shepherd'
+
   deps-latest:
     # Simulates consumer dependency resolution: throw away the lockfile and
     # build against the newest versions Hex resolves. Non-blocking by design.
