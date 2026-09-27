@@ -34,6 +34,9 @@ remaining findings across shepherd/NIF, lib, tests, docs, and CI).
 
 ### Fixed
 
+- **The shepherd is compiled with `-fPIE`.** The flag was passed only when
+  linking, so a compiler that does not produce position-independent code by
+  default could not link the shepherd.
 - **EINTR is retried** in the NIF `read(2)`/`write(2)` loops and shepherd
   I/O; a transient signal can no longer permanently wedge a drain loop.
 - **Shepherd diagnostics surface.** A spawn-stage `MSG_ERROR` (cgroup

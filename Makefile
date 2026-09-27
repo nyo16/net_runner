@@ -47,12 +47,11 @@ ifeq ($(UNAME_S),Darwin)
 	# += so packager-provided CFLAGS are honored, not clobbered.
 	CFLAGS += $(CFLAGS_BASE) -D_DARWIN_C_SOURCE
 	NIF_LDFLAGS = -dynamiclib -undefined dynamic_lookup
-	SHEPHERD_LDFLAGS = -fPIE
 	NIF_EXT = .so
 else
 	CFLAGS += $(CFLAGS_BASE) -D_GNU_SOURCE
 	NIF_LDFLAGS = -shared -Wl,-z,relro,-z,now -Wl,-z,noexecstack
-	SHEPHERD_LDFLAGS = -fPIE -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
+	SHEPHERD_LDFLAGS = -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 	NIF_EXT = .so
 endif
 
@@ -64,6 +63,8 @@ endif
 # -fvisibility=hidden: only nif_init needs to be exported, and ERL_NIF_INIT
 # already marks it default-visible.
 NIF_CFLAGS = $(CFLAGS) -I$(ERTS_INCLUDE_DIR) -I$(C_SRC_DIR) -fPIC -fvisibility=hidden
+
+SHEPHERD_CFLAGS = $(CFLAGS) -fPIE
 
 # Targets
 SHEPHERD = $(PRIV_DIR)/shepherd
@@ -94,7 +95,7 @@ $(SHEPHERD): $(SHEPHERD_OBJ)
 	$(CC) $(SHEPHERD_LDFLAGS) $(LDFLAGS) -o $@ $<
 
 $(SHEPHERD_OBJ): $(SHEPHERD_SRC) $(HEADERS)
-	$(CC) $(CFLAGS) -I$(C_SRC_DIR) -c -o $@ $<
+	$(CC) $(SHEPHERD_CFLAGS) -I$(C_SRC_DIR) -c -o $@ $<
 
 # NIF shared library
 $(NIF_LIB): $(NIF_OBJ)
