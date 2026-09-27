@@ -49,6 +49,8 @@ remaining findings across shepherd/NIF, lib, tests, docs, and CI).
 
 ### Changed
 
+- **The native build writes no object files.** Each binary is compiled and
+  linked in one step, so `make PRIV_DIR=…` leaves the source tree unchanged.
 - **`NetRunner.Process.Nif` renamed to `NetRunner.Nif`** (internal,
   `@moduledoc false`, but referenced in tests/benches).
 - **Option-validation convention unified.** Malformed options (unknown keys,

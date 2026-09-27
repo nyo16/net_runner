@@ -33,6 +33,13 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
+      # Run this before any other build step. Later steps build into priv/, and
+      # a stray write there would then go unnoticed.
+      - name: Build into another PRIV_DIR, leaving the tree unchanged
+        run: |
+          make all PRIV_DIR="$RUNNER_TEMP/priv"
+          test -z "$(git status --porcelain --ignored -- c_src priv)"
+
       - name: Cache deps & build
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:

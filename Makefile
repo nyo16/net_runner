@@ -1,8 +1,12 @@
 # Makefile for NetRunner native code
 #
-# Builds:
-#   priv/shepherd       - persistent child-process shepherd binary
-#   priv/net_runner_nif - NIF shared library for async I/O
+# Builds these files in PRIV_DIR, which defaults to priv/:
+#   shepherd       - persistent child-process shepherd binary
+#   net_runner_nif - NIF shared library for async I/O
+#
+# Only a value on the make command line overrides PRIV_DIR. It is assigned
+# with = so that an unrelated PRIV_DIR in the environment cannot move the
+# output.
 
 PRIV_DIR = priv
 C_SRC_DIR = c_src
@@ -62,7 +66,7 @@ endif
 
 # -fvisibility=hidden: only nif_init needs to be exported, and ERL_NIF_INIT
 # already marks it default-visible.
-NIF_CFLAGS = $(CFLAGS) -I$(ERTS_INCLUDE_DIR) -I$(C_SRC_DIR) -fPIC -fvisibility=hidden
+NIF_CFLAGS = $(CFLAGS) -I$(ERTS_INCLUDE_DIR) -fPIC -fvisibility=hidden
 
 SHEPHERD_CFLAGS = $(CFLAGS) -fPIE
 
@@ -73,14 +77,11 @@ NIF_LIB = $(PRIV_DIR)/net_runner_nif$(NIF_EXT)
 SHEPHERD_SRC = $(C_SRC_DIR)/shepherd.c
 NIF_SRC = $(C_SRC_DIR)/net_runner_nif.c
 
-SHEPHERD_OBJ = $(C_SRC_DIR)/shepherd.o
-NIF_OBJ = $(C_SRC_DIR)/net_runner_nif.o
-
 HEADERS = $(C_SRC_DIR)/protocol.h $(C_SRC_DIR)/utils.h
 
 .PHONY: all clean asan bench bench-perf bench-claims bench-deadlock bench-spawn bench-exec
 
-all: $(PRIV_DIR) $(SHEPHERD) $(NIF_LIB)
+all: $(SHEPHERD) $(NIF_LIB)
 
 # Convenience: force a sanitizer rebuild. Same as SANITIZE=1 make clean all.
 asan:
@@ -90,22 +91,18 @@ asan:
 $(PRIV_DIR):
 	mkdir -p $(PRIV_DIR)
 
-# Shepherd binary
-$(SHEPHERD): $(SHEPHERD_OBJ)
-	$(CC) $(SHEPHERD_LDFLAGS) $(LDFLAGS) -o $@ $<
+$(SHEPHERD) $(NIF_LIB): | $(PRIV_DIR)
 
-$(SHEPHERD_OBJ): $(SHEPHERD_SRC) $(HEADERS)
-	$(CC) $(SHEPHERD_CFLAGS) -I$(C_SRC_DIR) -c -o $@ $<
+# Each binary has one source file, so each rule compiles and links it in one
+# command.
+$(SHEPHERD): $(SHEPHERD_SRC) $(HEADERS)
+	$(CC) $(SHEPHERD_CFLAGS) $(SHEPHERD_LDFLAGS) $(LDFLAGS) -o $@ $<
 
-# NIF shared library
-$(NIF_LIB): $(NIF_OBJ)
-	$(CC) $(NIF_LDFLAGS) $(LDFLAGS) -o $@ $<
-
-$(NIF_OBJ): $(NIF_SRC) $(HEADERS)
-	$(CC) $(NIF_CFLAGS) -c -o $@ $<
+$(NIF_LIB): $(NIF_SRC) $(HEADERS)
+	$(CC) $(NIF_CFLAGS) $(NIF_LDFLAGS) $(LDFLAGS) -o $@ $<
 
 clean:
-	rm -f $(SHEPHERD) $(NIF_LIB) $(SHEPHERD_OBJ) $(NIF_OBJ)
+	rm -f $(SHEPHERD) $(NIF_LIB)
 
 # --- Benchmarks (repo-only; see bench/README.md) ---
 #
