@@ -14,8 +14,6 @@ defmodule NetRunner.Process.State do
     :cmd,
     :args,
     :owner_ref,
-    # Belt-and-suspenders Watcher pid; told to stand down once the exit
-    # status is delivered so it can never signal a reused OS pid.
     :watcher,
     operations: %Operations{},
     awaiting_exit: [],

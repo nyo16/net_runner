@@ -26,9 +26,9 @@ defmodule NetRunner.Watcher do
   end
 
   @doc """
-  Tells the watcher its process's exit status was delivered: the child is
-  reaped, so any later signal would race OS pid reuse. The watcher simply
-  stops. Safe on an already-stopped watcher.
+  Stops the watcher once its process records an exit status.
+
+  The stored PID is not a safe child identity after a synthetic status.
   """
   def stand_down(watcher) when is_pid(watcher) do
     GenServer.cast(watcher, :stand_down)
@@ -60,23 +60,10 @@ defmodule NetRunner.Watcher do
     {:stop, :normal, state}
   end
 
+  # This is the only signal outside the shepherd that uses a numeric PID.
+  # Probe once, and only after the shepherd has stopped, to limit the reuse race.
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{monitor_ref: ref} = state) do
-    # GenServer crashed without delivering an exit status. Send one immediate
-    # SIGTERM probe and stop. There is deliberately NO timed SIGKILL
-    # escalation here: five seconds after a crash the shepherd has usually
-    # seen POLLHUP, run its own SIGTERM→SIGKILL ladder and *reaped* the child
-    # — a later alive?→kill from this process (which has no reap authority)
-    # is a check-then-act race against OS pid reuse and can SIGKILL an
-    # innocent process. Escalation is the shepherd's job; this probe only
-    # covers a shepherd that died before its ladder ran, where the orphaned
-    # child's pid stays occupied (unreaped) and the probe window is narrow.
-    #
-    # While the shepherd port is still alive the probe is skipped entirely:
-    # the shepherd holds the child as a zombie until it reaps, so the pid is
-    # not recyclable and the shepherd's own POLLHUP ladder covers teardown —
-    # an alive?→kill from here would be the exact check-then-act race the
-    # missing escalation avoids.
     unless shepherd_alive?(state.shepherd_port) do
       case Nif.nif_is_os_pid_alive(state.os_pid) do
         true ->

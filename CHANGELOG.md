@@ -24,10 +24,11 @@ remaining findings across shepherd/NIF, lib, tests, docs, and CI).
   pipe after `fork` and only execs once the shepherd has migrated it into
   the cgroup — descendants can no longer escape limits or `cgroup.kill`
   teardown. Non-cgroup spawns are byte-for-byte unchanged.
-- **Pid-reuse guard on direct kills.** `Nif.nif_kill` fallbacks in
-  `NetRunner.Process` and the Watcher probe only fire when the shepherd port
-  is dead; while the shepherd lives it holds the child as a zombie, making
-  it the only safe signaller.
+- **Signals no longer use a cached child PID.** `kill/2` sends requests only
+  through the shepherd. This prevents a late request from signaling a process
+  that reused the child PID. A closed shepherd connection returns
+  `{:error, :transport_closed}`. The watcher stops after any recorded exit
+  status. See ADR-5.
 - **`nif_read` can no longer expose uninitialized heap.** The shrink of a
   >64 KiB read buffer now handles `enif_realloc_binary` failure with an
   alloc+copy fallback.

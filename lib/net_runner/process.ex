@@ -21,7 +21,6 @@ defmodule NetRunner.Process do
 
   use GenServer
 
-  alias NetRunner.Nif
   alias NetRunner.Process.{Exec, Operations, Pipe, Protocol, Stats}
   alias NetRunner.Signal
 
@@ -213,7 +212,14 @@ defmodule NetRunner.Process do
     GenServer.call(process, :close_stdin)
   end
 
-  @doc "Send a signal to the OS process."
+  @doc """
+  Asks the shepherd to signal the child's process group.
+
+  `:ok` confirms that NetRunner wrote the request to the shepherd socket. It
+  does not confirm signal delivery. A recorded exit returns
+  `{:error, :not_running}`. A failed write returns
+  `{:error, :transport_closed}`.
+  """
   @spec kill(GenServer.server(), atom() | pos_integer(), timeout()) :: :ok | {:error, term()}
   def kill(process, signal \\ :sigterm, timeout \\ 5_000) do
     GenServer.call(process, {:kill, signal}, timeout)
@@ -351,9 +357,6 @@ defmodule NetRunner.Process do
 
         state = %{state | stats: Stats.new(), owner_ref: owner_ref}
 
-        # Register with watcher for belt-and-suspenders cleanup. Keep the pid:
-        # once the exit status is delivered the Watcher is told to stand down,
-        # so it can never signal a reused OS pid after the child was reaped.
         watcher =
           case NetRunner.Watcher.watch(self(), state.os_pid, state.shepherd_port) do
             {:ok, pid} -> pid
@@ -476,15 +479,9 @@ defmodule NetRunner.Process do
   def handle_call({:kill, signal}, _from, state) do
     case Signal.resolve(signal) do
       {:ok, sig_num} ->
-        if state.os_pid do
-          # Send through shepherd protocol for process group kill
-          send_shepherd_command(state, Protocol.kill(sig_num))
-
-          maybe_direct_kill(state, sig_num)
-
-          {:reply, :ok, maybe_mark_exiting(state, signal)}
-        else
-          {:reply, {:error, :no_pid}, state}
+        case ask_shepherd_to_kill(state, sig_num) do
+          :ok -> {:reply, :ok, maybe_mark_exiting(state, signal)}
+          {:error, _} = error -> {:reply, error, state}
         end
 
       {:error, _} = error ->
@@ -652,35 +649,23 @@ defmodule NetRunner.Process do
   end
 
   defp on_owner_down(%{status: :exited} = state) do
-    # The child was already reaped — its OS pid may belong to a brand-new
-    # process by now (same rule as the {:kill, _} clause above). Just stop.
     {:stop, :normal, state}
   end
 
   defp on_owner_down(state) do
-    if state.os_pid do
-      case Signal.resolve(:sigkill) do
-        {:ok, sig_num} ->
-          send_shepherd_command(state, Protocol.kill(sig_num))
-
-          maybe_direct_kill(state, sig_num)
-
-        _ ->
-          :ok
-      end
+    case Signal.resolve(:sigkill) do
+      {:ok, sig_num} -> _ = ask_shepherd_to_kill(state, sig_num)
+      _other -> :ok
     end
 
     {:stop, :normal, state}
   end
 
-  # The shepherd owns the reap, so while it lives it is the only safe
-  # signaller: it holds the child as a zombie until waitpid, so the pid
-  # cannot be recycled while CMD_KILL is serviceable. Only when the shepherd
-  # is gone (child orphaned and un-reaped — pid still not recyclable) does
-  # the direct NIF kill take over.
-  defp maybe_direct_kill(state, sig_num) do
-    unless shepherd_alive?(state) do
-      Nif.nif_kill(state.os_pid, sig_num)
+  # The cached PID can be reused before this process learns of the reap.
+  defp ask_shepherd_to_kill(state, sig_num) do
+    case send_shepherd_command(state, Protocol.kill(sig_num)) do
+      :ok -> :ok
+      _other -> {:error, :transport_closed}
     end
   end
 
@@ -1115,14 +1100,6 @@ defmodule NetRunner.Process do
     end
   end
 
-  # A live shepherd port means a live shepherd: it still holds the child as
-  # a zombie until waitpid, so the OS pid cannot be recycled and CMD_KILL
-  # over the UDS is the safe signalling path. Direct NIF kills must wait
-  # until this is false — the BEAM has no reap authority over the pid.
-  defp shepherd_alive?(state) do
-    is_port(state.shepherd_port) and Port.info(state.shepherd_port) != nil
-  end
-
   defp maybe_read_exit_status(%{status: :exited} = state), do: state
 
   defp maybe_read_exit_status(state) do
@@ -1208,12 +1185,18 @@ defmodule NetRunner.Process do
   end
 
   defp finish_exit(state, exit_status) do
-    stats = Stats.finalize(state.stats, exit_status)
+    # After a synthetic status, the cached PID might no longer identify the child.
+    state =
+      case state.watcher do
+        nil ->
+          state
 
-    # The exit status is in hand, so the belt-and-suspenders Watcher must
-    # stand down: its whole purpose is covering a crash *before* the child
-    # was reaped, and any later probe would race OS pid reuse.
-    if state.watcher, do: NetRunner.Watcher.stand_down(state.watcher)
+        watcher ->
+          NetRunner.Watcher.stand_down(watcher)
+          %{state | watcher: nil}
+      end
+
+    stats = Stats.finalize(state.stats, exit_status)
 
     # Exit status now arrives over the UDS as soon as the shepherd sends it,
     # which can be while the child's output is still sitting in the pipe. Serve

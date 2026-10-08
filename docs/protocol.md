@@ -112,7 +112,8 @@ When BEAM sends `CMD_KILL`:
 1. Shepherd calls `kill(-child_pid, signal)` (process group kill)
 2. Falls back to `kill(child_pid, signal)` if group doesn't exist
 
-The BEAM also sends a direct NIF kill as belt-and-suspenders.
+The BEAM does not signal the cached child PID. A successful `CMD_KILL` write
+confirms only that the request reached the shepherd socket.
 
 ## Close Stdin Protocol
 
