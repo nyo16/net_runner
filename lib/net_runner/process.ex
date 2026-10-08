@@ -71,6 +71,7 @@ defmodule NetRunner.Process do
     :stderr_tail_bytes,
     :cgroup_path,
     :kill_timeout,
+    :cwd,
     :env
   ]
 
@@ -78,10 +79,10 @@ defmodule NetRunner.Process do
   Starts the process GenServer linked to the caller.
 
   Malformed options — unknown keys or invalid values for `:stderr`,
-  `:stderr_tail_bytes`, `:cgroup_path` or `:env` — are programmer errors and
-  raise `ArgumentError` here, in the caller, matching every other NetRunner
-  entry point. `{:error, reason}` is reserved for runtime spawn failures
-  (invalid command bytes, shepherd handshake errors, ...).
+  `:stderr_tail_bytes`, `:cgroup_path`, `:cwd` or `:env` — are programmer
+  errors and raise `ArgumentError` here, in the caller, matching every other
+  NetRunner entry point. `{:error, reason}` is reserved for runtime spawn
+  failures (invalid command bytes, shepherd handshake errors, ...).
   """
   @spec start_link(String.t(), [String.t()], keyword()) :: GenServer.on_start()
   def start_link(cmd, args \\ [], opts \\ []) do

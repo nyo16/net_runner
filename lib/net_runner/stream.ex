@@ -35,6 +35,7 @@ defmodule NetRunner.Stream do
     :pty,
     :cgroup_path,
     :kill_timeout,
+    :cwd,
     :env,
     :owner,
     :name

@@ -36,8 +36,8 @@ defmodule NetRunner do
 
   Malformed options are programmer errors and raise `ArgumentError` — unknown
   keys (`Keyword.validate!/2`) as well as invalid values (`:output`,
-  `:input_buffer`, `:stderr`, `:stderr_tail_bytes`, `:cgroup_path`, `:env`).
-  Runtime spawn failures (an invalid command, shepherd errors) return
+  `:input_buffer`, `:stderr`, `:stderr_tail_bytes`, `:cgroup_path`, `:cwd`,
+  `:env`). Runtime spawn failures (an invalid command, shepherd errors) return
   `{:error, reason}` instead. This convention holds at every NetRunner entry
   point.
 
@@ -69,18 +69,24 @@ defmodule NetRunner do
       grace on top of `:timeout`.
     * `:max_output_size` - maximum bytes to collect from stdout. Kills the process
       and returns `{:error, {:max_output_exceeded, partial_output}}` if exceeded.
+    * `:cwd` - working directory for the child. Defaults to the BEAM working
+      directory. Relative values use the BEAM working directory as their base.
+      The child resolves relative paths and executables from `:cwd`. A failed
+      directory change returns `{:error, {:shepherd_error, reason}}`. This
+      option does not change `PWD`.
     * `:output` - result shape for collected stdout: `:binary` (default)
       concatenates chunks into one binary; `:iodata` returns the collected
       chunks as iodata and skips the final flatten — for a 64 MiB output
       that flatten is an extra full-size allocation and copy. Pass the
       iodata straight to `File.write!/2`, a socket, or
       `IO.iodata_to_binary/1` when you do need a binary.
-    * `:env` - map of environment variables for the child: a binary value sets
-      the variable, `nil` unsets it. **The child's executable is resolved
-      against the modified environment**, so `env: %{"PATH" => ...}` changes
-      which binary runs — never build `PATH` from untrusted input, and pass an
-      absolute command path whenever `:env` comes from outside your trust
-      boundary.
+    * `:env` - child environment changes as a map or a list of `{name, value}`
+      pairs. A binary value sets a variable. `nil` and `""` remove it. Names
+      and values must contain valid UTF-8 and no NUL. Names must not contain
+      `=`. The child uses the modified `PATH` to resolve its executable. Use
+      an absolute command path when `:env` comes from untrusted input. Wrap the
+      input in `{:replace, environment}` to remove every unselected variable.
+      Other mode tags raise `ArgumentError`.
 
   Also accepted and passed through to the underlying process: `:pty`,
   `:cgroup_path`, `:kill_timeout`.
@@ -109,6 +115,7 @@ defmodule NetRunner do
     :timeout,
     :max_output_size,
     :output,
+    :cwd,
     :stderr,
     :stderr_tail_bytes,
     :pty,

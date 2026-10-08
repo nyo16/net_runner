@@ -328,6 +328,76 @@ Output handling options:
 
 Graceful shutdown: on `terminate/2`, sends SIGTERM, waits 5 seconds, then SIGKILL.
 
+## Working Directory
+
+`cwd:` sets the child working directory:
+
+```elixir
+{output, 0} = NetRunner.run(~w(git status), cwd: "/srv/checkouts/job_123")
+```
+
+Relative paths and executable names use this directory. A relative `cwd:`
+value uses the BEAM working directory as its base.
+
+If the shepherd cannot enter the directory, NetRunner returns an error before
+the command runs:
+
+```elixir
+NetRunner.run(~w(git status), cwd: "/srv/gone")
+#=> {:error, {:shepherd_error, "chdir failed: No such file or directory"}}
+```
+
+`cwd:` does not change the `PWD` environment variable. Set `PWD` through `env:`
+if the child requires it:
+
+```elixir
+NetRunner.run(~w(git status), cwd: dir, env: [{"PWD", dir}])
+```
+
+## Environment
+
+`env:` adds, overrides, or removes variables in the inherited environment. It
+accepts a map or the same list format as `System.cmd/3`:
+
+```elixir
+NetRunner.run(~w(codex), env: [{"CODEX_HOME", "/srv/agents/7"}, {"SSH_AUTH_SOCK", nil}])
+```
+
+A `nil` or empty value removes a variable. The BEAM cannot set an empty value
+through a port.
+
+Names must be non-empty UTF-8 binaries without `=` or NUL. Values must be UTF-8
+binaries without NUL, or `nil`. Invalid entries raise `ArgumentError`.
+
+The port option keeps environment values out of the shepherd command line. The
+values remain visible to processes that can inspect the shepherd or child
+environment. The child uses its `PATH` to resolve the executable:
+
+```elixir
+{"found\n", 0} = NetRunner.run(["only_on_this_path"], env: [{"PATH", "/srv/tools"}])
+```
+
+The operating system limits the environment size. NetRunner returns
+`{:error, {:shepherd_spawn_failed, reason}}` if the environment exceeds that
+limit.
+
+### Replacing the inherited environment
+
+Wrap the input in `{:replace, environment}` to define the complete child
+environment:
+
+```elixir
+NetRunner.run(~w(env), env: {:replace, %{"PATH" => "/srv/tools", "HOME" => "/srv/agents/7"}})
+```
+
+The shepherd removes all unselected variables before it forks. It does not
+change the BEAM environment. `env: {:replace, %{}}` gives the child an empty
+environment.
+
+Replacement mode uses the same validation as overlay mode. The child uses only
+the selected `PATH` to resolve its executable. An unknown mode raises
+`ArgumentError`.
+
 ## cgroup Support (Linux)
 
 Isolate child processes in a cgroup v2 hierarchy for resource control:
@@ -443,10 +513,11 @@ end, max_concurrency: 20)
 | `:output` | atom | `:binary` | Result shape for collected stdout (`run/2` only): `:binary` concatenates chunks into one binary; `:iodata` returns the collected chunks as iodata and skips the final flatten (an extra full-size allocation + copy for large outputs). The `max_output_exceeded` partial is always a binary. |
 | `:stderr` | atom | `:consume` | `:consume` (drained internally), `:capture` (drained, and the retained tail is returned as a third tuple element: `{output, exit_status, stderr}`) or `:disabled` |
 | `:stderr_tail_bytes` | integer | `8192` | Cap on the retained stderr tail; `0..1_048_576`. `0` retains nothing. |
-| `:env` | map | `nil` | Environment variables for the child: `%{"NAME" => "value"}` sets, `%{"NAME" => nil}` unsets. The child's executable is resolved against the **modified** environment, so an `:env`-supplied `PATH` changes which binary runs — pass absolute command paths when `:env` comes from untrusted input. |
+| `:env` | map \| list of pairs \| `{:replace, map \| list}` | `nil` | Child environment changes. A binary sets a variable. `nil` removes it. `{:replace, environment}` removes all unselected variables. |
 | `:pty` | boolean | `false` | Use pseudo-terminal |
 | `:kill_timeout` | integer | `5000` | SIGTERM→SIGKILL escalation timeout in ms |
 | `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only); must sit under a `net_runner/` prefix and be under 256 bytes |
+| `:cwd` | string | `nil` | Child working directory. Defaults to the BEAM working directory. |
 
 Unknown options raise `ArgumentError` (`Keyword.validate!/2`) instead of being
 silently ignored. `stream!/2` accepts the same options minus `:timeout`,

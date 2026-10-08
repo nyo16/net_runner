@@ -32,8 +32,15 @@ defmodule NetRunner.Process.Exec do
       with :ok <- validate_cmd_and_args(cmd, args),
            {:ok, listen_socket} <- create_uds_listener(uds_path),
            {:ok, shepherd_port} <- open_shepherd(uds_path, token, cmd, args, opts),
+           shepherd_monitor = :erlang.monitor(:port, shepherd_port),
            {:ok, conn_socket} <-
-             accept_authenticated(listen_socket, shepherd_port, token, accept_deadline()),
+             accept_authenticated(
+               listen_socket,
+               shepherd_port,
+               shepherd_monitor,
+               token,
+               accept_deadline()
+             ),
            :ok <- cleanup_listener(listen_socket, uds_path) do
         # conn_socket and shepherd_port are now live — clean up on any failure
         setup_after_connection(conn_socket, shepherd_port, owner, cmd, args, opts, pty_mode)
@@ -56,33 +63,105 @@ defmodule NetRunner.Process.Exec do
   # queued connect is still served on the next accept. On final failure the
   # shepherd port is closed (the listener is closed by spawn_process's error
   # path via cleanup_listener never running — close it here too).
-  defp accept_authenticated(listen_socket, shepherd_port, token, deadline) do
-    remaining = deadline - System.monotonic_time(:millisecond)
+  defp accept_authenticated(listen_socket, shepherd_port, shepherd_monitor, token, deadline) do
+    case accept_or_shepherd_exit(listen_socket, shepherd_port, shepherd_monitor, deadline) do
+      {:ok, conn_socket} ->
+        case authenticate_shepherd(conn_socket, token, deadline) do
+          :ok ->
+            Process.demonitor(shepherd_monitor, [:flush])
+            {:ok, conn_socket}
 
-    with true <- remaining > 0,
-         {:ok, conn_socket} <- :socket.accept(listen_socket, remaining) do
-      case authenticate_shepherd(conn_socket, token, deadline) do
-        :ok ->
-          {:ok, conn_socket}
-
-        {:error, _} ->
-          # Impostor (or a stalling peer): its socket is closed by
-          # authenticate_shepherd; keep listening for the real shepherd.
-          accept_authenticated(listen_socket, shepherd_port, token, deadline)
-      end
-    else
-      false ->
-        fail_accept(listen_socket, shepherd_port, :shepherd_connect_timeout)
-
-      {:error, :timeout} ->
-        fail_accept(listen_socket, shepherd_port, :shepherd_connect_timeout)
+          {:error, _} ->
+            # Impostor (or a stalling peer): its socket is closed by
+            # authenticate_shepherd; keep listening for the real shepherd.
+            accept_authenticated(
+              listen_socket,
+              shepherd_port,
+              shepherd_monitor,
+              token,
+              deadline
+            )
+        end
 
       {:error, reason} ->
-        fail_accept(listen_socket, shepherd_port, reason)
+        fail_accept(listen_socket, shepherd_port, shepherd_monitor, reason)
     end
   end
 
-  defp fail_accept(listen_socket, shepherd_port, reason) do
+  # Use an asynchronous accept so socket readiness and port exit share one wait.
+  defp accept_or_shepherd_exit(listen_socket, port, port_monitor, deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      {:error, :shepherd_connect_timeout}
+    else
+      case :socket.accept(listen_socket, :nowait) do
+        {:ok, _conn} = ok ->
+          ok
+
+        {:select, select_info} ->
+          await_connection(listen_socket, port, port_monitor, deadline, select_info)
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+  end
+
+  defp await_connection(listen_socket, port, port_monitor, deadline, select_info) do
+    {:select_info, _tag, handle} = select_info
+    timeout = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:"$socket", ^listen_socket, :select, ^handle} ->
+        accept_or_shepherd_exit(listen_socket, port, port_monitor, deadline)
+
+      {:"$socket", ^listen_socket, :abort, {^handle, reason}} ->
+        {:error, {:accept_aborted, reason}}
+
+      {^port, {:exit_status, status}} ->
+        cancel_select(listen_socket, select_info)
+
+        shepherd_stopped(
+          listen_socket,
+          {port, {:exit_status, status}},
+          {:exit_status, status}
+        )
+
+      {:DOWN, ^port_monitor, :port, ^port, reason} ->
+        cancel_select(listen_socket, select_info)
+        shepherd_stopped(listen_socket, nil, reason)
+    after
+      timeout ->
+        cancel_select(listen_socket, select_info)
+        {:error, :shepherd_connect_timeout}
+    end
+  end
+
+  # Port exit and socket readiness come from different senders and can arrive
+  # out of order. Check the listener before reporting a spawn failure. Requeue
+  # the exit status if a connection is pending so Process can handle it.
+  defp shepherd_stopped(listen_socket, pending_message, reason) do
+    case :socket.accept(listen_socket, :nowait) do
+      {:ok, _conn} = ok ->
+        if pending_message, do: send(self(), pending_message)
+        ok
+
+      {:select, select_info} ->
+        cancel_select(listen_socket, select_info)
+        {:error, {:shepherd_spawn_failed, reason}}
+
+      {:error, _reason} ->
+        {:error, {:shepherd_spawn_failed, reason}}
+    end
+  end
+
+  defp cancel_select(listen_socket, select_info) do
+    :socket.cancel(listen_socket, select_info)
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp fail_accept(listen_socket, shepherd_port, shepherd_monitor, reason) do
+    Process.demonitor(shepherd_monitor, [:flush])
     safe_close_socket(listen_socket)
     safe_port_close(shepherd_port)
     {:error, reason}
@@ -255,8 +334,8 @@ defmodule NetRunner.Process.Exec do
   end
 
   @doc """
-  Validates spawn option *values*, raising `ArgumentError` on any malformed
-  one. Returns `opts`.
+  Parses spawn option values, raising `ArgumentError` on malformed input.
+  Returns normalized options.
 
   Called on the client by `NetRunner.Process.start/3` / `start_link/3`, so
   every entry point (`NetRunner.run/2`, `stream!/2`, `Daemon`, direct
@@ -269,8 +348,12 @@ defmodule NetRunner.Process.Exec do
     validate_stderr_mode!(Keyword.get(opts, :stderr, :consume), pty_mode)
     validate_stderr_tail_bytes!(Keyword.get(opts, :stderr_tail_bytes, 8_192))
     validate_cgroup_path!(Keyword.get(opts, :cgroup_path, nil))
-    validate_env!(Keyword.get(opts, :env, nil))
-    opts
+    validate_cwd!(Keyword.get(opts, :cwd, nil))
+
+    case normalize_env!(Keyword.get(opts, :env, nil)) do
+      nil -> Keyword.delete(opts, :env)
+      environment -> Keyword.put(opts, :env, environment)
+    end
   end
 
   # In PTY mode stderr is folded into the bidirectional master FD, so the
@@ -296,33 +379,83 @@ defmodule NetRunner.Process.Exec do
             "got: #{inspect(bytes)}"
   end
 
-  # Optional :env map: name => value sets, name => nil unsets. Names/values
-  # travel through Port.open's env: option as charlists; reject shapes that
-  # would corrupt the environment block.
-  defp validate_env!(nil), do: :ok
+  defp normalize_env!(nil), do: nil
 
-  defp validate_env!(env) when is_map(env) do
-    Enum.each(env, fn
-      {k, v} when is_binary(k) and (is_binary(v) or is_nil(v)) ->
-        cond do
-          k == "" or String.contains?(k, ["=", <<0>>]) ->
-            raise ArgumentError, ":env has an invalid variable name: #{inspect(k)}"
-
-          is_binary(v) and String.contains?(v, <<0>>) ->
-            raise ArgumentError, ":env value for #{k} must not contain NUL bytes"
-
-          true ->
-            :ok
-        end
-
-      {k, _v} ->
-        raise ArgumentError,
-              ":env entry #{inspect(k)} must map a binary name to a binary or nil"
-    end)
+  defp normalize_env!({:replace, environment}) do
+    {:replace, normalize_environment!(environment)}
   end
 
-  defp validate_env!(env) do
-    raise ArgumentError, ":env must be a map of names to binaries or nil, got: #{inspect(env)}"
+  defp normalize_env!({tag, _environment}) when is_atom(tag) do
+    raise ArgumentError,
+          ":env got #{inspect(tag)}, which is not an environment mode; " <>
+            "the only tagged form is {:replace, environment}"
+  end
+
+  defp normalize_env!(env), do: normalize_environment!(env)
+
+  defp normalize_environment!(environment)
+       when is_map(environment) and not is_struct(environment) do
+    normalize_env_entries!(Map.to_list(environment), %{})
+  end
+
+  defp normalize_environment!(environment) when is_list(environment) do
+    normalize_env_entries!(environment, %{})
+  end
+
+  defp normalize_environment!(environment) do
+    raise ArgumentError,
+          ":env must be a map or a list of {name, value} pairs, got: #{inspect(environment)}"
+  end
+
+  defp normalize_env_entries!([], environment), do: Map.to_list(environment)
+
+  defp normalize_env_entries!([{k, v} | rest], environment)
+       when is_binary(k) and (is_binary(v) or is_nil(v)) do
+    validate_env_name!(k)
+    validate_env_value!(k, v)
+    value = if v == "", do: nil, else: v
+    normalize_env_entries!(rest, Map.put(environment, k, value))
+  end
+
+  defp normalize_env_entries!([{k, _v} | _rest], _environment) do
+    raise ArgumentError,
+          ":env entry #{inspect(k)} must map a binary name to a binary or nil"
+  end
+
+  defp normalize_env_entries!([other | _rest], _environment) do
+    raise ArgumentError, ":env entry must be a {name, value} pair, got: #{inspect(other)}"
+  end
+
+  defp normalize_env_entries!(tail, _environment) do
+    raise ArgumentError, ":env must be a proper list, got tail: #{inspect(tail)}"
+  end
+
+  defp validate_env_name!(name) do
+    cond do
+      name == "" or String.contains?(name, ["=", <<0>>]) ->
+        raise ArgumentError, ":env has an invalid variable name: #{inspect(name)}"
+
+      not String.valid?(name) ->
+        raise ArgumentError, ":env variable name #{inspect(name)} must be UTF-8 text"
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_env_value!(_name, nil), do: :ok
+
+  defp validate_env_value!(name, value) do
+    cond do
+      String.contains?(value, <<0>>) ->
+        raise ArgumentError, ":env value for #{name} must not contain NUL bytes"
+
+      not String.valid?(value) ->
+        raise ArgumentError, ":env value for #{name} must be UTF-8 text"
+
+      true ->
+        :ok
+    end
   end
 
   defp validate_cgroup_path!(nil), do: :ok
@@ -347,6 +480,25 @@ defmodule NetRunner.Process.Exec do
       true ->
         :ok
     end
+  end
+
+  defp validate_cwd!(nil), do: :ok
+
+  defp validate_cwd!(cwd) when is_binary(cwd) do
+    cond do
+      cwd == "" ->
+        raise ArgumentError, ":cwd must not be empty"
+
+      String.contains?(cwd, <<0>>) ->
+        raise ArgumentError, ":cwd must not contain NUL bytes"
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_cwd!(other) do
+    raise ArgumentError, ":cwd must be a binary, got: #{inspect(other)}"
   end
 
   # Place the socket inside a 0700 directory so only the current user can
@@ -452,6 +604,7 @@ defmodule NetRunner.Process.Exec do
     pty_mode = Keyword.get(opts, :pty, false)
 
     cgroup_path = Keyword.get(opts, :cgroup_path, nil)
+    cwd = Keyword.get(opts, :cwd, nil)
 
     # --token-fd, not --token <hex>: argv is world-readable via
     # /proc/<pid>/cmdline (Linux) and same-uid readable via KERN_PROCARGS2
@@ -465,7 +618,12 @@ defmodule NetRunner.Process.Exec do
         do: shepherd_flags ++ ["--cgroup-path", to_string(cgroup_path)],
         else: shepherd_flags
 
-    port_args = [uds_path | shepherd_flags] ++ [cmd | args]
+    shepherd_flags = if cwd, do: shepherd_flags ++ ["--cwd", cwd], else: shepherd_flags
+
+    {environment_flags, port_environment} =
+      environment_options(Keyword.get(opts, :env, nil))
+
+    port_args = [uds_path | shepherd_flags ++ environment_flags] ++ [cmd | args]
 
     port_opts = [
       :nouse_stdio,
@@ -474,16 +632,16 @@ defmodule NetRunner.Process.Exec do
       args: port_args
     ]
 
-    port_opts =
-      case Keyword.get(opts, :env, nil) do
-        nil -> port_opts
-        env -> [{:env, format_env(env)} | port_opts]
-      end
+    port_opts = if port_environment, do: [{:env, port_environment} | port_opts], else: port_opts
 
     # Port.open raises (e.g. shepherd binary missing from priv). Convert to a
     # value so spawn_process's error path still reclaims the listener and the
     # bound socket file.
     port = Port.open({:spawn_executable, shepherd}, port_opts)
+
+    # Port.command/2 can exit its caller when the token write fails. Unlink
+    # first so accept_authenticated/5 can return the port's exit status.
+    Process.unlink(port)
     send_token(port, token)
     {:ok, port}
   rescue
@@ -499,15 +657,23 @@ defmodule NetRunner.Process.Exec do
     :error, :badarg -> :ok
   end
 
-  # Environment entries as raw byte lists: execve consumes bytes, and
-  # String.to_charlist/1 would (a) raise UnicodeConversionError on non-UTF-8
-  # values validate_env accepted and (b) transcode UTF-8 bytes to codepoints.
+  # Port environment entries are character lists. Byte lists double-encode UTF-8.
   defp format_env(env) do
     Enum.map(env, fn
-      {name, nil} -> {:binary.bin_to_list(name), false}
-      {name, value} -> {:binary.bin_to_list(name), :binary.bin_to_list(value)}
+      {name, nil} -> {String.to_charlist(name), false}
+      {name, value} -> {String.to_charlist(name), String.to_charlist(value)}
     end)
   end
+
+  defp environment_options(nil), do: {[], nil}
+
+  defp environment_options({:replace, environment}) do
+    kept_names = for {name, value} <- environment, value != nil, do: name
+    flags = ["--replace-env", Integer.to_string(length(kept_names)) | kept_names]
+    {flags, format_env(environment)}
+  end
+
+  defp environment_options(environment), do: {[], format_env(environment)}
 
   defp shepherd_executable do
     app_dir = :code.priv_dir(:net_runner)
