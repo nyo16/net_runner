@@ -33,6 +33,21 @@ defmodule NetRunner.DaemonTest do
       GenServer.stop(daemon)
     end
 
+    test "malformed :process_opts raise ArgumentError in the caller, not inside init/1" do
+      # Without client-side validation the raise happens in init/1, which
+      # surfaces as {:error, {%ArgumentError{}, _}} plus an exit signal into
+      # the linked caller — the shape every other entry point avoids.
+      assert_raise ArgumentError, ~r/stderr_tail_bytes/, fn ->
+        Daemon.start_link(cmd: "sleep", args: ["100"], process_opts: [stderr_tail_bytes: -1])
+      end
+
+      assert_raise ArgumentError, ~r/:bogus/, fn ->
+        Daemon.start_link(cmd: "sleep", args: ["100"], process_opts: [bogus: 1])
+      end
+
+      refute_receive {:EXIT, _, _}, 50
+    end
+
     test "write after child exit returns an error tuple" do
       {:ok, daemon} = Daemon.start_link(cmd: "cat", args: [])
       os_pid = Daemon.os_pid(daemon)

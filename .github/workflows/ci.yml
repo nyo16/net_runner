@@ -148,16 +148,19 @@ jobs:
       # Delegate a cgroup v2 subtree to the runner user so the positive-path
       # cgroup tests (test/cgroup_test.exs) exercise the privileged branch.
       # The shepherd hardcodes /sys/fs/cgroup/<path> and the Elixir side only
-      # accepts paths under net_runner/, so no env var is needed — just a
-      # writable net_runner/ subtree. Root cgroup.procs must also be writable
-      # to migrate a process across the common ancestor (cgroup v2 delegation
-      # containment rule).
+      # accepts paths under net_runner/, so just a writable net_runner/
+      # subtree is needed. Root cgroup.procs must also be writable to migrate
+      # a process across the common ancestor (cgroup v2 delegation
+      # containment rule). NR_CGROUP_DELEGATED=1 turns the tests' degraded
+      # (fail-closed) branch into a hard failure on this leg, so a delegation
+      # regression cannot pass as a green build with zero cgroup coverage.
       - name: Delegate cgroup v2 subtree for cgroup tests
         if: runner.os == 'Linux'
         run: |
           sudo mkdir -p /sys/fs/cgroup/net_runner
           sudo chown -R "$(whoami)" /sys/fs/cgroup/net_runner
           sudo chown "$(whoami)" /sys/fs/cgroup/cgroup.procs
+          echo "NR_CGROUP_DELEGATED=1" >> "$GITHUB_ENV"
       - run: mix test
 
   test-alpine:
@@ -165,6 +168,10 @@ jobs:
     runs-on: ubuntu-latest
     # Digest-pinned (alpine:3.22 at time of pinning); Dependabot does not scan
     # `container:` keys, so bump this digest manually when moving minors.
+    # No cgroup delegation here (the container has no writable cgroup v2
+    # tree): the cgroup tests run their fail-closed branch and log
+    # "[degraded]"; the Ubuntu leg above is the one that covers the positive
+    # path.
     container: alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
     env:
       WERROR: "1"

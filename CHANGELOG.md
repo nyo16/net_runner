@@ -10,7 +10,8 @@ Performance follow-up cycle (from the 2026-08-31 `/phx:perf` reports; numbers
 are medians on an Apple M1 Max, `MIX_ENV=prod`, harness under `bench/`).
 
 Audit-remediation cycle (2026-08-31 project-health audit, second pass: all 39
-remaining findings across shepherd/NIF, lib, tests, docs, and CI).
+remaining findings across shepherd/NIF, lib, tests, docs, and CI), followed by
+the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
 
 ### Security
 
@@ -20,17 +21,70 @@ remaining findings across shepherd/NIF, lib, tests, docs, and CI).
   `MSG_ERROR` instead of silently running the child unconfined. A
   pre-existing cgroup leaf directory is now fatal too (teardown would not be
   owned), and the directory is created `0700`.
+- **cgroup teardown requires `cgroup.kill`.** `cgroup_setup` probes the new
+  leaf's `cgroup.kill` (Linux ≥ 5.14) and fails the spawn closed when it is
+  not writable: without it the only kill vector is `kill(-pgid)`, which a
+  `setsid()` daemoniser escapes. The cleanup write is now checked and logged
+  instead of silently ignored.
 - **cgroup attach no longer races `execvp`.** The child blocks on a sync
   pipe after `fork` and only execs once the shepherd has migrated it into
   the cgroup — descendants can no longer escape limits or `cgroup.kill`
-  teardown. Non-cgroup spawns are byte-for-byte unchanged.
-- **Pid-reuse guard on direct kills.** `Nif.nif_kill` fallbacks in
-  `NetRunner.Process` and the Watcher probe only fire when the shepherd port
-  is dead; while the shepherd lives it holds the child as a zombie, making
-  it the only safe signaller.
+  teardown. The gate is not created for non-cgroup spawns; those pay only
+  the two `fcntl` calls that make the UDS nonblocking (see Fixed).
+- **Shepherd argv is `--`-terminated.** The BEAM emits `--` after its flags
+  so a command whose name starts with `-` (`"--cgroup-path"`,
+  `"--kill-timeout"`, `"--pty"`) can no longer be parsed as a shepherd option
+  and re-target the cgroup or stretch the kill ladder behind the API.
+- **Signal routing is probe-then-signal.** While the shepherd Port lives,
+  `CMD_KILL` over the UDS is the signaller (the shepherd holds the child as
+  a zombie, so the pid cannot be recycled). Once the Port is dead — or the
+  UDS send fails — `NetRunner.Process` probes `kill(pid, 0)` before
+  `nif_kill`. This narrows, but does not close, the window in which a
+  dropped `MSG_CHILD_EXITED` leaves a reaped pid looking live; the comments
+  now say so. The Watcher's port-liveness gate was removed: the Port is owned
+  by the GenServer whose death the Watcher handles, so it was always already
+  closed and the gate was a no-op.
 - **`nif_read` can no longer expose uninitialized heap.** The shrink of a
   >64 KiB read buffer now handles `enif_realloc_binary` failure with an
   alloc+copy fallback.
+
+### Fixed (review of the audit cycle)
+
+- **`kill/2` reports lost signals.** `send_shepherd_command` now returns
+  `:ok | {:error, reason}`; a `CMD_KILL` that cannot reach a live shepherd
+  falls back to the direct probe-and-kill, and `kill/2` returns
+  `{:error, :not_running}` when the probe finds no process instead of a
+  misleading `:ok`. `set_window_size/3` likewise surfaces a failed send.
+- **Bounded UDS waits everywhere in the shepherd.** `send_fds` shared the
+  `write_fully` design but restarted its 5 s window on every `EAGAIN`
+  wakeup; both now use one `wait_pollout` helper with a single absolute
+  deadline (lazily computed, so a first-try write never reads the clock) and
+  a hard poll cap when the monotonic clock is unavailable.
+- **Option validation really is uniform.** `NetRunner.Daemon.start_link/1`
+  validates `:process_opts` in the caller (via the new
+  `NetRunner.Process.validate_opts!/1`) instead of raising inside `init/1`
+  and exiting the linked caller; `:kill_timeout` is range-checked
+  (`1..60_000`) and `:cgroup_path` rejects NUL bytes and non-binaries, so a
+  bad value raises `ArgumentError` instead of a silent 10 s
+  `:shepherd_connect_timeout`.
+- **`NetRunner.Process.Protocol.kill/1`** rejects signal numbers outside
+  `1..255` instead of truncating them to one byte.
+- **macOS test flake.** Timeout tests built a `sleep` duration from
+  `System.unique_integer/1`, which crossed `INT32_MAX` late in a full run;
+  macOS `/bin/sleep` then exited 1 with a usage error. `sleep_marker/0` keeps
+  it in range.
+
+### Added (review of the audit cycle)
+
+- **`Stats.shepherd_error`** — a post-spawn `MSG_ERROR` from the shepherd is
+  now exposed via `NetRunner.Process.stats/1` rather than buried in server
+  state.
+- Tests: Watcher probe on an orphaned child, direct `kill/2` after shepherd
+  death, `Protocol` encoder byte layouts, post-spawn `MSG_ERROR` recording,
+  Daemon client-side validation, `:kill_timeout` validation, `--` terminator;
+  the PTY-resize test's sentinel no longer matches its own failure message.
+  On the delegated Linux CI leg `NR_CGROUP_DELEGATED=1` makes the cgroup
+  tests' fail-closed branch a hard failure.
 
 ### Fixed
 

@@ -215,10 +215,10 @@ defmodule NetRunnerTest do
     # Regression / sanity: on timeout, the OS process must be killed and
     # the GenServer stopped — no zombies left behind.
     test "timeout returns :timeout and cleans up" do
-      # High-entropy marker (still a valid sleep duration) so pgrep -f can
-      # never collide with another test's `sleep` argv or an unrelated
-      # process on the host.
-      marker = "86400#{System.unique_integer([:positive])}"
+      # High-entropy marker (still a valid sleep duration on every platform)
+      # so pgrep -f can never collide with another test's `sleep` argv or an
+      # unrelated process on the host.
+      marker = sleep_marker()
 
       for _ <- 1..5 do
         assert {:error, :timeout} =

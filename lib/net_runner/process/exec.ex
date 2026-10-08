@@ -10,6 +10,11 @@ defmodule NetRunner.Process.Exec do
   # diagnostic tail" turns into an unbounded-ish per-process buffer.
   @stderr_tail_bytes_max 1_048_576
 
+  # SIGTERM->SIGKILL escalation window forwarded to the shepherd as
+  # --kill-timeout; the max mirrors shepherd.c's argv check.
+  @default_kill_timeout_ms 5_000
+  @kill_timeout_max_ms 60_000
+
   @doc """
   Spawns a new OS process via the shepherd binary.
 
@@ -264,13 +269,27 @@ defmodule NetRunner.Process.Exec do
   errors and raise in the caller; `{:error, reason}` is reserved for runtime
   spawn failures.
   """
+  @spec validate_opts!(keyword()) :: keyword()
   def validate_opts!(opts) do
     pty_mode = Keyword.get(opts, :pty, false)
     validate_stderr_mode!(Keyword.get(opts, :stderr, :consume), pty_mode)
     validate_stderr_tail_bytes!(Keyword.get(opts, :stderr_tail_bytes, 8_192))
     validate_cgroup_path!(Keyword.get(opts, :cgroup_path, nil))
+    validate_kill_timeout!(Keyword.get(opts, :kill_timeout, @default_kill_timeout_ms))
     validate_env!(Keyword.get(opts, :env, nil))
     opts
+  end
+
+  # Mirrors the shepherd's own --kill-timeout check (1..60000). Anything else
+  # makes the shepherd exit before it ever connects, which the BEAM can only
+  # observe as a 10 s :shepherd_connect_timeout with the real reason on the
+  # VM's stderr — so reject it here where the caller can see it.
+  defp validate_kill_timeout!(ms) when is_integer(ms) and ms in 1..@kill_timeout_max_ms, do: :ok
+
+  defp validate_kill_timeout!(ms) do
+    raise ArgumentError,
+          ":kill_timeout must be an integer in 1..#{@kill_timeout_max_ms} (ms), " <>
+            "got: #{inspect(ms)}"
   end
 
   # In PTY mode stderr is folded into the bidirectional master FD, so the
@@ -327,26 +346,31 @@ defmodule NetRunner.Process.Exec do
 
   defp validate_cgroup_path!(nil), do: :ok
 
-  defp validate_cgroup_path!(path) do
-    path_str = to_string(path)
-
+  defp validate_cgroup_path!(path) when is_binary(path) do
     cond do
-      String.starts_with?(path_str, "/") ->
-        raise ArgumentError, ":cgroup_path must be relative, got: #{path_str}"
+      String.contains?(path, <<0>>) ->
+        raise ArgumentError, ":cgroup_path must not contain NUL bytes"
 
-      String.contains?(path_str, "..") ->
-        raise ArgumentError, ":cgroup_path cannot contain '..', got: #{path_str}"
+      String.starts_with?(path, "/") ->
+        raise ArgumentError, ":cgroup_path must be relative, got: #{path}"
 
-      byte_size(path_str) >= 256 ->
+      String.contains?(path, "..") ->
+        raise ArgumentError, ":cgroup_path cannot contain '..', got: #{path}"
+
+      byte_size(path) >= 256 ->
         raise ArgumentError, ":cgroup_path must be under 256 bytes"
 
-      not String.starts_with?(path_str, "net_runner/") or path_str == "net_runner/" ->
+      not String.starts_with?(path, "net_runner/") or path == "net_runner/" ->
         raise ArgumentError,
-              ":cgroup_path must sit under the net_runner/ prefix, got: #{path_str}"
+              ":cgroup_path must sit under the net_runner/ prefix, got: #{path}"
 
       true ->
         :ok
     end
+  end
+
+  defp validate_cgroup_path!(path) do
+    raise ArgumentError, ":cgroup_path must be a binary, got: #{inspect(path)}"
   end
 
   # Place the socket inside a 0700 directory so only the current user can
@@ -448,7 +472,7 @@ defmodule NetRunner.Process.Exec do
 
   defp open_shepherd(uds_path, token, cmd, args, opts) do
     shepherd = shepherd_executable()
-    kill_timeout = Keyword.get(opts, :kill_timeout, 5000)
+    kill_timeout = Keyword.get(opts, :kill_timeout, @default_kill_timeout_ms)
     pty_mode = Keyword.get(opts, :pty, false)
 
     cgroup_path = Keyword.get(opts, :cgroup_path, nil)
@@ -462,10 +486,12 @@ defmodule NetRunner.Process.Exec do
 
     shepherd_flags =
       if cgroup_path,
-        do: shepherd_flags ++ ["--cgroup-path", to_string(cgroup_path)],
+        do: shepherd_flags ++ ["--cgroup-path", cgroup_path],
         else: shepherd_flags
 
-    port_args = [uds_path | shepherd_flags] ++ [cmd | args]
+    # "--" ends shepherd option parsing: a cmd beginning with "-" must reach
+    # execvp verbatim, never be read as --cgroup-path/--kill-timeout/--pty.
+    port_args = [uds_path | shepherd_flags] ++ ["--", cmd | args]
 
     port_opts = [
       :nouse_stdio,

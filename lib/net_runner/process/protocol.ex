@@ -25,8 +25,10 @@ defmodule NetRunner.Process.Protocol do
 
   # --- BEAM -> shepherd command encoders ---
 
-  @doc "Encodes CMD_KILL for a resolved signal number."
-  def kill(sig_num) when is_integer(sig_num), do: <<@cmd_kill, sig_num::8>>
+  @doc "Encodes CMD_KILL for a resolved signal number (one byte on the wire)."
+  def kill(sig_num) when is_integer(sig_num) and sig_num in 1..255 do
+    <<@cmd_kill, sig_num::8>>
+  end
 
   @doc "Encodes CMD_CLOSE_STDIN."
   def close_stdin, do: <<@cmd_close_stdin>>

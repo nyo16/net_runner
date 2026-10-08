@@ -76,7 +76,7 @@ sides must therefore buffer:
 - The shepherd keeps a carry-over buffer across `poll()` iterations and
   dispatches per-opcode lengths (`command_length/1` in `shepherd.c`).
 - The BEAM keeps `State.uds_carry` and parses with
-  `NetRunner.Process.Exec.parse_uds_message/1`, retaining any unconsumed tail.
+  `NetRunner.Process.Protocol.parse_uds_message/1`, retaining any unconsumed tail.
 
 This is not theoretical. For a child that exits before the BEAM's `recvmsg`,
 the iov byte, `MSG_CHILD_STARTED` and `MSG_CHILD_EXITED` all coalesce into one

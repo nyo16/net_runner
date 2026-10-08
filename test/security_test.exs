@@ -89,6 +89,36 @@ defmodule NetRunner.SecurityTest do
     end
   end
 
+  describe ":kill_timeout validation" do
+    test "rejects values the shepherd would refuse, in the caller" do
+      # Out-of-range or non-integer values used to make the shepherd exit
+      # before connecting, visible only as a 10 s :shepherd_connect_timeout.
+      for bad <- [0, 60_001, 5000.0, "5000", nil] do
+        assert_raise ArgumentError, ~r/:kill_timeout/, fn ->
+          Proc.start("echo", ["x"], kill_timeout: bad)
+        end
+      end
+
+      {:ok, pid} = Proc.start("echo", ["x"], kill_timeout: 60_000)
+      assert {:ok, 0} = Proc.await_exit(pid)
+    end
+  end
+
+  describe "shepherd argv terminator" do
+    test "a command whose name starts with '-' is never parsed as a shepherd flag" do
+      # Before the "--" terminator, cmd: "--kill-timeout" consumed the next
+      # argv entry as a shepherd option and exec'd whatever followed. Now the
+      # shepherd must try to exec the literal "--kill-timeout" and fail (127).
+      assert {"", 127, stderr} =
+               NetRunner.run(["--kill-timeout", "1", "sh", "-c", "echo pwned"],
+                 stderr: :capture
+               )
+
+      assert stderr =~ "--kill-timeout"
+      refute stderr =~ "pwned"
+    end
+  end
+
   describe "UDS base directory (SEC-5)" do
     test "lives in a 0700 directory owned by us" do
       # Force at least one spawn so the base dir exists.

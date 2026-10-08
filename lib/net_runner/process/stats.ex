@@ -12,7 +12,8 @@ defmodule NetRunner.Process.Stats do
             duration_ms: nil,
             read_count: 0,
             write_count: 0,
-            exit_status: nil
+            exit_status: nil,
+            shepherd_error: nil
 
   @typedoc """
   Per-process counters.
@@ -24,6 +25,9 @@ defmodule NetRunner.Process.Stats do
     * `:duration_ms` — set on exit: wall time from spawn to exit status
     * `:read_count` / `:write_count` — number of `read(2)`/`write(2)` calls
     * `:exit_status` — set on exit
+    * `:shepherd_error` — most recent post-spawn `MSG_ERROR` diagnostic from
+      the shepherd (`nil` when none was reported). Spawn-stage errors never
+      reach here: they fail the spawn with `{:error, {:shepherd_error, msg}}`.
   """
   @type t :: %__MODULE__{
           bytes_in: non_neg_integer(),
@@ -33,7 +37,8 @@ defmodule NetRunner.Process.Stats do
           duration_ms: non_neg_integer() | nil,
           read_count: non_neg_integer(),
           write_count: non_neg_integer(),
-          exit_status: non_neg_integer() | nil
+          exit_status: non_neg_integer() | nil,
+          shepherd_error: binary() | nil
         }
 
   def new do
@@ -56,6 +61,10 @@ defmodule NetRunner.Process.Stats do
   # `write_count` means.
   def record_write(%__MODULE__{} = stats, bytes, count \\ 1) do
     %{stats | bytes_in: stats.bytes_in + bytes, write_count: stats.write_count + count}
+  end
+
+  def record_shepherd_error(%__MODULE__{} = stats, msg) when is_binary(msg) do
+    %{stats | shepherd_error: msg}
   end
 
   def finalize(%__MODULE__{} = stats, exit_status) do
