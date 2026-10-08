@@ -33,6 +33,13 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
+      # Run this before any other build step. Later steps build into priv/, and
+      # a stray write there would then go unnoticed.
+      - name: Build into another PRIV_DIR, leaving the tree unchanged
+        run: |
+          make all PRIV_DIR="$RUNNER_TEMP/priv"
+          test -z "$(git status --porcelain --ignored -- c_src priv)"
+
       - name: Cache deps & build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -181,6 +188,13 @@ jobs:
       - run: mix deps.compile
       - run: mix compile
       - run: mix test
+
+      - name: Link the shepherd as a static PIE
+        run: |
+          make all SHEPHERD_STATIC=1 PRIV_DIR=/tmp/static
+          readelf -h /tmp/static/shepherd | grep -q 'DYN'
+          if readelf -l /tmp/static/shepherd | grep -q INTERP; then exit 1; fi
+          /tmp/static/shepherd 2>&1 | grep -q '^usage: shepherd'
 
   deps-latest:
     # Simulates consumer dependency resolution: throw away the lockfile and
