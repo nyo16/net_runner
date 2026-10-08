@@ -24,12 +24,11 @@ defmodule NetRunner.CgroupTest do
         {:error, reason} ->
           # Fail-closed contract: a cgroup the caller asked for but cannot
           # have must fail the spawn with the shepherd's diagnostic, never
-          # degrade silently. Visible marker so a CI leg where the positive
-          # path silently stopped executing can be spotted in the log.
+          # degrade silently.
           assert match?({:shepherd_error, _}, reason),
                  "expected a shepherd MSG_ERROR, got: #{inspect(reason)}"
 
-          IO.puts("[degraded] cgroup plumbing test ran fail-closed path: #{inspect(reason)}")
+          degraded("cgroup plumbing test ran the fail-closed path: #{inspect(reason)}")
       end
     end
 
@@ -57,7 +56,20 @@ defmodule NetRunner.CgroupTest do
         {:error, reason} ->
           # No cgroup v2 write access at all in this environment; the
           # validation plumbing is covered by the test above.
-          IO.puts("[degraded] cgroup fail-closed test skipped: mkdir #{full}: #{inspect(reason)}")
+          degraded("cgroup fail-closed test skipped: mkdir #{full}: #{inspect(reason)}")
+      end
+    end
+
+    # A cgroup positive path that silently stops executing would leave a green
+    # build with zero cgroup coverage. CI sets NR_CGROUP_DELEGATED=1 on the leg
+    # that delegates /sys/fs/cgroup/net_runner, so there the degraded branch is
+    # a hard failure; elsewhere it is a logged, expected downgrade.
+    defp degraded(message) do
+      if System.get_env("NR_CGROUP_DELEGATED") == "1" do
+        flunk("cgroup positive path did not run on a delegated CI leg: " <> message)
+      else
+        require Logger
+        Logger.warning("[degraded] " <> message)
       end
     end
 
@@ -95,6 +107,16 @@ defmodule NetRunner.CgroupTest do
 
       assert_raise ArgumentError, ~r/256/, fn ->
         Proc.start("echo", ["x"], cgroup_path: long)
+      end
+    end
+
+    test "rejects NUL bytes and non-binary paths before they reach the shepherd argv" do
+      assert_raise ArgumentError, ~r/NUL/, fn ->
+        Proc.start("echo", ["x"], cgroup_path: "net_runner/a\0b")
+      end
+
+      assert_raise ArgumentError, ~r/must be a binary/, fn ->
+        Proc.start("echo", ["x"], cgroup_path: :"net_runner/atom")
       end
     end
   end

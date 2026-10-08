@@ -174,15 +174,21 @@ When `pty: true` is passed:
 
 ## cgroup Support (Linux Only)
 
-When `cgroup_path:` is set (must sit under a `net_runner/` prefix, < 256
-bytes):
-- Shepherd creates `/sys/fs/cgroup/{path}` and records whether *it* created
-  the directory
-- Moves child PID to `cgroup.procs`
-- On cleanup — only for a directory it created itself — writes `1` to
-  `cgroup.kill` and removes the directory; a pre-existing directory is left
-  untouched
-- No-op on macOS/BSD
+When `cgroup_path:` is set (a binary under the `net_runner/` prefix, < 256
+bytes, no NUL):
+- Shepherd creates `/sys/fs/cgroup/{path}` (`mkdir 0700`). A pre-existing
+  directory is a spawn error — `{:error, {:shepherd_error, "cgroup_setup: …
+  already exists; teardown would not be owned"}}` — because the shepherd only
+  tears down what it created
+- Requires `cgroup.kill` (Linux ≥ 5.14) to be writable in the new leaf;
+  otherwise the spawn fails closed, since without it descendants that leave
+  the child's process group could outlive teardown
+- Moves the child PID to `cgroup.procs` *before* the child `execvp`s (the
+  child blocks on a sync pipe until the migration is confirmed); any
+  migration failure fails the spawn with the shepherd's diagnostic
+- On cleanup writes `1` to `cgroup.kill` (failure is logged to the
+  shepherd's stderr) and removes the directory
+- No-op on macOS/BSD: the option is accepted and the child runs unconfined
 
 ## Parallelism Model
 

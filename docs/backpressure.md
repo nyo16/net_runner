@@ -99,6 +99,16 @@ bigger buffer cuts round trips per MiB by ~16x. Reads still happen 64 KB at a
 time (`@default_read_size`, sized to the NIF's stack fast path) — a saturated
 1 MB pipe simply drains over ~16 consecutive reads.
 
+The growth is charged against the per-user pipe-buffer budget,
+`/proc/sys/fs/pipe-user-pages-soft` (default 16384 pages = 64 MiB). Each
+pipe-mode spawn grows three pipes (stdin, stdout, stderr) = 768 pages, so
+roughly 21 concurrent commands exhaust the soft limit; past it the kernel
+refuses `F_SETPIPE_SZ` with `EPERM` (silently accepted by the shepherd) and
+new pipes fall back to the 64 KB default — the same per-chunk round-trip cost
+as macOS, not a correctness problem. `[unmeasured]` The threshold is derived
+from the kernel defaults, not yet observed; see the concurrency row in
+`bench/LINUX_VERIFICATION.md`.
+
 When the Elixir consumer stops reading:
 1. OS pipe buffer fills up
 2. Child's `write()` call blocks (kernel-level backpressure)
