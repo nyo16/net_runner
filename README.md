@@ -338,7 +338,7 @@ Isolate child processes in a cgroup v2 hierarchy for resource control:
 )
 ```
 
-The shepherd creates the cgroup directory, moves the child into it, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the directory). No-op on macOS.
+The shepherd creates the cgroup directory, moves the child into it *before* `execvp`, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the directory). Spawns fail closed with `{:error, {:shepherd_error, msg}}` when the cgroup cannot be created, the leaf already exists, the migration is refused, or `cgroup.kill` (Linux ≥ 5.14) is unavailable. No-op on macOS.
 
 ## Command DSL
 

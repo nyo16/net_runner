@@ -110,6 +110,35 @@ defmodule NetRunner.ExitStatusTest do
     end
   end
 
+  describe "post-spawn MSG_ERROR" do
+    import ExUnit.CaptureLog
+
+    test "is recorded in stats as :shepherd_error" do
+      # The current shepherd only emits MSG_ERROR before the fd handshake, so
+      # the post-spawn path is driven by injecting the frame into the UDS
+      # carry and waking the drain the same way a readiness message would.
+      {:ok, pid} = Proc.start("sleep", ["100"])
+      assert Proc.stats(pid).shepherd_error == nil
+
+      msg = "cgroup_cleanup: write to cgroup.kill failed"
+      frame = <<0x82, byte_size(msg)::big-unsigned-16, msg::binary>>
+      %{uds_socket: socket} = :sys.get_state(pid)
+
+      log =
+        capture_log(fn ->
+          :sys.replace_state(pid, &%{&1 | uds_carry: &1.uds_carry <> frame})
+          send(pid, {:"$socket", socket, :select, make_ref()})
+          assert Proc.stats(pid).shepherd_error == msg
+        end)
+
+      assert log =~ "shepherd reported error"
+      assert Proc.alive?(pid)
+
+      Proc.kill(pid, :sigkill)
+      Proc.await_exit(pid)
+    end
+  end
+
   # The wire path of a spawn-stage shepherd failure: the shepherd replaces the
   # expected SCM_RIGHTS payload with a bare MSG_ERROR frame on the UDS. A real
   # socket pair (not a parse-level call) covers receive_fds's recvmsg path and

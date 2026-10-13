@@ -32,19 +32,24 @@ defmodule NetRunner.TeardownTest do
       proc = :sys.get_state(daemon).proc
       eventually(fn -> assert Proc.stats(proc).bytes_out > 5_000_000 end, 10_000)
 
-      # Sample only the tasks THIS daemon owns (its monitors: two drain tasks
-      # and the stdin forwarder). Enumerating all of the globally shared
-      # NetRunner.TaskSupervisor under async: true asserted on sibling tests'
-      # tasks — and `stacks != []` could pass on a sibling's task even with
-      # this daemon's drain dead.
+      # Sample only the drain tasks THIS daemon owns. Enumerating all of the
+      # globally shared NetRunner.TaskSupervisor under async: true asserted on
+      # sibling tests' tasks. The daemon also monitors its stdin forwarder,
+      # which must be excluded: otherwise `stacks != []` would hold with both
+      # drain tasks dead.
+      %{forwarder: forwarder} = :sys.get_state(daemon)
       {:monitors, monitors} = Process.info(daemon, :monitors)
 
       stacks =
-        Enum.flat_map(monitors, fn {:process, pid} ->
-          case Process.info(pid, :stack_size) do
-            {:stack_size, size} -> [size]
-            nil -> []
-          end
+        Enum.flat_map(monitors, fn
+          {:process, pid} when is_pid(pid) and pid != forwarder ->
+            case Process.info(pid, :stack_size) do
+              {:stack_size, size} -> [size]
+              nil -> []
+            end
+
+          _ ->
+            []
         end)
 
       assert stacks != [], "expected at least one live drain task"

@@ -47,15 +47,40 @@ defmodule NetRunner.Daemon do
 
   @daemon_opts [:cmd, :args, :on_output, :process_opts]
 
+  @doc """
+  Starts a supervised daemon. Options: `:cmd` (required), `:args`,
+  `:on_output` (see `t:on_output/0`), `:process_opts` (forwarded to
+  `NetRunner.Process.start_link/3`; `:stderr` is forced to `:disabled`), and
+  `:name`. Malformed options raise `ArgumentError` in the caller.
+  """
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     {gen_opts, daemon_opts} = Keyword.split(opts, [:name])
-    # Validate on the client so a misspelt option raises in the caller
-    # instead of surfacing as a supervisor start_link failure.
+    # Validate on the client — both the Daemon's own keys and the wrapped
+    # :process_opts — so a malformed option raises ArgumentError in the
+    # caller instead of surfacing as a supervisor start_link failure (and an
+    # exit signal into a non-trapping caller) from inside init/1.
     daemon_opts = Keyword.validate!(daemon_opts, @daemon_opts)
+    daemon_opts |> process_opts() |> Proc.validate_opts!()
     GenServer.start_link(__MODULE__, daemon_opts, gen_opts)
   end
 
+  # Force stderr: :disabled so the underlying Process does NOT start its own
+  # internal stderr consumer. The Daemon's own drain task is then the sole
+  # reader of the stderr pipe, so on_output receives the full stream in
+  # order rather than racing the internal consumer for chunks.
+  defp process_opts(daemon_opts) do
+    daemon_opts
+    |> Keyword.get(:process_opts, [])
+    |> Keyword.put(:stderr, :disabled)
+  end
+
+  @doc "OS pid of the child, answered from Daemon state (no hop into the Process)."
+  @spec os_pid(GenServer.server()) :: non_neg_integer() | nil
   def os_pid(daemon), do: GenServer.call(daemon, :os_pid)
+
+  @doc "Whether the underlying `NetRunner.Process` reports its child as still running."
+  @spec alive?(GenServer.server()) :: boolean()
   def alive?(daemon), do: GenServer.call(daemon, :alive?)
 
   @doc """
@@ -86,16 +111,7 @@ defmodule NetRunner.Daemon do
     # a message instead of silently killing the Daemon without terminate/2.
     Process.flag(:trap_exit, true)
 
-    # Force stderr: :disabled so the underlying Process does NOT start its own
-    # internal stderr consumer. The Daemon's own drain task (below) is then the
-    # sole reader of the stderr pipe, so on_output receives the full stream in
-    # order rather than racing the internal consumer for chunks.
-    process_opts =
-      opts
-      |> Keyword.get(:process_opts, [])
-      |> Keyword.put(:stderr, :disabled)
-
-    case Proc.start_link(cmd, args, process_opts) do
+    case Proc.start_link(cmd, args, process_opts(opts)) do
       {:ok, proc} ->
         # Start drain tasks. The stdout drain also awaits the exit status
         # after EOF, so its completion is the "child exited" signal.

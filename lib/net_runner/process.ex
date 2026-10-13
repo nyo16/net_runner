@@ -102,10 +102,13 @@ defmodule NetRunner.Process do
     GenServer.start(__MODULE__, {cmd, args, opts}, gen_opts)
   end
 
-  # Client-side option validation: unknown keys (Keyword.validate!) and bad
-  # option values (Exec.validate_opts!) raise ArgumentError in the caller —
-  # one convention for every entry point — rather than poisoning init/1.
-  defp validate_opts!(opts) do
+  @doc """
+  Validates spawn options as `start_link/3` does — unknown keys and bad
+  values raise `ArgumentError` — and returns them. Exposed so wrappers such
+  as `NetRunner.Daemon` can fail in their caller instead of inside `init/1`.
+  """
+  @spec validate_opts!(keyword()) :: keyword()
+  def validate_opts!(opts) do
     opts
     |> Keyword.validate!(@process_opts)
     |> Exec.validate_opts!()
@@ -355,7 +358,7 @@ defmodule NetRunner.Process do
         # once the exit status is delivered the Watcher is told to stand down,
         # so it can never signal a reused OS pid after the child was reaped.
         watcher =
-          case NetRunner.Watcher.watch(self(), state.os_pid, state.shepherd_port) do
+          case NetRunner.Watcher.watch(self(), state.os_pid) do
             {:ok, pid} -> pid
             _ -> nil
           end
@@ -456,7 +459,7 @@ defmodule NetRunner.Process do
       end
 
     # Also tell shepherd to close its copy
-    send_shepherd_command(state, Protocol.close_stdin())
+    _ = send_shepherd_command(state, Protocol.close_stdin())
 
     # Fail parked writes eagerly: an EAGAIN-parked writer registered select
     # on the resource that was just closed, so no readiness event will ever
@@ -473,22 +476,16 @@ defmodule NetRunner.Process do
     {:reply, {:error, :not_running}, state}
   end
 
+  def handle_call({:kill, _signal}, _from, %{os_pid: nil} = state) do
+    {:reply, {:error, :no_pid}, state}
+  end
+
   def handle_call({:kill, signal}, _from, state) do
-    case Signal.resolve(signal) do
-      {:ok, sig_num} ->
-        if state.os_pid do
-          # Send through shepherd protocol for process group kill
-          send_shepherd_command(state, Protocol.kill(sig_num))
-
-          maybe_direct_kill(state, sig_num)
-
-          {:reply, :ok, maybe_mark_exiting(state, signal)}
-        else
-          {:reply, {:error, :no_pid}, state}
-        end
-
-      {:error, _} = error ->
-        {:reply, error, state}
+    with {:ok, sig_num} <- Signal.resolve(signal),
+         :ok <- signal_child(state, sig_num) do
+      {:reply, :ok, maybe_mark_exiting(state, signal)}
+    else
+      {:error, _} = error -> {:reply, error, state}
     end
   end
 
@@ -517,8 +514,7 @@ defmodule NetRunner.Process do
   end
 
   def handle_call({:set_window_size, rows, cols}, _from, state) do
-    send_shepherd_command(state, Protocol.set_winsize(rows, cols))
-    {:reply, :ok, state}
+    {:reply, send_shepherd_command(state, Protocol.set_winsize(rows, cols)), state}
   end
 
   def handle_call({:set_owner, owner}, _from, state) do
@@ -660,27 +656,42 @@ defmodule NetRunner.Process do
   defp on_owner_down(state) do
     if state.os_pid do
       case Signal.resolve(:sigkill) do
-        {:ok, sig_num} ->
-          send_shepherd_command(state, Protocol.kill(sig_num))
-
-          maybe_direct_kill(state, sig_num)
-
-        _ ->
-          :ok
+        {:ok, sig_num} -> signal_child(state, sig_num)
+        _ -> :ok
       end
     end
 
     {:stop, :normal, state}
   end
 
-  # The shepherd owns the reap, so while it lives it is the only safe
-  # signaller: it holds the child as a zombie until waitpid, so the pid
-  # cannot be recycled while CMD_KILL is serviceable. Only when the shepherd
-  # is gone (child orphaned and un-reaped — pid still not recyclable) does
-  # the direct NIF kill take over.
-  defp maybe_direct_kill(state, sig_num) do
-    unless shepherd_alive?(state) do
+  # Signal routing. The shepherd owns the reap, so while it lives it is the
+  # one party that can signal the child without racing OS pid reuse: it
+  # holds the child as a zombie until waitpid, so CMD_KILL over the UDS is
+  # the primary path. If the UDS send fails while the shepherd lives, the
+  # direct kill is still safe for the same reason.
+  #
+  # Once the shepherd Port is dead the pid IS recyclable: an orphaned child
+  # is reaped by PID 1 the moment it exits, and a MSG_CHILD_EXITED the
+  # shepherd failed to deliver (write_fully drops frames on POLLOUT timeout)
+  # leaves `status: :running` until the force-exit backstop fires. The
+  # direct path therefore probes first. That narrows the exposure to the
+  # microseconds between kill(pid, 0) and kill(pid, sig); it cannot close it.
+  defp signal_child(state, sig_num) do
+    if shepherd_alive?(state) do
+      case send_shepherd_command(state, Protocol.kill(sig_num)) do
+        :ok -> :ok
+        {:error, _reason} -> direct_kill(state, sig_num)
+      end
+    else
+      direct_kill(state, sig_num)
+    end
+  end
+
+  defp direct_kill(state, sig_num) do
+    if Nif.nif_is_os_pid_alive(state.os_pid) do
       Nif.nif_kill(state.os_pid, sig_num)
+    else
+      {:error, :not_running}
     end
   end
 
@@ -1109,16 +1120,26 @@ defmodule NetRunner.Process do
     %{state | stderr_tail: tail, stats: Stats.record_read_stderr(state.stats, bytes)}
   end
 
+  # `:ok` only when the whole frame reached the shepherd's socket buffer.
+  # Callers that must guarantee delivery (kill) fall back on failure; the
+  # best-effort ones (close_stdin) ignore the result.
+  defp send_shepherd_command(%{uds_socket: nil}, _command), do: {:error, :no_uds}
+
   defp send_shepherd_command(state, command) do
-    if state.uds_socket do
-      :socket.send(state.uds_socket, command)
+    case :socket.send(state.uds_socket, command) do
+      :ok -> :ok
+      {:ok, _rest} -> {:error, :partial_send}
+      {:error, {reason, _rest}} -> {:error, reason}
+      {:error, _} = error -> error
     end
   end
 
-  # A live shepherd port means a live shepherd: it still holds the child as
+  # A live shepherd Port means a live shepherd: it still holds the child as
   # a zombie until waitpid, so the OS pid cannot be recycled and CMD_KILL
-  # over the UDS is the safe signalling path. Direct NIF kills must wait
-  # until this is false — the BEAM has no reap authority over the pid.
+  # over the UDS is the preferred signalling path. Inside this GenServer the
+  # Port only dies when the shepherd exits (see the {port, {:exit_status, _}}
+  # clause), so the test is sound here — unlike in the Watcher, which runs
+  # after this process (and with it the Port) is already gone.
   defp shepherd_alive?(state) do
     is_port(state.shepherd_port) and Port.info(state.shepherd_port) != nil
   end
@@ -1202,9 +1223,8 @@ defmodule NetRunner.Process do
     require Logger
 
     Logger.warning("[NetRunner] shepherd reported error: #{inspect(msg)}")
-    # Recorded (not just logged) so a caller inspecting the server after a
-    # degraded spawn can see what the shepherd reported.
-    %{state | last_shepherd_error: msg}
+    # Recorded, not just logged: `stats/1` exposes it as `:shepherd_error`.
+    %{state | stats: Stats.record_shepherd_error(state.stats, msg)}
   end
 
   defp finish_exit(state, exit_status) do

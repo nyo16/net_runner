@@ -57,7 +57,7 @@ defmodule NetRunner.IOPipeliningTest do
     # The escape hatch must survive the concurrent writer: the writer task is
     # now live on the timeout branch and has to be torn down with the reader.
     test "still returns {:error, :timeout} and reaps the OS process" do
-      marker = "86400#{System.unique_integer([:positive])}"
+      marker = sleep_marker()
       payload = :binary.copy(<<?x>>, 4_194_304)
 
       # Drains stdin fully (so the writer finishes) and then refuses to exit.
@@ -71,7 +71,7 @@ defmodule NetRunner.IOPipeliningTest do
     end
 
     test "times out even while the writer is still blocked on a full stdin pipe" do
-      marker = "86400#{System.unique_integer([:positive])}"
+      marker = sleep_marker()
       payload = :binary.copy(<<?x>>, 4_194_304)
 
       # Never reads stdin, so the writer parks in Proc.write for the whole run.

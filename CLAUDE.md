@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 mix deps.get              # Fetch dependencies
 mix compile               # Compile Elixir + C code (via elixir_make)
-mix test                  # Run full test suite (47 tests)
+mix test                  # Run full test suite (~250 tests)
 mix test test/process_test.exs          # Run a single test file
 mix test test/process_test.exs:10       # Run a single test at line
 mix format                # Auto-format code
@@ -34,7 +34,7 @@ NetRunner is a safe OS process execution library for Elixir with NIF-based backp
 
 1. **Shepherd** — detects BEAM death (POLLHUP on UDS), kills child process group
 2. **Watcher GenServer** — monitors Process GenServer, kills OS process on DOWN
-3. **NIF destructor** — closes FDs on garbage collection
+3. **NIF owner monitor** — `io_resource_down` closes FDs when the owning process dies (the destructor only runs for resources with no live `enif_select`)
 
 ### Spawn Sequence
 
@@ -49,7 +49,8 @@ NetRunner is a safe OS process execution library for Elixir with NIF-based backp
 - `NetRunner` — top-level API (`run/2`, `stream!/2`, `stream/2`)
 - `NetRunner.Process` — GenServer owning the OS process lifecycle
 - `NetRunner.Process.Exec` — spawn logic (UDS, Port, SCM_RIGHTS, Pipe creation)
-- `NetRunner.Process.Nif` — NIF stubs (`nif_read`, `nif_write`, `nif_close`, `nif_create_fd`, `nif_kill`)
+- `NetRunner.Nif` — NIF stubs (`nif_read`, `nif_write`, `nif_close`, `nif_create_fd`, `nif_kill`)
+- `NetRunner.Process.Protocol` — shepherd wire protocol: frame constants, parser, command encoders
 - `NetRunner.Process.Pipe` — struct wrapping a NIF resource with owner/type metadata
 - `NetRunner.Process.Operations` — pending operation queue (park on EAGAIN, retry on select)
 - `NetRunner.Stream` — `Stream.resource` wrapper with concurrent input writer Task

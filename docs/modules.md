@@ -9,7 +9,7 @@ graph TD
     P --> ST[Process.State]
     P --> OP[Process.Operations]
     P --> PI[Process.Pipe]
-    P --> NI[Process.Nif]
+    P --> NI[NetRunner.Nif]
     P --> SIG[NetRunner.Signal]
     P --> STATS[Process.Stats]
     EX --> NI
@@ -53,7 +53,8 @@ graph TD
 | Module | Purpose |
 |--------|---------|
 | NetRunner.Process.Exec | Process spawning: UDS, Port.open, SCM\_RIGHTS, FD wrapping |
-| NetRunner.Process.Nif | NIF function stubs (@on\_load :load\_nifs) |
+| NetRunner.Nif | NIF function stubs (@on\_load :load\_nifs) |
+| NetRunner.Process.Protocol | Shepherd wire protocol: constants, frame parser, command encoders |
 | NetRunner.Process.Pipe | Pipe struct wrapping a NIF FD resource |
 | NetRunner.Process.State | GenServer state struct |
 | NetRunner.Process.Operations | Pending operation queue (park on EAGAIN, retry on ready) |

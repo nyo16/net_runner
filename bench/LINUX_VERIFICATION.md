@@ -243,6 +243,8 @@ OTP 29 / erts 17.0.3, `MIX_ENV=prod`:
 | stdin round trip, 16 MiB via `cat` | `run/2` 1002–1163 MB/s vs `stream!/2` 1074–1130 | 1 MiB pipes mean fewer round trips; both should rise together |
 | stderr drain | 928–978 MB/s | 1 MiB stderr pipe → a drain pass is more likely to hit the 16-chunk budget and use the `:consume_stderr_more` resume path (see below) |
 | spawn | 4.4–7.2 ms | Linux `posix_spawn`/`vfork` is usually faster than macOS |
+| spawn with `cgroup_path:` | n/a (macOS no-op) | `cgroup_setup` (mkdir + `cgroup.procs` write on cgroupfs) now runs *before* the child's `execvp`, gated by a sync pipe. Run `spawn_breakdown.exs` with and without `cgroup_path:` on a delegated subtree and record the delta here |
+| ≥32 concurrent 64 MiB `stream!/2` reads | n/a (64 KiB pipes regardless) | `pipe-user-pages-soft` (default 64 MiB) is exhausted by ~21 concurrent 3×1 MiB spawns; later pipes fall back to 64 KiB. Compare the per-stream chunk count (`Proc.stats/1` `read_count`) at 1, 16 and 32 concurrent streams — a ≥10× jump between 16 and 32 confirms the cliff. Chunk counts are structural, so no median/variance discipline is needed |
 
 ### One Linux-specific behaviour to watch
 

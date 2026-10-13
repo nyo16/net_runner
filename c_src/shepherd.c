@@ -100,6 +100,52 @@ static int64_t monotonic_ms(void) {
 #define UDS_WRITE_TIMEOUT_MS 5000
 
 /*
+ * Absolute deadline for one bounded POLLOUT wait, initialised lazily so a
+ * write that succeeds on the first attempt never reads the clock.
+ *   at == -2  unset
+ *   at == -1  monotonic clock unavailable; `polls` caps the wait instead
+ *   at >=  0  monotonic_ms() value to stop at
+ */
+struct write_deadline {
+    int64_t at;
+    int polls;
+};
+#define WRITE_DEADLINE_INIT {-2, 0}
+
+/* Without a clock each poll() is a full timeout_ms, so this caps the total
+ * wait at NOCLOCK_MAX_POLLS * timeout_ms regardless of how often the peer
+ * frees a byte or a signal interrupts us. */
+#define NOCLOCK_MAX_POLLS 4
+
+/*
+ * Wait until fd is writable or the deadline passes. Returns 0 when
+ * writable, -1 on timeout or error. Every EAGAIN/EINTR wakeup re-derives
+ * the remaining budget from the same deadline, so a peer that frees one
+ * byte per timeout cannot extend the wait indefinitely.
+ */
+static int wait_pollout(int fd, struct write_deadline *dl, int timeout_ms) {
+    if (dl->at == -2) {
+        int64_t now = monotonic_ms();
+        dl->at = (now < 0) ? -1 : now + timeout_ms;
+    }
+    for (;;) {
+        int wait_ms = timeout_ms;
+        if (dl->at >= 0) {
+            int64_t now = monotonic_ms();
+            if (now < 0 || now >= dl->at) return -1;
+            wait_ms = (int)(dl->at - now);
+        } else if (dl->polls++ >= NOCLOCK_MAX_POLLS) {
+            return -1;
+        }
+        struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+        int pret = poll(&pfd, 1, wait_ms);
+        if (pret > 0) return 0;
+        if (pret < 0 && errno == EINTR) continue;
+        return -1; /* timeout, or poll error */
+    }
+}
+
+/*
  * Write all of buf to the non-blocking UDS, polling POLLOUT for up to
  * timeout_ms before giving up. Returns 0 on success, -1 on error/timeout.
  *
@@ -114,8 +160,7 @@ static int64_t monotonic_ms(void) {
  */
 static int write_fully(int fd, const uint8_t *buf, size_t len,
                        int timeout_ms) {
-    int64_t now = monotonic_ms();
-    int64_t deadline = (now < 0) ? -1 : now + timeout_ms;
+    struct write_deadline dl = WRITE_DEADLINE_INIT;
     size_t written = 0;
 
     while (written < len) {
@@ -126,16 +171,8 @@ static int write_fully(int fd, const uint8_t *buf, size_t len,
         }
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            int wait_ms = timeout_ms;
-            if (deadline >= 0) {
-                now = monotonic_ms();
-                if (now < 0 || now >= deadline) return -1;
-                wait_ms = (int)(deadline - now);
-            }
-            struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
-            int pret = poll(&pfd, 1, wait_ms);
-            if (pret < 0 && errno != EINTR) return -1;
-            if (pret == 0) return -1; /* peer not draining: drop the frame */
+            /* peer not draining within the deadline: drop the frame */
+            if (wait_pollout(fd, &dl, timeout_ms) < 0) return -1;
             continue;
         }
         return -1;
@@ -175,8 +212,10 @@ static int send_fds(int uds_fd, int *fds, int nfds) {
     cmsg->cmsg_len = CMSG_LEN((size_t)nfds * sizeof(int));
     memcpy(CMSG_DATA(cmsg), fds, (size_t)nfds * sizeof(int));
 
-    /* Retry on EINTR; wait (bounded) for buffer space on EAGAIN — the UDS
-     * is non-blocking. Anything else, or a partial send, is an error. */
+    /* Retry on EINTR; wait (bounded by one shared deadline) for buffer
+     * space on EAGAIN — the UDS is non-blocking. Anything else, or a
+     * partial send, is an error. */
+    struct write_deadline dl = WRITE_DEADLINE_INIT;
     for (;;) {
         ssize_t ret = sendmsg(uds_fd, &msg, 0);
         if (ret == 1) {
@@ -185,10 +224,7 @@ static int send_fds(int uds_fd, int *fds, int nfds) {
         }
         if (ret < 0 && errno == EINTR) continue;
         if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            struct pollfd pfd = {.fd = uds_fd, .events = POLLOUT,
-                                 .revents = 0};
-            int pret = poll(&pfd, 1, UDS_WRITE_TIMEOUT_MS);
-            if (pret > 0 || (pret < 0 && errno == EINTR)) continue;
+            if (wait_pollout(uds_fd, &dl, UDS_WRITE_TIMEOUT_MS) == 0) continue;
             ERROR_LOG("sendmsg: no buffer space after %d ms",
                       UDS_WRITE_TIMEOUT_MS);
             free(cmsg_buf);
@@ -303,6 +339,30 @@ static int cgroup_setup(pid_t child_pid) {
         return -1;
     }
 
+    /* Teardown relies on cgroup.kill (Linux >= 5.14) to reach descendants
+     * that left the child's process group (setsid/setpgid daemonisers).
+     * Without it the only kill vector is kill(-pgid), so the containment
+     * the caller asked for would be partial — fail closed instead. The
+     * directory we just made is removed so a retry does not hit EEXIST. */
+    char kill_path[576];
+    n = snprintf(kill_path, sizeof(kill_path), "%s/cgroup.kill", full_path);
+    if (n < 0 || (size_t)n >= sizeof(kill_path)) {
+        ERROR_LOG("cgroup kill path too long");
+        snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+                 "cgroup_setup: kill path too long");
+        return -1;
+    }
+    if (access(kill_path, W_OK) != 0) {
+        int err = errno;
+        ERROR_LOG("%s unavailable: %s", kill_path, strerror(err));
+        snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+                 "cgroup_setup: cgroup.kill unavailable (%s); teardown could "
+                 "not reach escaped descendants",
+                 strerror(err));
+        if (rmdir(full_path) == 0) cgroup_owned = 0;
+        return -1;
+    }
+
     n = snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs", full_path);
     if (n < 0 || (size_t)n >= sizeof(procs_path)) {
         ERROR_LOG("cgroup procs path too long");
@@ -352,13 +412,18 @@ static void cgroup_cleanup(void) {
                      cgroup_path);
     if (n < 0 || (size_t)n >= sizeof(full_path)) return;
 
-    /* Kill all processes in the cgroup via cgroup.kill (cgroup v2) */
+    /* Kill all processes in the cgroup via cgroup.kill (cgroup v2).
+     * cgroup_setup() verified the file was writable, so a failure here is
+     * worth a log line: it means descendants may outlive the teardown. */
     n = snprintf(kill_path, sizeof(kill_path), "%s/cgroup.kill", full_path);
     if (n < 0 || (size_t)n >= sizeof(kill_path)) return;
     FILE *f = fopen(kill_path, "w");
-    if (f) {
-        fprintf(f, "1\n");
-        fclose(f);
+    if (!f) {
+        ERROR_LOG("cgroup_cleanup: open %s failed: %s", kill_path,
+                  strerror(errno));
+    } else if (fprintf(f, "1\n") < 0 || fclose(f) != 0) {
+        ERROR_LOG("cgroup_cleanup: write to %s failed: %s", kill_path,
+                  strerror(errno));
     }
 
     /* Poll for rmdir success rather than a fixed sleep — the kernel needs
@@ -646,7 +711,7 @@ static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
 }
 
 /*
- * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] <cmd> [args...]
+ * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] [--cgroup-path <rel>] [--] <cmd> [args...]
  *
  *   uds_path:       Path to the UDS listener socket created by the BEAM
  *   --kill-timeout:  SIGTERM->SIGKILL escalation timeout in ms (default 5000)
@@ -659,7 +724,7 @@ static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         fprintf(stderr,
-                "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] <cmd> [args...]\n");
+                "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] [--cgroup-path <rel>] [--] <cmd> [args...]\n");
         return 1;
     }
 
@@ -706,6 +771,13 @@ int main(int argc, char *argv[]) {
             }
             memcpy(cgroup_path, path, strlen(path) + 1);
             cmd_idx += 2;
+        } else if (strcmp(argv[cmd_idx], "--") == 0) {
+            /* End of shepherd options. The BEAM always emits this so a
+             * command whose name starts with '-' can never be parsed as a
+             * shepherd flag (which would let a caller re-target
+             * --cgroup-path or stretch --kill-timeout behind the API). */
+            cmd_idx += 1;
+            break;
         } else {
             break; /* Unknown flag — treat as command */
         }
