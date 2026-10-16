@@ -88,6 +88,9 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
 
 ### Fixed
 
+- **The shepherd is compiled with `-fPIE`.** The flag was passed only when
+  linking, so a compiler that does not produce position-independent code by
+  default could not link the shepherd.
 - **EINTR is retried** in the NIF `read(2)`/`write(2)` loops and shepherd
   I/O; a transient signal can no longer permanently wedge a drain loop.
 - **Shepherd diagnostics surface.** A spawn-stage `MSG_ERROR` (cgroup
@@ -100,6 +103,8 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
 
 ### Changed
 
+- **The native build writes no object files.** Each binary is compiled and
+  linked in one step, so `make PRIV_DIR=…` leaves the source tree unchanged.
 - **`NetRunner.Process.Nif` renamed to `NetRunner.Nif`** (internal,
   `@moduledoc false`, but referenced in tests/benches).
 - **Option-validation convention unified.** Malformed options (unknown keys,
@@ -124,6 +129,8 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
 
 ### Added
 
+- **`SHEPHERD_STATIC=1`** links the shepherd as a static PIE (Linux only), for
+  a release that runs where the build's libc may be absent.
 - **`NetRunner.Process.read_batch/3` and `read_stderr_batch/3`.** Read up to
   `max_chunks` pipe chunks in one GenServer round trip. A batch never waits
   once it has data (it ends at the first EAGAIN), and an EOF/error after ≥1

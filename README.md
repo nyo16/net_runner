@@ -539,6 +539,25 @@ relying on them.
 - `make`
 - Linux or macOS
 
+### Building for another target
+
+`make` writes the shepherd and NIF to `priv/`, or to the directory given as
+`PRIV_DIR` on its command line, and writes nothing else. A release for another
+target, such as one that ships a musl BEAM to glibc hosts, can build into its
+own `priv`. The NIF must be built against the ERTS that will load it. Run the
+build on a Linux host, because the Makefile selects its platform flags from the
+host's `uname`.
+
+```sh
+make all \
+  CC="zig cc -target x86_64-linux-musl" \
+  ERTS_INCLUDE_DIR=/path/to/target/erts-VERSION/include \
+  PRIV_DIR=/path/to/release/lib/net_runner-VERSION/priv
+```
+
+zig cc already links musl targets statically. With gcc or clang and a static
+libc, such as musl's, `SHEPHERD_STATIC=1` links the shepherd as a static PIE.
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE).
