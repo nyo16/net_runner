@@ -17,7 +17,6 @@ defmodule NetRunner.StderrTailTest do
       pid = start_proc("sh", ["-c", "yes errline 2>/dev/null | head -c #{@total_bytes} 1>&2"])
 
       assert {:ok, _status} = Proc.await_exit(pid)
-      wait_until_drained(pid, @total_bytes)
 
       tail = Proc.stderr_tail(pid)
       assert byte_size(tail) == 8_192
@@ -38,7 +37,6 @@ defmodule NetRunner.StderrTailTest do
         )
 
       assert {:ok, _status} = Proc.await_exit(pid)
-      wait_until_drained(pid, @total_bytes)
 
       tail = Proc.stderr_tail(pid)
       assert byte_size(tail) == 1_024
@@ -60,7 +58,6 @@ defmodule NetRunner.StderrTailTest do
         )
 
       assert {:ok, _status} = Proc.await_exit(pid)
-      wait_until_drained(pid, total)
 
       tail = Proc.stderr_tail(pid)
       assert byte_size(tail) == cap
@@ -91,7 +88,6 @@ defmodule NetRunner.StderrTailTest do
         )
 
       assert {:ok, _status} = Proc.await_exit(pid)
-      wait_until_drained(pid, total)
 
       tail = Proc.stderr_tail(pid)
       assert byte_size(tail) == cap
@@ -107,7 +103,6 @@ defmodule NetRunner.StderrTailTest do
         )
 
       assert {:ok, _status} = Proc.await_exit(pid)
-      wait_until_drained(pid, @total_bytes)
 
       assert Proc.stderr_tail(pid) == ""
       # Draining still happened (the child did not block on a full pipe).
@@ -118,11 +113,41 @@ defmodule NetRunner.StderrTailTest do
       pid = start_proc("sh", ["-c", "yes errline 2>/dev/null | head -c 200000 1>&2"])
 
       assert {:ok, _status} = Proc.await_exit(pid)
-      wait_until_drained(pid, 200_000)
 
       # The whole point: O(1) retention vs O(n) throughput.
       assert Proc.stats(pid).bytes_err == 200_000
       assert byte_size(Proc.stderr_tail(pid)) == 8_192
+    end
+
+    # Issue #22: the exit status arrives over the UDS independently of the
+    # stderr readiness event. When the exit wins, the tail must still hold the
+    # child's last writes once await_exit/2 returns. The race is forced
+    # deterministically: with the server suspended until both notifications
+    # are queued, the stderr one is discarded from inside the server, so the
+    # only remaining trigger is the exit.
+    test "await_exit/2 returns a complete tail when the exit beats the stderr readiness event" do
+      pid = start_proc("sh", ["-c", "sleep 0.2; printf LAST 1>&2"])
+      %{stderr: %{resource: stderr_res}, uds_socket: uds} = :sys.get_state(pid)
+      :ok = :sys.suspend(pid)
+
+      eventually(fn ->
+        {:messages, msgs} = Process.info(pid, :messages)
+        assert Enum.any?(msgs, &match?({:select, ^stderr_res, _, :ready_input}, &1))
+        assert Enum.any?(msgs, &match?({:"$socket", ^uds, :select, _}, &1))
+      end)
+
+      :sys.replace_state(pid, fn state ->
+        receive do
+          {:select, ^stderr_res, _, :ready_input} -> state
+        after
+          0 -> flunk("stderr readiness message vanished")
+        end
+      end)
+
+      :ok = :sys.resume(pid)
+
+      assert {:ok, 0} = Proc.await_exit(pid)
+      assert Proc.stderr_tail(pid) == "LAST"
     end
   end
 
@@ -190,16 +215,6 @@ defmodule NetRunner.StderrTailTest do
     end)
 
     pid
-  end
-
-  # Polls until at least `expected` stderr bytes have been drained, so the
-  # retained tail is final before we assert on it (avoids racing the
-  # select-driven consumer against the OS process exit notification).
-  defp wait_until_drained(pid, expected) do
-    eventually(fn ->
-      drained = Proc.stats(pid).bytes_err
-      assert drained >= expected, "stderr not fully drained: #{drained}/#{expected}"
-    end)
   end
 
   # Accumulates chunks until `expected` is fully received (chunking is

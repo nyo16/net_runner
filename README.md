@@ -12,7 +12,7 @@ NetRunner combines NIF-based async I/O (`enif_select`) with a persistent **sheph
 ```elixir
 def deps do
   [
-    {:net_runner, "~> 1.3"}
+    {:net_runner, "~> 1.4"}
   ]
 end
 ```
@@ -338,7 +338,11 @@ Isolate child processes in a cgroup v2 hierarchy for resource control:
 )
 ```
 
-The shepherd creates the cgroup directory, moves the child into it, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the directory). No-op on macOS.
+The shepherd creates the cgroup directory (and its `net_runner/` parent if missing), moves the child into it *before* `execvp`, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the leaf; the shared parent is left in place). Spawns fail closed with `{:error, {:shepherd_error, msg}}` when the parent or leaf cannot be created, the leaf already exists, the migration is refused, or `cgroup.kill` (Linux ≥ 5.14) is unavailable. No-op on macOS.
+
+Requirements: cgroup v2, with `/sys/fs/cgroup` writable by the BEAM's user (root, or a delegated root), plus write access to the `cgroup.procs` of the nearest common ancestor of the BEAM's cgroup and the target (usually the root) so the child can be migrated. If an administrator pre-creates and delegates `/sys/fs/cgroup/net_runner` instead, only that subtree needs to be writable.
+
+Paths must sit under `net_runner/`. An unprefixed path (accepted by 1.3.x, rejected by 1.4.0) is placed under the prefix since 1.4.1 — `"job"` becomes `"net_runner/job"` — with a once-per-VM deprecation warning; it will raise in 2.0.
 
 ## Command DSL
 
@@ -446,7 +450,7 @@ end, max_concurrency: 20)
 | `:env` | map | `nil` | Environment variables for the child: `%{"NAME" => "value"}` sets, `%{"NAME" => nil}` unsets. The child's executable is resolved against the **modified** environment, so an `:env`-supplied `PATH` changes which binary runs — pass absolute command paths when `:env` comes from untrusted input. |
 | `:pty` | boolean | `false` | Use pseudo-terminal |
 | `:kill_timeout` | integer | `5000` | SIGTERM→SIGKILL escalation timeout in ms |
-| `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only); must sit under a `net_runner/` prefix and be under 256 bytes |
+| `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only) under a `net_runner/` prefix, under 256 bytes; unprefixed paths are prefixed (deprecated) |
 
 Unknown options raise `ArgumentError` (`Keyword.validate!/2`) instead of being
 silently ignored. `stream!/2` accepts the same options minus `:timeout`,

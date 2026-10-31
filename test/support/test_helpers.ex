@@ -77,6 +77,35 @@ defmodule NetRunner.TestHelpers do
     end
   end
 
+  @doc """
+  Parent pid of `os_pid`. Works on busybox too: Alpine's `ps` supports
+  neither `-p` nor `ppid=`, but /proc is always there on Linux; macOS has
+  no /proc and a full BSD ps.
+  """
+  def parent_pid!(os_pid) do
+    case File.read("/proc/#{os_pid}/status") do
+      {:ok, status} ->
+        [_, ppid] = Regex.run(~r/^PPid:\s+(\d+)$/m, status)
+        String.to_integer(ppid)
+
+      {:error, _} ->
+        {out, 0} = System.cmd("ps", ["-o", "ppid=", "-p", to_string(os_pid)])
+        out |> String.trim() |> String.to_integer()
+    end
+  end
+
+  @doc """
+  A high-entropy `sleep` duration that `pgrep -f "sleep <marker>"` can match
+  without colliding with other tests or host processes.
+
+  Kept below 2^31-1: macOS `/bin/sleep` rejects larger durations with a usage
+  error and exit 1, which made timeout tests fail as `{"", 1}` late in a
+  full-suite run once `System.unique_integer/1` grew past five digits.
+  """
+  def sleep_marker do
+    "86400#{rem(System.unique_integer([:positive]), 10_000)}"
+  end
+
   # /proc/<pid>/stat field 3 is the state character; "Z" is a zombie. macOS
   # has no /proc, but also reaps orphans via launchd, so absence => not a
   # zombie concern.
