@@ -10,7 +10,9 @@ Communication between the BEAM and the shepherd binary occurs over a Unix domain
    directory) and generates a per-spawn 16-byte random token
 2. BEAM spawns shepherd via `Port.open` with the UDS path as argv[1] and the
    `--token-fd` flag, then writes the 32-byte hex token to the shepherd over
-   the private fd-3 port channel
+   the private fd-3 port channel. For a replacement environment, the port
+   environment already unsets every unselected variable the BEAM saw, and
+   `--replace-env` carries the selected-name allowlist
 3. Shepherd reads the token from fd 3, connects to the UDS and writes the
    32 hex bytes verbatim as its very first frame
 4. BEAM verifies the token (and, where the platform exposes peer

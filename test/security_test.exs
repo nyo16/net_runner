@@ -20,6 +20,22 @@ defmodule NetRunner.SecurityTest do
     end
   end
 
+  describe ":env option (SEC-9)" do
+    test "malformed env raises at Proc.start, before anything is spawned" do
+      for bad <- [
+            %{"A=B" => "x"},
+            %{"" => "x"},
+            %{"OK" => "a\0b"},
+            %{"OK" => <<0xFF>>},
+            {:merge, %{"OK" => "x"}}
+          ] do
+        assert_raise ArgumentError, ~r/:env/, fn ->
+          Proc.start("echo", ["x"], env: bad)
+        end
+      end
+    end
+  end
+
   describe "set_window_size validation (SEC-10)" do
     test "rejects values outside the 2-byte protocol range" do
       {:ok, pid} = Proc.start("cat", [], pty: true)
@@ -49,8 +65,8 @@ defmodule NetRunner.SecurityTest do
 
   describe ":kill_timeout validation" do
     test "rejects values the shepherd would refuse, in the caller" do
-      # Out-of-range or non-integer values used to make the shepherd exit
-      # before connecting, visible only as a 10 s :shepherd_connect_timeout.
+      # Out-of-range or non-integer values make the shepherd exit before
+      # connecting, with the reason only on the VM's stderr.
       for bad <- [0, 60_001, 5000.0, "5000", nil] do
         assert_raise ArgumentError, ~r/:kill_timeout/, fn ->
           Proc.start("echo", ["x"], kill_timeout: bad)

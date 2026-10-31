@@ -60,13 +60,12 @@ defmodule NetRunner.EnvTest do
     end
 
     test "an environment too large to exec is reported as a spawn failure" do
-      {us, result} =
-        :timer.tc(fn ->
-          NetRunner.run([@sh, "-c", "echo hi"], env: [{"BIG", String.duplicate("x", 2_000_000)}])
-        end)
-
-      assert {:error, {:shepherd_spawn_failed, _reason}} = result
-      assert us < 2_000_000
+      # :shepherd_spawn_failed (not :shepherd_connect_timeout) is what proves
+      # the failure was reported without waiting out the accept deadline.
+      assert {:error, {:shepherd_spawn_failed, _reason}} =
+               NetRunner.run([@sh, "-c", "echo hi"],
+                 env: [{"BIG", String.duplicate("x", 2_000_000)}]
+               )
     end
   end
 

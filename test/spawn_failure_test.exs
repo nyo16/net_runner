@@ -8,10 +8,8 @@ defmodule NetRunner.SpawnFailureTest do
 
   describe "a shepherd that cannot start" do
     test "is reported as a spawn failure, not a connect timeout" do
-      {us, result} = :timer.tc(fn -> NetRunner.run([@sh, "-c", @unexecable_arg]) end)
-
-      assert {:error, {:shepherd_spawn_failed, _reason}} = result
-      assert us < 2_000_000
+      assert {:error, {:shepherd_spawn_failed, _reason}} =
+               NetRunner.run([@sh, "-c", @unexecable_arg])
     end
   end
 

@@ -73,7 +73,8 @@ defmodule NetRunner do
       directory. Relative values use the BEAM working directory as their base.
       The child resolves relative paths and executables from `:cwd`. A failed
       directory change returns `{:error, {:shepherd_error, reason}}`. This
-      option does not change `PWD`.
+      option does not change `PWD`. `:cwd` must come from trusted input: with a
+      relative command or relative `PATH` entries it selects which file runs.
     * `:output` - result shape for collected stdout: `:binary` (default)
       concatenates chunks into one binary; `:iodata` returns the collected
       chunks as iodata and skips the final flatten — for a 64 MiB output
@@ -83,10 +84,12 @@ defmodule NetRunner do
     * `:env` - child environment changes as a map or a list of `{name, value}`
       pairs. A binary value sets a variable. `nil` and `""` remove it. Names
       and values must contain valid UTF-8 and no NUL. Names must not contain
-      `=`. The child uses the modified `PATH` to resolve its executable. Use
-      an absolute command path when `:env` comes from untrusted input. Wrap the
-      input in `{:replace, environment}` to remove every unselected variable.
-      Other mode tags raise `ArgumentError`.
+      `=`. **The child's executable is resolved against the modified `PATH`.**
+      `:env` must come from trusted input: never build `PATH` from untrusted
+      input, and note that an absolute command path does not make untrusted
+      `:env` safe (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `BASH_ENV`, ...).
+      Wrap the input in `{:replace, environment}` to remove every unselected
+      variable. Other mode tags raise `ArgumentError`.
 
   Also accepted and passed through to the underlying process: `:pty`,
   `:cgroup_path`, `:kill_timeout`.

@@ -410,9 +410,9 @@ defmodule NetRunner.Process.Exec do
   end
 
   # Mirrors the shepherd's own --kill-timeout check (1..60000). Anything else
-  # makes the shepherd exit before it ever connects, which the BEAM can only
-  # observe as a 10 s :shepherd_connect_timeout with the real reason on the
-  # VM's stderr — so reject it here where the caller can see it.
+  # makes the shepherd exit before it ever connects; the caller would get a
+  # bare {:shepherd_spawn_failed, {:exit_status, 1}} with the real reason only
+  # on the VM's stderr — so reject it here with a message the caller can read.
   defp validate_kill_timeout!(ms) when is_integer(ms) and ms in 1..@kill_timeout_max_ms, do: :ok
 
   defp validate_kill_timeout!(ms) do
@@ -712,8 +712,12 @@ defmodule NetRunner.Process.Exec do
     # bound socket file.
     port = Port.open({:spawn_executable, shepherd}, port_opts)
 
-    # Port.command/2 can exit its caller when the token write fails. Unlink
-    # first so accept_authenticated/5 can return the port's exit status.
+    # The token write races a shepherd that failed to exec: the port then dies
+    # with :epipe, and as a linked exit signal that would kill this
+    # (non-trapping) process. So the port stays unlinked. If this process is
+    # killed, the shepherd sees its UDS hang up and tears down; if it is
+    # killed before the token is written, the shepherd's bounded token read
+    # (TOKEN_READ_TIMEOUT_MS) makes it exit instead of blocking on fd 3.
     Process.unlink(port)
     send_token(port, token)
     {:ok, port}
@@ -740,10 +744,24 @@ defmodule NetRunner.Process.Exec do
 
   defp environment_options(nil), do: {[], nil}
 
+  # Replacement mode uses two layers. The shepherd's --replace-env allowlist
+  # is authoritative for the child: it drops every name outside the selection
+  # just before fork, so the result does not depend on timing. In addition,
+  # every variable in an :os.env/0 snapshot that the caller did not select is
+  # unset (`false`) in the port environment, so the shepherd itself normally
+  # never holds ambient values such as RELEASE_COOKIE. A variable put into the
+  # BEAM environment between the snapshot and Port.open reaches the shepherd
+  # but is still filtered out of the child.
   defp environment_options({:replace, environment}) do
+    selected = format_env(environment)
+    selected_names = MapSet.new(selected, fn {name, _value} -> name end)
+
+    unset =
+      for {name, _value} <- :os.env(), not MapSet.member?(selected_names, name), do: {name, false}
+
     kept_names = for {name, value} <- environment, value != nil, do: name
     flags = ["--replace-env", Integer.to_string(length(kept_names)) | kept_names]
-    {flags, format_env(environment)}
+    {flags, unset ++ selected}
   end
 
   defp environment_options(environment), do: {[], format_env(environment)}

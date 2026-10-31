@@ -354,6 +354,10 @@ if the child requires it:
 NetRunner.run(~w(git status), cwd: dir, env: [{"PWD", dir}])
 ```
 
+`cwd:` must come from trusted input. Combined with a relative command
+(`./tool`) or relative `PATH` entries (`.` or empty), a caller-controlled
+`cwd:` runs whatever files that directory contains.
+
 ## Environment
 
 `env:` adds, overrides, or removes variables in the inherited environment. It
@@ -377,6 +381,11 @@ environment. The child uses its `PATH` to resolve the executable:
 {"found\n", 0} = NetRunner.run(["only_on_this_path"], env: [{"PATH", "/srv/tools"}])
 ```
 
+`env:` must come from trusted input. An absolute command path does not make an
+untrusted `env:` safe: variables such as `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`
+or `BASH_ENV` still run code in the shepherd or the child, and a `PATH` built
+from untrusted input changes which binary runs.
+
 The operating system limits the environment size. NetRunner returns
 `{:error, {:shepherd_spawn_failed, reason}}` if the environment exceeds that
 limit.
@@ -387,12 +396,15 @@ Wrap the input in `{:replace, environment}` to define the complete child
 environment:
 
 ```elixir
-NetRunner.run(~w(env), env: {:replace, %{"PATH" => "/srv/tools", "HOME" => "/srv/agents/7"}})
+NetRunner.run(["/usr/bin/env"], env: {:replace, %{"PATH" => "/srv/tools", "HOME" => "/srv/agents/7"}})
 ```
 
-The shepherd removes all unselected variables before it forks. It does not
-change the BEAM environment. `env: {:replace, %{}}` gives the child an empty
-environment.
+The shepherd removes every unselected variable before it forks, and NetRunner
+also unsets the unselected variables it can see in the port environment, so
+ambient values such as `RELEASE_COOKIE` normally never reach the shepherd
+either. The selected names (not values) appear in the shepherd command line.
+The BEAM environment does not change. `env: {:replace, %{}}` gives the child
+an empty environment.
 
 Replacement mode uses the same validation as overlay mode. The child uses only
 the selected `PATH` to resolve its executable. An unknown mode raises
@@ -517,7 +529,7 @@ end, max_concurrency: 20)
 | `:output` | atom | `:binary` | Result shape for collected stdout (`run/2` only): `:binary` concatenates chunks into one binary; `:iodata` returns the collected chunks as iodata and skips the final flatten (an extra full-size allocation + copy for large outputs). The `max_output_exceeded` partial is always a binary. |
 | `:stderr` | atom | `:consume` | `:consume` (drained internally), `:capture` (drained, and the retained tail is returned as a third tuple element: `{output, exit_status, stderr}`) or `:disabled` |
 | `:stderr_tail_bytes` | integer | `8192` | Cap on the retained stderr tail; `0..1_048_576`. `0` retains nothing. |
-| `:env` | map \| list of pairs \| `{:replace, map \| list}` | `nil` | Child environment changes. A binary sets a variable. `nil` removes it. `{:replace, environment}` removes all unselected variables. |
+| `:env` | map \| list of pairs \| `{:replace, map \| list}` | `nil` | Child environment changes. A binary sets a variable. `nil` removes it. `{:replace, environment}` removes all unselected variables. The child resolves its executable against the modified `PATH`; `env:` must come from trusted input (see [Environment](#environment)). |
 | `:pty` | boolean | `false` | Use pseudo-terminal |
 | `:kill_timeout` | integer | `5000` | SIGTERM→SIGKILL escalation timeout in ms |
 | `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only) under a `net_runner/` prefix, under 256 bytes; unprefixed paths are prefixed (deprecated) |

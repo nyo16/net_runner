@@ -45,39 +45,17 @@ defmodule NetRunner.EnvReplaceTest do
                NetRunner.run([env], env: {:replace, %{"PROBE_ONE" => "one"}})
     end
 
-    test "the shepherd removes an unselected variable from its inherited environment" do
-      dir = tmp_dir("net_runner_allowlist")
-      socket_path = Path.join(dir, "shepherd.sock")
-      result_path = Path.join(dir, "result")
-      shepherd = Path.join(to_string(:code.priv_dir(:net_runner)), "shepherd")
-      token = String.duplicate("0", 32)
+    @tag :linux_only
+    test "the shepherd itself never receives an unselected variable", %{ambient: name} do
+      # The child's parent is the shepherd, and /proc/<pid>/environ is the
+      # environment block the port handed it.
+      script = "tr '\\0' '\\n' < /proc/$PPID/environ | grep -c '^#{name}=' || true"
 
-      {:ok, listener} = :socket.open(:local, :stream)
-      :ok = :socket.bind(listener, %{family: :local, path: socket_path})
-      :ok = :socket.listen(listener)
+      assert {"0\n", 0} =
+               NetRunner.run([@sh, "-c", script], env: {:replace, %{"PATH" => "/usr/bin:/bin"}})
 
-      script = "printf %s \"${NET_RUNNER_LATE_VARIABLE-absent}\" > #{result_path}"
-
-      port =
-        Port.open(
-          {:spawn_executable, shepherd},
-          [
-            :nouse_stdio,
-            :exit_status,
-            :binary,
-            args: [socket_path, "--token-fd", "--replace-env", "0", @sh, "-c", script],
-            env: [{~c"NET_RUNNER_LATE_VARIABLE", ~c"leaked"}]
-          ]
-        )
-
-      true = Port.command(port, token)
-      {:ok, connection} = :socket.accept(listener, 5_000)
-
-      assert_receive {^port, {:exit_status, 0}}, 5_000
-      assert File.read!(result_path) == "absent"
-
-      :socket.close(connection)
-      :socket.close(listener)
+      # Overlay mode inherits it, which proves the probe can see it at all.
+      assert {"1\n", 0} = NetRunner.run([@sh, "-c", script])
     end
 
     test "a non-ASCII UTF-8 value survives the replacement" do

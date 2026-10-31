@@ -211,19 +211,32 @@ the BEAM.
 - An environment over the platform limit returns
   `{:shepherd_spawn_failed, reason}`.
 
-## ADR-12: Filter Replacement Environments in the Shepherd
+## ADR-12: Filter Replacement Environments in the Shepherd, Pre-Cleared by the BEAM
 
 **Context**: An overlay cannot remove inherited variables that the caller does
 not know about. Some callers need to define the complete child environment.
+Filtering only in the shepherd leaves ambient values (`RELEASE_COOKIE`, cloud
+credentials) in the shepherd's own environment for the child's lifetime.
+Clearing only in the BEAM, from an `:os.env/0` snapshot, races
+`System.put_env/2` calls made between the snapshot and `Port.open`, and a
+variable set in that window would reach the child.
 
-**Decision**: Add `env: {:replace, environment}`. Pass values through the port
-environment and names through a shepherd allowlist. The shepherd removes all
-other variables before `fork()`. Untagged `env:` remains an overlay.
+**Decision**: Add `env: {:replace, environment}` with two layers. The shepherd
+receives the selected names as a `--replace-env` allowlist and removes every
+other variable before `fork()`; this is authoritative for the child. The BEAM
+also unsets, in the `Port.open` environment, every variable from an
+`:os.env/0` snapshot that the caller did not select. Untagged `env:` remains
+an overlay.
 
 **Consequences**:
-- Replacement mode filters the environment that the shepherd received.
+- The child receives exactly the selection, independent of timing.
+- The shepherd normally holds no unselected variable; one put into the BEAM
+  environment during the snapshot/`Port.open` window reaches the shepherd but
+  not the child.
 - Values use the same port transport and validation in both modes.
-- Selected names also appear in the shepherd command line.
+- Selected names (not values) appear in the shepherd command line and count
+  toward both the argument and environment size limits.
 - Without `PATH`, the shepherd prevents `execvp` from using a default search
   path.
-- Selected names count toward both the argument and environment size limits.
+- Caller-supplied values, including `LD_PRELOAD`/`DYLD_*`, reach the shepherd
+  as well as the child in both modes, so `env:` must come from trusted input.

@@ -195,9 +195,13 @@ The `env:` option has this flow:
 - `nil` and `""` both remove a variable
 - Names and values must contain valid UTF-8
 
-Replacement mode also passes the selected names in a shepherd allowlist. After
-authentication, the shepherd removes all other variables before `fork()`. The
-BEAM environment does not change.
+Replacement mode has two layers. The shepherd gets the selected names as a
+`--replace-env` allowlist and, after authentication, removes every other
+variable before `fork()`, so the child's environment does not depend on
+timing. The BEAM also unsets, in the port environment, every variable from an
+`:os.env/0` snapshot that the caller did not select, so the shepherd itself
+normally never holds ambient values such as `RELEASE_COOKIE`. The BEAM
+environment does not change.
 
 See ADR-11 and ADR-12 in `decisions.md`.
 

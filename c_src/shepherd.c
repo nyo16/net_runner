@@ -134,6 +134,10 @@ static int64_t monotonic_ms(void) {
  * buffer space before being dropped. */
 #define UDS_WRITE_TIMEOUT_MS 5000
 
+/* Upper bound on waiting for the handshake token on fd 3; matches the BEAM's
+ * accept deadline, after which the spawn is abandoned anyway. */
+#define TOKEN_READ_TIMEOUT_MS 10000
+
 /*
  * Absolute deadline for one bounded POLLOUT wait, initialised lazily so a
  * write that succeeds on the first attempt never reads the clock.
@@ -888,10 +892,31 @@ int main(int argc, char *argv[]) {
     set_cloexec(4);
 
     /* Read the handshake token from the BEAM before touching the UDS. The
-     * port channel is private to the BEAM and this process. */
+     * port channel is private to the BEAM and this process. The BEAM unlinks
+     * the port for this write, so a spawner killed before writing need not
+     * close fd 3: bound the wait by the BEAM's own accept deadline instead of
+     * blocking forever. */
     if (token_from_fd) {
         size_t got = 0;
+        int64_t deadline = monotonic_ms();
+        if (deadline >= 0) deadline += TOKEN_READ_TIMEOUT_MS;
         while (got < TOKEN_HEX_LEN) {
+            int wait_ms = TOKEN_READ_TIMEOUT_MS;
+            if (deadline >= 0) {
+                int64_t now = monotonic_ms();
+                wait_ms = (now < 0 || now >= deadline) ? 0 : (int)(deadline - now);
+            }
+            struct pollfd pfd = { .fd = 3, .events = POLLIN, .revents = 0 };
+            int ready = poll(&pfd, 1, wait_ms);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                perror("token poll");
+                return 1;
+            }
+            if (ready == 0) {
+                fprintf(stderr, "error: timed out waiting for token\n");
+                return 1;
+            }
             ssize_t n = read(3, token + got, TOKEN_HEX_LEN - got);
             if (n < 0) {
                 if (errno == EINTR) continue;

@@ -10,17 +10,44 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 - **`SHEPHERD_STATIC=1`** links the shepherd as a static PIE (Linux only), for
   a release that runs where the build's libc may be absent.
+- **`:cwd` sets the child working directory.** `NetRunner.run/2`, `stream!/2`,
+  `stream/2`, and `NetRunner.Process.start/3` accept `cwd: path`.
+  `NetRunner.Daemon` accepts it in `process_opts`. If the shepherd cannot enter
+  the directory, the spawn returns `{:error, {:shepherd_error, reason}}`.
+  Relative paths use the BEAM working directory. This option does not change
+  `PWD`. See ADR-10 in `docs/decisions.md`.
+- **`:env` accepts maps and lists of `{name, value}` pairs.** A `nil` or empty
+  value removes the variable because a port cannot set an empty value. See
+  ADR-11 in `docs/decisions.md`.
+- **`env: {:replace, environment}` defines the complete child environment.**
+  The shepherd removes every unselected variable before it forks, and the
+  port environment already unsets the unselected variables the BEAM can see,
+  so ambient values such as `RELEASE_COOKIE` normally never reach the
+  shepherd either. An empty map or list gives the child an empty
+  environment. The child uses only the selected `PATH` to resolve its
+  executable. Untagged `env:` remains an overlay. See ADR-12 in
+  `docs/decisions.md`.
 
 ### Changed
 
 - **The native build writes no object files.** Each binary is compiled and
   linked in one step, so `make PRIV_DIR=…` leaves the source tree unchanged.
+- **`:env` names and values must be valid UTF-8.** Port environment entries
+  are now character lists; non-UTF-8 values, previously passed as raw bytes,
+  raise `ArgumentError`.
 
 ### Fixed
 
 - **The shepherd is compiled with `-fPIE`.** The flag was passed only when
   linking, so a compiler that does not produce position-independent code by
   default could not link the shepherd.
+- **Non-ASCII `:env` values are no longer double-encoded.** Values were passed
+  to the port as byte lists, which the port re-encoded byte by byte, so `é`
+  reached the child as `c3 83 c2 a9`.
+- **Startup failures return promptly.** If the OS rejects the shepherd's
+  arguments or environment, NetRunner returns
+  `{:error, {:shepherd_spawn_failed, reason}}` without waiting for the 10 s
+  socket timeout. An immediate child exit remains a valid spawn.
 
 ## [1.4.1] - 2026-10-31
 
@@ -148,11 +175,6 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
   deadline, so a wedged peer cannot park the shepherd after reap and skip
   cgroup cleanup.
 
-- **Startup failures return promptly.** If the OS rejects the shepherd's
-  arguments or environment, NetRunner returns
-  `{:error, {:shepherd_spawn_failed, reason}}` without waiting for the socket
-  timeout. An immediate child exit remains a valid spawn.
-
 ### Changed
 
 - **`NetRunner.Process.Nif` renamed to `NetRunner.Nif`** (internal,
@@ -193,24 +215,6 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
   iodata, skipping the terminal `IO.iodata_to_binary/1` flatten — an extra
   full-size allocation and copy for large outputs. Default `:binary`
   unchanged; the `max_output_exceeded` partial is always a binary.
-
-- **`:cwd` sets the child working directory.** `NetRunner.run/2`, `stream!/2`,
-  `stream/2`, and `NetRunner.Process.start/3` accept `cwd: path`.
-  `NetRunner.Daemon` accepts it in `process_opts`. If the shepherd cannot enter
-  the directory, the spawn returns `{:error, {:shepherd_error, reason}}`.
-  Relative paths use the BEAM working directory. This option does not change
-  `PWD`. See ADR-10 in `docs/decisions.md`.
-
-- **`:env` accepts maps and lists of `{name, value}` pairs.** A `nil` or empty
-  value removes the variable because a port cannot set an empty value. Names
-  and values must contain valid UTF-8. Character lists fix the double encoding
-  of non-ASCII values. See ADR-11 in `docs/decisions.md`.
-
-- **`env: {:replace, environment}` defines the complete child environment.**
-  The shepherd removes every unselected variable before it forks. An empty map
-  or list gives the child an empty environment. The child uses only the
-  selected `PATH` to resolve its executable. Untagged `env:` remains an
-  overlay. See ADR-12 in `docs/decisions.md`.
 
 ### Changed
 
@@ -297,8 +301,8 @@ cycle below (numbers are medians on an Apple M1 Max, OTP 29 / erts 17.0.3,
 
 - **`:env` option** (`run/2`, `stream!/2`, `Process.start/3`): a map of
   environment variables for the child; a binary value sets, `nil` unsets.
-  The child's executable uses the modified `PATH`. Pass an
-  absolute command path when `:env` comes from outside your trust boundary.
+  PATH resolution happens before `:env` applies — pass absolute command
+  paths when overriding `PATH`.
 - **`stderr: :capture` for `run/2`** — returns the retained stderr tail as a
   third tuple element: `{output, exit_status, stderr}`.
 - **`NetRunner.Error`** exception with the original reason in `:reason`;
@@ -327,9 +331,7 @@ cycle below (numbers are medians on an Apple M1 Max, OTP 29 / erts 17.0.3,
   empty; rejecting beats silently returning `""`.
 - **`:env` values travel as raw bytes** (`execve` semantics): non-UTF-8
   values no longer raise from inside spawn, and UTF-8 values are no longer
-  transcoded to codepoints. The Unreleased rules replace this behavior. Port
-  environment entries are characters, so NetRunner now rejects non-UTF-8
-  values.
+  transcoded to codepoints.
 - **`Daemon` stops when its child exits**, with
   `{:shutdown, {:exit_status, n}}`, so `restart: :permanent` supervisors
   restart it; previously it lingered as a healthy-looking GenServer over a
