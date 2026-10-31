@@ -40,19 +40,47 @@ sequenceDiagram
     S->>B: Connect to UDS
     S->>B: token echoed back (32 bytes, first UDS frame)
     B->>B: Verify token (+ peer uid where supported)
-    S->>S: fork()
-    S->>C: execvp(command)
-    S->>B: sendmsg(SCM_RIGHTS: stdin_w, stdout_r, stderr_r)
+    S->>C: fork()
+    C->>C: die_with_shepherd, setpgid(0,0) / setsid(), reset signals
+    C-->>S: 'R' (PTY: session set up)
+    C->>C: block on exec gate
+    S->>S: setpgid(child, child) (pipe mode), pidfd_open (Linux)
+    S->>S: cgroup_setup (if requested)
+    S->>B: sendmsg(SCM_RIGHTS: stdin_w, stdout_r, stderr_r [, pidfd])
     S->>B: MSG_CHILD_STARTED(pid)
-    B->>B: NIF: create_fd(stdin), create_fd(stdout), create_fd(stderr)
+    S->>C: 'G' (release the gate)
+    C->>C: execvp(command)
+    B->>B: NIF: create_fd(stdin), create_fd(stdout), create_fd(stderr) [, create_fd(pidfd)]
 
     loop I/O
         B->>B: NIF read/write on FDs (enif_select)
     end
 
     C->>S: exit(status)
+    S->>S: waitid(WNOWAIT) → kill(-pid, SIGKILL) → waitpid → cgroup_cleanup
     S->>B: MSG_CHILD_EXITED(status)
     S->>S: exit(0)
+```
+
+The command is exec'd only after the shepherd has sent the BEAM its fds and pid. On any
+shepherd-side failure before the `'G'` byte (cgroup setup, `sendmsg`, the
+`MSG_CHILD_STARTED` write) the shepherd closes the gate — the child
+`_exit(127)`s without exec — SIGKILLs and reaps it, and only then reports
+`MSG_ERROR`. A failed spawn therefore never ran the command, so retrying
+it cannot run it twice (ADR-15).
+
+The child also leads its own process group before the BEAM hears of it: in
+pipe mode both the child (`setpgid(0, 0)`) and the shepherd
+(`setpgid(child, child)`) set it, and in PTY mode the shepherd waits for the
+child's `'R'` after `setsid()`. So the BEAM's `killpg` in
+`finish_orphaned/2` always has a group to hit; should it still get `ESRCH`,
+it falls back to signalling the leader directly.
+
+Before blocking on the gate the child restores every signal disposition to
+its default and empties its signal mask: SIG_IGN and the mask survive
+`execve`, and the BEAM's launcher (erts ignores SIGFPE and a realtime
+signal; `nohup`/`+Bi` ignore SIGHUP/SIGINT) must not decide what the
+command can receive.
 ```
 
 The token never appears on the command line: the shepherd is spawned with
@@ -70,7 +98,7 @@ frame, and the BEAM verifies it before accepting any FDs.
 ```mermaid
 graph TD
     subgraph "Zombie Prevention"
-        L1[Layer 1: Shepherd<br/>Detects BEAM death via POLLHUP<br/>SIGTERM → SIGKILL child]
+        L1[Layer 1: Shepherd<br/>Detects BEAM death via POLLHUP or its own SIGTERM/INT/HUP/QUIT<br/>SIGTERM group → always SIGKILL group<br/>sweeps the group on every child exit]
         L2[Layer 2: Watcher GenServer<br/>Detects Process GenServer death<br/>single SIGTERM probe via NIF — no escalation]
         L3[Layer 3: NIF owner monitor<br/>down callback closes FDs<br/>Child sees EOF/SIGPIPE]
     end
@@ -83,10 +111,43 @@ graph TD
 
 | Layer | Trigger | Mechanism | Covers |
 |-------|---------|-----------|--------|
-| Shepherd | BEAM process dies | UDS POLLHUP → kill child group | BEAM SIGKILL, OOM kill, segfault |
-| Process GenServer | Shepherd dies without reporting an exit | Port exit → `killpg(child, SIGKILL)`, status 137 (`finish_orphaned/2`); on Linux also `PR_SET_PDEATHSIG` in the child | Shepherd SIGKILL/OOM/crash, a child killing its parent |
+| Shepherd | BEAM process dies; shepherd gets SIGTERM/SIGINT/SIGHUP/SIGQUIT | UDS POLLHUP (after draining queued commands) or self-pipe → SIGTERM group → wait (WNOWAIT) up to `kill_timeout` → **always** SIGKILL group (direct-pid fallback) → reap → cgroup cleanup → `MSG_CHILD_EXITED` when the UDS still works | BEAM SIGKILL, OOM kill, segfault, `systemctl stop`/`kill` of the shepherd |
+| Shepherd | Child exits on its own | SIGCHLD → `waitid(WNOWAIT)` → `kill(-pid, SIGKILL)` → reap → cgroup cleanup → `MSG_CHILD_EXITED` | Background members left in the child's group (`sh -c 'worker & exit 0'`) |
+| Process GenServer | Shepherd dies without reporting an exit | Port exit → `killpg(child, SIGKILL)` plus a pidfd signal to the leader on Linux (direct kill on `ESRCH` elsewhere), status 137 (`finish_orphaned/2`); on Linux also `PR_SET_PDEATHSIG` in the child | Shepherd SIGKILL/OOM/crash, a child killing its parent |
 | Watcher | GenServer crashes | Process.monitor → one SIGTERM probe via NIF | Elixir-level crashes, unhandled errors |
 | NIF owner monitor | Owner process dies | `down` callback + destructor close(fd) → child SIGPIPE/EOF | Owner killed without cleanup, FD leaks |
+
+**The group never outlives its leader.** Every shepherd exit path sweeps the
+child's process group with SIGKILL *before* reaping the leader: the shepherd
+waits for the leader's exit with `waitid(..., WEXITED | WNOWAIT)`, which
+leaves it a zombie, and a zombie leader keeps its pid — and so its process
+group id — from being reused. `kill(-pid, SIGKILL)` therefore reaches exactly
+the child's remaining group members and never a stranger (ADR-14). A
+consequence callers can see: background jobs in the child's group die with
+it; a job meant to outlive the command must `setsid` itself.
+
+**Exit frame after cleanup.** `MSG_CHILD_EXITED` is sent only after the group
+sweep, the reap and `cgroup_cleanup`, so when `await_exit/2` returns the
+cgroup leaf is already gone and an immediate respawn on the same
+`:cgroup_path` (a `Daemon` restart) cannot hit "already exists". Failure
+paths (a `poll()` error, a lost exit frame) report the reaped status whenever
+the UDS is still usable instead of leaving the BEAM to `killpg` a reaped,
+recyclable pgid.
+
+**Termination signals.** SIGTERM, SIGINT, SIGHUP and SIGQUIT to the shepherd
+write a byte to its self-pipe and the event loop runs the BEAM-death ladder,
+cleanup included; during spawn they abort the spawn cleanly. Only SIGKILL
+(or an OOM kill) can still bypass the shepherd — Layer 2 and
+`PR_SET_PDEATHSIG` cover that.
+
+**pidfd (Linux ≥ 5.3).** Right after `fork` the shepherd opens a pidfd for
+the child and passes it as the optional last `SCM_RIGHTS` fd. The BEAM wraps
+it like a pipe (owner monitor closes it) and uses it for every direct signal
+(`nif_pidfd_send_signal`): a pidfd names the process, not a pid number, so a
+kill issued after the child was reaped returns `ESRCH` (`{:error,
+:not_running}`) instead of hitting a reused pid. It is closed as soon as the
+exit status arrives. Without one (macOS, older kernels, seccomp) the BEAM
+keeps the probe-then-kill path (ADR-16).
 
 The Watcher deliberately does **not** escalate SIGTERM → SIGKILL
 (`lib/net_runner/watcher.ex`): by the time a timed escalation would fire, the
@@ -96,13 +157,24 @@ authority is a check-then-act race against OS pid reuse and can SIGKILL an
 innocent process. Escalation is the shepherd's job (Layer 1); the Watcher's
 single probe only covers a shepherd that died before its ladder ran *and*
 before the GenServer handled the shepherd's Port exit, where the orphaned
-child's pid stays occupied (unreaped) and the probe is safe.
+child's pid stays occupied (unreaped) and the probe is safe. The Watcher has
+no pidfd: it only acts after the GenServer that owned the pidfd is gone.
 
 The NIF owner-monitor layer is likewise not garbage collection: a NIF resource with a live
 `enif_select` registration is never destructed, so the leak safety net is the
 owner-process monitor — `io_resource_down` in `c_src/net_runner_nif.c` closes
 the fd when the owning process dies without cleaning up; the destructor only
 covers resources that were never selected on.
+
+**Threat model.** These layers contain crashing, buggy or careless children.
+A child that is adversarial *and* runs under the BEAM's uid can SIGSTOP or
+SIGKILL its shepherd, leave its cgroup leaf, ptrace the shepherd (Yama
+permitting) or signal the BEAM; containing it needs a separate uid or a
+user+cgroup namespace. Within that model the shepherd is non-dumpable on
+Linux (`PR_SET_DUMPABLE(0)`), so its memory and environment are not readable
+through `/proc` by the same uid without `CAP_SYS_PTRACE`, and `no_new_privs:
+true` stops the child from gaining privileges via setuid binaries or file
+capabilities.
 
 ## I/O Architecture
 
@@ -169,8 +241,10 @@ fork a full shell before `exec` and measure ~13.8 ms/iteration.
 
 When `pty: true` is passed:
 - Shepherd calls `openpty()` instead of `pipe()`
-- Child gets a controlling terminal (`setsid()` + `TIOCSCTTY`)
-- Single bidirectional master FD is sent via SCM_RIGHTS
+- Child gets a controlling terminal (`setsid()` + `TIOCSCTTY`); the shepherd
+  waits for the child's `'R'` byte after `setsid()` before reporting it
+- Single bidirectional master FD is sent via SCM_RIGHTS (followed by the
+  pidfd on Linux)
 - BEAM dups the FD for independent stdin/stdout NIF resources
 - `set_window_size/3` sends `CMD_SET_WINSIZE` to shepherd, which calls `ioctl(TIOCSWINSZ)`
 
@@ -230,8 +304,12 @@ once-per-VM deprecation warning until 2.0):
 - Moves the child PID to `cgroup.procs` *before* the child `execvp`s (the
   child blocks on a sync pipe until the migration is confirmed); any
   migration failure fails the spawn with the shepherd's diagnostic
+- Leaves sub-cgroup creation allowed (container runtimes and harnesses
+  nest cgroups); teardown removes them instead
 - On cleanup writes `1` to `cgroup.kill` (failure is logged to the
-  shepherd's stderr) and removes the directory
+  shepherd's stderr) and removes the directory, recursively removing any
+  sub-cgroups first; giving up is logged. Cleanup finishes before
+  `MSG_CHILD_EXITED` is sent
 - No-op on macOS/BSD: the option is accepted and the child runs unconfined
 
 ## Parallelism Model

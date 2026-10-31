@@ -21,12 +21,28 @@ Communication between the BEAM and the shepherd binary occurs over a Unix domain
 5. Shepherd enters `--cwd` when present (`MSG_ERROR` and exit on failure)
 6. For a replacement environment, shepherd removes every variable outside the
    selected-name allowlist
-7. Shepherd forks the child process
-8. Shepherd sends pipe FDs via `SCM_RIGHTS` (1 message)
-9. Shepherd sends `MSG_CHILD_STARTED` (can share the FD receive)
-10. Bidirectional command/notification flow starts
-11. On child exit: `MSG_CHILD_EXITED`, shepherd exits
-12. On BEAM death: shepherd sees `POLLHUP`, kills child
+7. Shepherd forks the child. The child sets up its process group (pipe mode:
+   `setpgid(0, 0)`; PTY mode: `setsid()`, then signals the shepherd with an
+   `'R'` byte), resets every signal disposition and its signal mask, and
+   blocks on the exec gate
+8. Shepherd: pipe mode `setpgid(child, child)`; on Linux `pidfd_open(child)`;
+   cgroup placement when `--cgroup-path` is set
+9. Shepherd sends the FDs via `SCM_RIGHTS` (1 message; the pidfd, when
+   obtained, is the last fd)
+10. Shepherd sends `MSG_CHILD_STARTED` (can share the FD receive)
+11. Shepherd writes `'G'` to the gate; only now does the child `execvp`
+12. Bidirectional command/notification flow starts
+13. On child exit: SIGKILL of the remaining process group (while the zombie
+    leader still pins the pgid), reap, cgroup cleanup, *then*
+    `MSG_CHILD_EXITED`, shepherd exits
+14. On BEAM death (`POLLHUP`/`POLLERR`/`POLLNVAL`) or a SIGTERM/SIGINT/SIGHUP/
+    SIGQUIT to the shepherd: drain queued commands, then the teardown ladder
+    (see [BEAM Death Detection](#beam-death-detection))
+
+Any shepherd failure in steps 8–11 closes the gate (the child `_exit(127)`s
+without exec), SIGKILLs and reaps the child, and only then sends `MSG_ERROR`
+when the UDS is usable. The BEAM therefore never sees an error for a spawn
+whose command ran.
 
 ## Authentication Handshake
 
@@ -61,17 +77,25 @@ else is left behind.
 
 ## FD Passing (SCM_RIGHTS)
 
-Immediately after fork, the shepherd sends file descriptors using `sendmsg()` with `SCM_RIGHTS` ancillary data.
+Once the child is parked on the exec gate, the shepherd sends file descriptors using `sendmsg()` with `SCM_RIGHTS` ancillary data.
 
-**Pipe mode** (3 FDs):
+**Pipe mode** (3 FDs, or 4 with a pidfd):
 ```
 [stdin_write_fd, stdout_read_fd, stderr_read_fd]
+[stdin_write_fd, stdout_read_fd, stderr_read_fd, pidfd]
 ```
 
-**PTY mode** (1 FD):
+**PTY mode** (1 FD, or 2 with a pidfd):
 ```
-[master_fd]  (bidirectional — used for both read and write)
+[master_fd]          (bidirectional — used for both read and write)
+[master_fd, pidfd]
 ```
+
+The pidfd is optional and always last: Linux ≥ 5.3 only, skipped silently on
+`ENOSYS` or any other `pidfd_open` failure. The shepherd closes its own copy
+after sending. The BEAM accepts either count, wraps the pidfd with
+`nif_create_fd/2` (so the owner monitor closes it) and uses it for direct
+signals via `nif_pidfd_send_signal/2`.
 
 The iov payload is a single dummy byte (`0x00`). The BEAM receives this via `:socket.recvmsg/5` and decodes FDs from the control message as native-endian 32-bit integers.
 
@@ -99,6 +123,14 @@ remainder, losing the exit status for every fast-exiting command — the caller
 then waited out a 5 s timeout and received a synthetic `137` instead of the
 real status.
 
+### Unknown opcodes
+
+An unknown opcode means the two sides disagree about framing, so nothing after
+it in the buffer can be trusted. Both sides discard the rest of the current
+buffer instead of resynchronising byte by byte (which would reinterpret payload
+bytes as commands); the shepherd logs it once to its stderr. There is no
+version negotiation: shepherd and library always ship together.
+
 ### BEAM → Shepherd Commands
 
 | Byte | Command | Payload | Description |
@@ -111,14 +143,21 @@ real status.
 
 | Byte | Message | Payload | Description |
 |------|---------|---------|-------------|
-| `0x80` | `MSG_CHILD_STARTED` | `pid` (4 bytes, big-endian) | Child process PID after successful fork+exec |
-| `0x81` | `MSG_CHILD_EXITED` | `status` (4 bytes, big-endian) | Child exit status (exit code or 128+signal) |
+| `0x80` | `MSG_CHILD_STARTED` | `pid` (4 bytes, big-endian) | Child PID, sent once the child leads its process group and is parked on the exec gate (before `execvp`) |
+| `0x81` | `MSG_CHILD_EXITED` | `status` (4 bytes, big-endian) | Child exit status (exit code or 128+signal), sent after the group sweep, reap and cgroup cleanup |
 | `0x82` | `MSG_ERROR` | `length` (2 bytes, big-endian) + `message` (N bytes) | Error text (up to 255 bytes). Before FD passing, this frame has no FDs |
 
 ## Exit Status Encoding
 
 - Normal exit: `WEXITSTATUS(status)` (0-255)
 - Signal death: `128 + WTERMSIG(status)` (e.g., SIGKILL=9 → 137)
+- Neither (should not happen): `255` (`EXIT_STATUS_UNKNOWN`). The status is
+  always in `0..255`, never `0xFFFFFFFF`
+- A child that could not be reaped after SIGKILL (stuck in uninterruptible
+  sleep) is reported as `137`
+- A failure after `MSG_CHILD_STARTED` but before exec (e.g. SIGTERM to the
+  shepherd mid-hand-off) sends `MSG_ERROR` followed by
+  `MSG_CHILD_EXITED(137)`
 
 ## Kill Protocol
 
@@ -126,7 +165,10 @@ When BEAM sends `CMD_KILL`:
 1. Shepherd calls `kill(-child_pid, signal)` (process group kill)
 2. Falls back to `kill(child_pid, signal)` if group doesn't exist
 
-The BEAM also sends a direct NIF kill as belt-and-suspenders.
+If the command cannot be sent (or the shepherd is gone), the BEAM signals
+the child directly: through the pidfd when it has one (race-free; `ESRCH`
+→ `{:error, :not_running}`), otherwise by probing the pid and then
+`kill(2)`.
 
 ## Close Stdin Protocol
 
@@ -140,6 +182,21 @@ Only then does the child's `read(STDIN_FILENO)` return 0 (EOF).
 ## BEAM Death Detection
 
 The shepherd watches the UDS with `poll()`:
-- `POLLHUP` or `POLLERR` → BEAM died
-- Triggers `kill_child()`: SIGTERM → configurable timeout → SIGKILL
-- Also triggers cgroup cleanup if configured
+- `POLLHUP`, `POLLERR` or `POLLNVAL` → BEAM died. Readable bytes are drained
+  through the command parser first, so a `CMD_KILL` the BEAM sent just before
+  closing (e.g. `kill(pid, :sigkill)` followed by `stop/1`) is honoured
+  instead of being replaced by the ladder
+- SIGTERM/SIGINT/SIGHUP/SIGQUIT delivered to the shepherd take the same path
+  through its self-pipe
+- Triggers `kill_child()`: SIGTERM to the group → wait for the leader's exit
+  without reaping it (`WNOWAIT`) up to `--kill-timeout` → **always** SIGKILL
+  the group (direct-pid fallback) → reap → cgroup cleanup
+- Sends `MSG_CHILD_EXITED` with the reaped status when the UDS is still
+  usable (the signal path), then exits
+
+## Exec Failure
+
+A child that cannot exec writes `execvp: <cmd>: <reason> (errno N)` to its
+stderr and exits `127` for `ENOENT` (and a replacement environment without
+`PATH`), `126` for every other errno (`EACCES`, `ENOEXEC`, ...), following
+the shell convention.

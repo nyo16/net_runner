@@ -67,6 +67,6 @@ graph TD
 | File | Lines | Purpose |
 |------|-------|---------|
 | `c_src/shepherd.c` | ~600 | Persistent child watchdog: fork, FD pass, poll loop, kill escalation, PTY, cgroup |
-| `c_src/net_runner_nif.c` | ~480 | NIF: read/write/close/create_fd/dup_fd/kill/signal_number with enif_select |
+| `c_src/net_runner_nif.c` | ~480 | NIF: read/write/close/create_fd/dup_fd/kill/kill_group/pidfd_send_signal/signal_number with enif_select |
 | `c_src/protocol.h` | ~35 | Shared protocol constants |
 | `c_src/utils.h` | ~20 | Debug/error macros |
