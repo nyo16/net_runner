@@ -36,6 +36,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   values as raw bytes (and documented that non-UTF-8 values no longer
   raise); they are now converted to port charlists, and a non-UTF-8 name or
   value raises `ArgumentError`.
+- **Linux pipe growth is smaller for stdin and stderr.** The shepherd grew
+  all three pipes to 1 MiB, charging 768 pages per spawn to the user's
+  `pipe-user-pages-soft` budget; at ~21 concurrent commands the budget ran
+  out and the kernel capped every new pipe for that user (any program, not
+  just NetRunner) at 8 KiB. stdout stays at 1 MiB; stdin and stderr now get
+  256 KiB, for 384 pages per spawn (~42 concurrent). Measured: `run/2` with
+  16 MiB of input within noise, bulk stderr drain about 22% slower
+  (`bench/LINUX_VERIFICATION.md`).
 
 ### Fixed
 
@@ -49,6 +57,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   arguments or environment, NetRunner returns
   `{:error, {:shepherd_spawn_failed, reason}}` without waiting for the 10 s
   socket timeout. An immediate child exit remains a valid spawn.
+- **A child is no longer orphaned when its shepherd dies.** If the shepherd
+  was SIGKILLed, OOM-killed or crashed before reporting the child's exit, the
+  child kept running unsupervised: after a 5 s wait `await_exit/2` reported a
+  synthetic 137 and `kill/2` refused to signal it (a child could trigger this
+  itself with `kill -9 $PPID`). The BEAM now SIGKILLs the child's process
+  group as soon as the shepherd's port exits without a status and reports
+  137 immediately; on Linux the child also has `PR_SET_PDEATHSIG` set, so the
+  kernel kills it the moment the shepherd dies.
 
 ## [1.4.1] - 2026-10-31
 

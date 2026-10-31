@@ -90,24 +90,25 @@ The OS pipe buffer acts as the natural flow control mechanism:
 
 | Platform | Pipe Buffer | Effect |
 |----------|-------------|--------|
-| Linux | 1 MB — the shepherd grows each pipe from the 64 KB default via `fcntl(F_SETPIPE_SZ, 1 << 20)` (best effort; capped by `/proc/sys/fs/pipe-max-size` and may be refused for unprivileged processes, in which case 64 KB stands) | Child blocks on `write()` when buffer full |
+| Linux | stdout 1 MiB, stdin and stderr 256 KiB — the shepherd grows each pipe from the 64 KiB default via `fcntl(F_SETPIPE_SZ, …)` (best effort; capped by `/proc/sys/fs/pipe-max-size` and refused once the user's pipe budget is spent, in which case the kernel's cap stands) | Child blocks on `write()` when buffer full |
 | macOS | 64 KB (no equivalent knob) | Same blocking behavior |
 
 The Linux growth is a throughput optimisation: every buffer-sized chunk costs
 the BEAM a read → `EAGAIN` → `enif_select` → message round trip, so a 16x
-bigger buffer cuts round trips per MiB by ~16x. Reads still happen 64 KB at a
-time (`@default_read_size`, sized to the NIF's stack fast path) — a saturated
-1 MB pipe simply drains over ~16 consecutive reads.
+bigger stdout buffer cuts round trips per MiB by ~16x. Reads still happen
+64 KiB at a time (`@default_read_size`, sized to the NIF's stack fast path) —
+a saturated 1 MiB stdout pipe simply drains over ~16 consecutive reads.
 
 The growth is charged against the per-user pipe-buffer budget,
-`/proc/sys/fs/pipe-user-pages-soft` (default 16384 pages = 64 MiB). Each
-pipe-mode spawn grows three pipes (stdin, stdout, stderr) = 768 pages, so
-roughly 21 concurrent commands exhaust the soft limit; past it the kernel
-refuses `F_SETPIPE_SZ` with `EPERM` (silently accepted by the shepherd) and
-new pipes fall back to the 64 KB default — the same per-chunk round-trip cost
-as macOS, not a correctness problem. `[unmeasured]` The threshold is derived
-from the kernel defaults, not yet observed; see the concurrency row in
-`bench/LINUX_VERIFICATION.md`.
+`/proc/sys/fs/pipe-user-pages-soft` (default 16384 pages = 64 MiB), for as long
+as the pipes live. Once a user is at that limit, pipe(7): *"individual pipes
+created by a user will be limited to two pages"* (8 KiB) and growth is
+refused — for **every** new pipe that user creates, not only NetRunner's. A
+pipe-mode spawn charges 256 + 64 + 64 = 384 pages, so roughly 42 concurrent
+commands fit; growing all three pipes to 1 MiB (768 pages, before 1.5.0) ran
+out at ~21, which is what made `io_pipelining_test.exs` read 8 KiB chunks under
+a busy test suite. Sizes were chosen by A/B benchmark on Linux; see
+`bench/LINUX_VERIFICATION.md` ("Pipe sizes and the per-user budget").
 
 When the Elixir consumer stops reading:
 1. OS pipe buffer fills up

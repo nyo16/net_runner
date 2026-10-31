@@ -575,11 +575,12 @@ NetRunner.Watcher (belt-and-suspenders with shepherd)
     |-- Monitors GenServer, kills OS process if GenServer crashes
 ```
 
-**Three layers of zombie prevention:**
+**Layers of zombie prevention:**
 
 1. **Shepherd** — detects BEAM death via POLLHUP on UDS, kills child process group
-2. **Watcher** — detects GenServer crash via `Process.monitor`, kills child via NIF
-3. **NIF resource destructor** — closes FDs on GC, child sees broken pipe
+2. **Process GenServer** — detects shepherd death via its Port exit; if no exit status arrived, SIGKILLs the orphaned child's process group (on Linux the child also dies via `PR_SET_PDEATHSIG`)
+3. **Watcher** — detects GenServer crash via `Process.monitor`, kills child via NIF
+4. **NIF owner monitor** — closes FDs when the owning process dies, child sees EOF/broken pipe
 
 ## Performance
 

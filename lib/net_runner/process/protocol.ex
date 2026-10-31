@@ -75,8 +75,8 @@ defmodule NetRunner.Process.Protocol do
   writes (the 1-byte SCM_RIGHTS filler, MSG_CHILD_STARTED and later
   MSG_CHILD_EXITED) can coalesce into a single `recvmsg`. A child that exits
   before the BEAM reads therefore delivers its exit status *inside* this
-  buffer; discarding the tail loses it permanently and strands the caller on
-  the force-exit timeout with a synthetic status.
+  buffer; discarding the tail loses it permanently, and the caller gets a
+  synthetic 137 once the shepherd exits instead of the real status.
   """
   def extract_child_started(socket, iov_rest, timeout) do
     case iov_rest do
