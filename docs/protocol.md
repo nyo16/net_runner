@@ -50,8 +50,14 @@ so an impostor costs only its own connection.
 The shepherd binary and the Elixir library always ship together, so there is
 no compatibility shim for token-less shepherds.
 
-The shepherd applies `--cwd` after authentication. The token must remain the
-first frame on the socket.
+The shepherd applies `--cwd` after sending its token (it never learns whether
+the BEAM accepted it). The token must remain the first frame on the socket.
+
+A shepherd that never receives its token exits after `TOKEN_READ_TIMEOUT_MS`
+(10 s, the BEAM's accept deadline). The BEAM unlinks the port for the token
+write, so a spawner killed before writing need not close fd 3; this bound
+keeps such a shepherd from waiting forever. It has no child yet, so nothing
+else is left behind.
 
 ## FD Passing (SCM_RIGHTS)
 

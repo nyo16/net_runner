@@ -741,8 +741,8 @@ defmodule NetRunner.Process.Exec do
     Port.command(port, token)
     :ok
   catch
-    # Port already dead (spawn raced its own failure) — the accept deadline
-    # and token verification fail the spawn cleanly downstream.
+    # Port already dead (spawn raced its own failure): the port monitor in
+    # accept_or_shepherd_exit/4 reports {:shepherd_spawn_failed, _} promptly.
     :error, :badarg -> :ok
   end
 

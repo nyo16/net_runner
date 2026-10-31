@@ -180,7 +180,7 @@ can set it through the `Port.open` `cd:` option, in the child between `fork()`
 and `exec()`, or in the shepherd before `fork()`.
 
 **Decision**: Pass `--cwd <dir>` to the shepherd. The shepherd calls `chdir()`
-after authentication and before `fork()`.
+after sending its token and before `fork()`.
 
 **Consequences**:
 - A failed `chdir()` returns `MSG_ERROR` with `strerror(errno)` before a child
@@ -189,6 +189,11 @@ after authentication and before `fork()`.
 - A child-side `chdir()` failure would look like an exit status from the child.
 - The selected directory controls relative paths and relative executables.
 - The shepherd also changes directory. Its later filesystem paths are absolute.
+- The directory name appears in the shepherd command line, readable by any
+  local user like the child's own arguments; directory names must not carry
+  secrets. Moving it to the private fd-3 channel was considered and deferred:
+  it would add parsing to the authentication path for a value that is
+  usually as visible as the child's argv.
 
 ## ADR-11: Pass the Environment through the Port
 
@@ -241,3 +246,8 @@ an overlay.
   path.
 - Caller-supplied values, including `LD_PRELOAD`/`DYLD_*`, reach the shepherd
   as well as the child in both modes, so `env:` must come from trusted input.
+- The BEAM-side clearing also applies to the shepherd's own exec, so loader
+  variables such as `LD_LIBRARY_PATH` are gone unless selected. A shepherd
+  that needs one to start (for example a dynamically linked build under Nix)
+  then fails with `{:shepherd_spawn_failed, _}`; select the variable (it also
+  reaches the child) or build with `SHEPHERD_STATIC=1`.

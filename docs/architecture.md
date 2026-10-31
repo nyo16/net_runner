@@ -177,10 +177,13 @@ When `pty: true` is passed:
 The `cwd:` option has this flow:
 - BEAM accepts a non-empty binary without NUL and passes it to the shepherd as
   `--cwd <dir>`
-- Shepherd calls `chdir()` after authentication and before `fork()`
+- Shepherd calls `chdir()` after sending its token and before `fork()`
 - A failed `chdir()` sends `MSG_ERROR` before the shepherd starts a child
 - The UDS and cgroup paths are absolute, so the directory change does not
   affect them
+- The directory name is part of the shepherd command line, which any local
+  user can read (`ps`, `/proc/<pid>/cmdline`) just like the child's own
+  arguments, so it must not contain secrets
 
 See ADR-10 in `decisions.md`.
 
@@ -196,7 +199,7 @@ The `env:` option has this flow:
 - Names and values must contain valid UTF-8
 
 Replacement mode has two layers. The shepherd gets the selected names as a
-`--replace-env` allowlist and, after authentication, removes every other
+`--replace-env` allowlist and, after sending its token, removes every other
 variable before `fork()`, so the child's environment does not depend on
 timing. The BEAM also unsets, in the port environment, every variable from an
 `:os.env/0` snapshot that the caller did not select, so the shepherd itself

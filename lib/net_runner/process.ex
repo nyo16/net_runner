@@ -83,6 +83,8 @@ defmodule NetRunner.Process do
   errors and raise `ArgumentError` here, in the caller, matching every other
   NetRunner entry point. `{:error, reason}` is reserved for runtime spawn
   failures (invalid command bytes, shepherd handshake errors, ...).
+
+  `:cwd` and `:env` behave as described in `NetRunner.run/2`.
   """
   @spec start_link(String.t(), [String.t()], keyword()) :: GenServer.on_start()
   def start_link(cmd, args \\ [], opts \\ []) do

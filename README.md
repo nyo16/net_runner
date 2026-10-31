@@ -358,6 +358,10 @@ NetRunner.run(~w(git status), cwd: dir, env: [{"PWD", dir}])
 (`./tool`) or relative `PATH` entries (`.` or empty), a caller-controlled
 `cwd:` runs whatever files that directory contains.
 
+The directory name is passed on the shepherd command line, so any local user
+can see it (`ps`, `/proc/<pid>/cmdline`), just like the child's own arguments.
+Keep secrets out of directory names.
+
 ## Environment
 
 `env:` adds, overrides, or removes variables in the inherited environment. It

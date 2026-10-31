@@ -1012,7 +1012,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Keep chdir after authentication so the token remains the first frame.
+    /* Keep chdir after the token write so the token remains the first frame.
      * Keep it before fork so a failure can use MSG_ERROR. */
     if (child_cwd != NULL && chdir(child_cwd) != 0) {
         char msg[128];

@@ -89,10 +89,24 @@ defmodule NetRunner do
       input, and note that an absolute command path does not make untrusted
       `:env` safe (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `BASH_ENV`, ...).
       Wrap the input in `{:replace, environment}` to remove every unselected
-      variable. Other mode tags raise `ArgumentError`.
+      variable; in that mode, leaving out `PATH` means only commands
+      containing `/` can run. Other mode tags raise `ArgumentError`.
 
   Also accepted and passed through to the underlying process: `:pty`,
   `:cgroup_path`, `:kill_timeout`.
+
+  ## Spawn errors
+
+    * `{:error, {:shepherd_spawn_failed, reason}}` - the shepherd did not
+      start or exited before connecting. `reason` is `{:exit_status, n}`, a
+      port exit reason, or a message string when `Port.open/2` itself raised
+      (for example an argument list or environment over the OS limit).
+    * `{:error, {:shepherd_error, message}}` - the shepherd connected but
+      could not start the child (`chdir`, cgroup setup, `fork`, ...).
+    * `{:error, :shepherd_connect_timeout}` - no authenticated shepherd
+      connection within 10 s.
+    * `{:error, {:accept_aborted, reason}}` - the spawn's UDS listener was
+      torn down while waiting for the shepherd.
 
   ## Examples
 
@@ -256,6 +270,7 @@ defmodule NetRunner do
       writes of up to that many bytes for throughput. Eager lists always
       coalesce.
     * `:stderr` - `:consume` (default) or `:disabled`
+    * `:cwd`, `:env` - as in `run/2`
 
   `:timeout` and `:max_output_size` are `run/2`-only options and are rejected
   here — a lazy stream has no single wall-clock to bound. Unknown options
