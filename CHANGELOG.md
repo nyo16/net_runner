@@ -6,6 +6,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-31
+
+Child launch context (`:cwd`, `:env` lists and `{:replace, env}`, from #16 by
+@mjrusso), cross-target and static shepherd builds (#20 by @mjrusso), and two
+fixes from the 2026-10-31 audit: no orphaned child when the shepherd dies,
+and Linux pipe growth that fits the per-user pipe budget. **Breaking:** `:env`
+names and values must be valid UTF-8 (see Changed).
+
 ### Added
 
 - **`SHEPHERD_STATIC=1`** links the shepherd as a static PIE (Linux only), for
