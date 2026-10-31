@@ -300,13 +300,45 @@ static int cgroup_owned = 0;
 #ifdef __linux__
 #include <dirent.h>
 
+#define CGROUP_ROOT "/sys/fs/cgroup/"
+
+/* Create every ancestor of the leaf (the shared net_runner/ parent and any
+ * intermediate components) on demand. EEXIST is success: concurrent spawns
+ * into sibling leaves race on the same mkdir, and an ancestor created by an
+ * admin or another shepherd is equally usable. Ancestors are shared, so
+ * they are never cgroup.kill'ed or removed; adopting a pre-existing one does
+ * not weaken the ownership guard, which stays on the leaf. 0755 so a
+ * delegated user other than the creator can still traverse it. Failure gets
+ * its own message so "no permission for cgroups at all" (EACCES on a
+ * non-delegated root) is distinguishable from a leaf collision. */
+static int cgroup_create_ancestors(char *full_path) {
+    char *rel = full_path + strlen(CGROUP_ROOT);
+    for (char *p = strchr(rel, '/'); p != NULL && p[1] != '\0';
+         p = strchr(p + 1, '/')) {
+        *p = '\0';
+        int rc = mkdir(full_path, 0755);
+        int err = errno;
+        *p = '/';
+        if (rc != 0 && err != EEXIST) {
+            int rel_len = (int)(p - rel);
+            ERROR_LOG("mkdir(%.*s) failed: %s", (int)(p - full_path), full_path,
+                      strerror(err));
+            snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+                     "cgroup_setup: cannot create parent cgroup %.*s: %s",
+                     rel_len > 160 ? 160 : rel_len, rel, strerror(err));
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int cgroup_setup(pid_t child_pid) {
     if (cgroup_path[0] == '\0') return 0;
 
     char full_path[512];
     char procs_path[576];
 
-    int n = snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s",
+    int n = snprintf(full_path, sizeof(full_path), CGROUP_ROOT "%s",
                      cgroup_path);
     if (n < 0 || (size_t)n >= sizeof(full_path)) {
         ERROR_LOG("cgroup path too long");
@@ -314,6 +346,8 @@ static int cgroup_setup(pid_t child_pid) {
                  "cgroup_setup: path too long");
         return -1;
     }
+    if (cgroup_create_ancestors(full_path) != 0) return -1;
+
     /* 0700 — the cgroup directory has no reason to be group/world
      * readable. A pre-existing directory is fatal: we cannot know who
      * owns it, cgroup_cleanup() would refuse to tear it down
@@ -408,7 +442,7 @@ static void cgroup_cleanup(void) {
     char full_path[512];
     char kill_path[576];
 
-    int n = snprintf(full_path, sizeof(full_path), "/sys/fs/cgroup/%s",
+    int n = snprintf(full_path, sizeof(full_path), CGROUP_ROOT "%s",
                      cgroup_path);
     if (n < 0 || (size_t)n >= sizeof(full_path)) return;
 

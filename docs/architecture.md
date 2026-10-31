@@ -175,11 +175,17 @@ When `pty: true` is passed:
 ## cgroup Support (Linux Only)
 
 When `cgroup_path:` is set (a binary under the `net_runner/` prefix, < 256
-bytes, no NUL):
-- Shepherd creates `/sys/fs/cgroup/{path}` (`mkdir 0700`). A pre-existing
-  directory is a spawn error — `{:error, {:shepherd_error, "cgroup_setup: …
-  already exists; teardown would not be owned"}}` — because the shepherd only
-  tears down what it created
+bytes, no NUL; an unprefixed path is placed under `net_runner/` with a
+once-per-VM deprecation warning until 2.0):
+- Shepherd creates any missing ancestors (`net_runner/` and intermediate
+  components, `mkdir 0755`, `EEXIST` tolerated so sibling spawns do not race)
+  and never tears them down. Failure to create one is its own spawn error —
+  `"cgroup_setup: cannot create parent cgroup net_runner: Permission denied"`
+  on a non-delegated root
+- Shepherd creates the leaf `/sys/fs/cgroup/{path}` (`mkdir 0700`). A
+  pre-existing leaf is a spawn error — `{:error, {:shepherd_error,
+  "cgroup_setup: … already exists; teardown would not be owned"}}` — because
+  the shepherd only tears down what it created
 - Requires `cgroup.kill` (Linux ≥ 5.14) to be writable in the new leaf;
   otherwise the spawn fails closed, since without it descendants that leave
   the child's process group could outlive teardown

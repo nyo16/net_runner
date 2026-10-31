@@ -1240,11 +1240,14 @@ defmodule NetRunner.Process do
     # parked readers from that buffer first — the child's write ends are closed
     # by now, so a read returns the remaining bytes and then :eof rather than
     # EAGAIN. Failing them outright here would silently truncate a stream.
+    # The :consume drain is select-driven too, so it gets the same pass: the
+    # retained tail must be final before await_exit/2 replies (issue #22).
     state =
       state
       |> Map.put(:stats, stats)
       |> retry_reads_for({:read, :stdout})
       |> retry_reads_for({:read, :stderr})
+      |> maybe_consume_stderr()
 
     # Reply to all awaiting callers
     Enum.each(state.awaiting_exit, fn from ->

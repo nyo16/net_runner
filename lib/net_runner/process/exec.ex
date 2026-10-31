@@ -1,6 +1,8 @@
 defmodule NetRunner.Process.Exec do
   @moduledoc false
 
+  require Logger
+
   alias NetRunner.Nif
   alias NetRunner.Process.{Pipe, Protocol, State}
 
@@ -14,6 +16,11 @@ defmodule NetRunner.Process.Exec do
   # --kill-timeout; the max mirrors shepherd.c's argv check.
   @default_kill_timeout_ms 5_000
   @kill_timeout_max_ms 60_000
+
+  # Every NetRunner cgroup lives under this shared parent, which the shepherd
+  # creates on demand and never tears down.
+  @cgroup_prefix "net_runner/"
+  @cgroup_prefix_warned_key {__MODULE__, :cgroup_prefix_warned}
 
   @doc """
   Spawns a new OS process via the shepherd binary.
@@ -261,7 +268,8 @@ defmodule NetRunner.Process.Exec do
 
   @doc """
   Validates spawn option *values*, raising `ArgumentError` on any malformed
-  one. Returns `opts`.
+  one. Returns `opts`, with an unprefixed `:cgroup_path` placed under
+  `net_runner/` (deprecated until 2.0, when it will raise).
 
   Called on the client by `NetRunner.Process.start/3` / `start_link/3`, so
   every entry point (`NetRunner.run/2`, `stream!/2`, `Daemon`, direct
@@ -272,12 +280,48 @@ defmodule NetRunner.Process.Exec do
   @spec validate_opts!(keyword()) :: keyword()
   def validate_opts!(opts) do
     pty_mode = Keyword.get(opts, :pty, false)
+    requested_cgroup_path = Keyword.get(opts, :cgroup_path, nil)
+    opts = normalize_cgroup_path(opts)
     validate_stderr_mode!(Keyword.get(opts, :stderr, :consume), pty_mode)
     validate_stderr_tail_bytes!(Keyword.get(opts, :stderr_tail_bytes, 8_192))
     validate_cgroup_path!(Keyword.get(opts, :cgroup_path, nil))
     validate_kill_timeout!(Keyword.get(opts, :kill_timeout, @default_kill_timeout_ms))
     validate_env!(Keyword.get(opts, :env, nil))
+    warn_if_prefixed(requested_cgroup_path, Keyword.get(opts, :cgroup_path, nil))
     opts
+  end
+
+  # 1.3.x accepted any relative :cgroup_path; 1.4.0 started requiring the
+  # net_runner/ prefix and raised otherwise, which broke callers within a
+  # minor version. Until 2.0 an unprefixed path is placed under the prefix
+  # instead. Absolute and empty paths are left alone so
+  # validate_cgroup_path!/1 rejects them with the usual message.
+  defp normalize_cgroup_path(opts) do
+    case Keyword.get(opts, :cgroup_path) do
+      path when is_binary(path) and path != "" ->
+        if String.starts_with?(path, [@cgroup_prefix, "/"]),
+          do: opts,
+          else: Keyword.put(opts, :cgroup_path, @cgroup_prefix <> path)
+
+      _ ->
+        opts
+    end
+  end
+
+  # Logged once per VM, and only for a path that passed validation, so an
+  # options error never consumes the one deprecation notice.
+  defp warn_if_prefixed(same, same), do: :ok
+
+  defp warn_if_prefixed(requested, prefixed) do
+    if not :persistent_term.get(@cgroup_prefix_warned_key, false) do
+      :persistent_term.put(@cgroup_prefix_warned_key, true)
+
+      Logger.warning(
+        "[NetRunner] :cgroup_path #{inspect(requested)} has no #{@cgroup_prefix} prefix; " <>
+          "using #{inspect(prefixed)}. Unprefixed paths are deprecated and will " <>
+          "raise in 2.0. (Logged once per VM.)"
+      )
+    end
   end
 
   # Mirrors the shepherd's own --kill-timeout check (1..60000). Anything else
@@ -360,9 +404,9 @@ defmodule NetRunner.Process.Exec do
       byte_size(path) >= 256 ->
         raise ArgumentError, ":cgroup_path must be under 256 bytes"
 
-      not String.starts_with?(path, "net_runner/") or path == "net_runner/" ->
+      not String.starts_with?(path, @cgroup_prefix) or path == @cgroup_prefix ->
         raise ArgumentError,
-              ":cgroup_path must sit under the net_runner/ prefix, got: #{path}"
+              ":cgroup_path must name a cgroup under #{@cgroup_prefix}, got: #{inspect(path)}"
 
       true ->
         :ok
