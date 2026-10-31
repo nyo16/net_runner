@@ -6,11 +6,62 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`SHEPHERD_STATIC=1`** links the shepherd as a static PIE (Linux only), for
+  a release that runs where the build's libc may be absent.
+
+### Changed
+
+- **The native build writes no object files.** Each binary is compiled and
+  linked in one step, so `make PRIV_DIR=…` leaves the source tree unchanged.
+
+### Fixed
+
+- **The shepherd is compiled with `-fPIE`.** The flag was passed only when
+  linking, so a compiler that does not produce position-independent code by
+  default could not link the shepherd.
+
+## [1.4.1] - 2026-10-31
+
+### Fixed
+
+- **cgroup parent is created on demand** ([#24](https://github.com/nyo16/net_runner/issues/24)).
+  The shepherd now creates the shared `net_runner/` parent (and any
+  intermediate components) when missing, tolerating `EEXIST` so concurrent
+  sibling spawns do not race; the documented `cgroup_path: "net_runner/job"`
+  failed with `mkdir failed: No such file or directory` on a fresh
+  hierarchy. Ancestors are shared and never torn down; the ownership guard
+  stays on the leaf. A parent that cannot be created gets its own error
+  (`"cgroup_setup: cannot create parent cgroup net_runner: Permission
+  denied"`) so a non-delegated root is distinguishable from a leaf
+  collision. The delegated Linux CI leg pre-creates `net_runner/`, which is
+  what hid this; a new test now spawns into a fresh nested parent so
+  on-demand creation runs on every build.
+- **Unprefixed `cgroup_path` works again** ([#24](https://github.com/nyo16/net_runner/issues/24)).
+  1.4.0 raised `ArgumentError` for a path outside `net_runner/`, breaking
+  1.3.x callers within a minor release. Such a path is now placed under the
+  prefix (`"job"` → `"net_runner/job"`) with a once-per-VM deprecation
+  warning; it will raise in 2.0.
+- **`stderr_tail/1` is complete once `await_exit/2` returns** ([#22](https://github.com/nyo16/net_runner/issues/22)).
+  In `:consume` mode (and `run/2` with `stderr: :capture`) the drain was only
+  driven by stderr readiness events, so when the shepherd's exit message won
+  the race the retained tail missed the child's last writes. The exit path
+  now drains buffered stderr before replying, as it already did for parked
+  readers.
+
+## [1.4.0] - 2026-10-13
+
+Released from `5f12e06`. This section was first drafted at the 2026-08-31
+cut; the work from here down to "The 2026-08-31 cycles" landed afterwards
+and shipped in the same release, but sat under Unreleased by mistake.
+
 Performance follow-up cycle (from the 2026-08-31 `/phx:perf` reports; numbers
 are medians on an Apple M1 Max, `MIX_ENV=prod`, harness under `bench/`).
 
 Audit-remediation cycle (2026-08-31 project-health audit, second pass: all 39
-remaining findings across shepherd/NIF, lib, tests, docs, and CI).
+remaining findings across shepherd/NIF, lib, tests, docs, and CI), followed by
+the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
 
 ### Security
 
@@ -20,17 +71,70 @@ remaining findings across shepherd/NIF, lib, tests, docs, and CI).
   `MSG_ERROR` instead of silently running the child unconfined. A
   pre-existing cgroup leaf directory is now fatal too (teardown would not be
   owned), and the directory is created `0700`.
+- **cgroup teardown requires `cgroup.kill`.** `cgroup_setup` probes the new
+  leaf's `cgroup.kill` (Linux ≥ 5.14) and fails the spawn closed when it is
+  not writable: without it the only kill vector is `kill(-pgid)`, which a
+  `setsid()` daemoniser escapes. The cleanup write is now checked and logged
+  instead of silently ignored.
 - **cgroup attach no longer races `execvp`.** The child blocks on a sync
   pipe after `fork` and only execs once the shepherd has migrated it into
   the cgroup — descendants can no longer escape limits or `cgroup.kill`
-  teardown. Non-cgroup spawns are byte-for-byte unchanged.
-- **Pid-reuse guard on direct kills.** `Nif.nif_kill` fallbacks in
-  `NetRunner.Process` and the Watcher probe only fire when the shepherd port
-  is dead; while the shepherd lives it holds the child as a zombie, making
-  it the only safe signaller.
+  teardown. The gate is not created for non-cgroup spawns; those pay only
+  the two `fcntl` calls that make the UDS nonblocking (see Fixed).
+- **Shepherd argv is `--`-terminated.** The BEAM emits `--` after its flags
+  so a command whose name starts with `-` (`"--cgroup-path"`,
+  `"--kill-timeout"`, `"--pty"`) can no longer be parsed as a shepherd option
+  and re-target the cgroup or stretch the kill ladder behind the API.
+- **Signal routing is probe-then-signal.** While the shepherd Port lives,
+  `CMD_KILL` over the UDS is the signaller (the shepherd holds the child as
+  a zombie, so the pid cannot be recycled). Once the Port is dead — or the
+  UDS send fails — `NetRunner.Process` probes `kill(pid, 0)` before
+  `nif_kill`. This narrows, but does not close, the window in which a
+  dropped `MSG_CHILD_EXITED` leaves a reaped pid looking live; the comments
+  now say so. The Watcher's port-liveness gate was removed: the Port is owned
+  by the GenServer whose death the Watcher handles, so it was always already
+  closed and the gate was a no-op.
 - **`nif_read` can no longer expose uninitialized heap.** The shrink of a
   >64 KiB read buffer now handles `enif_realloc_binary` failure with an
   alloc+copy fallback.
+
+### Fixed (review of the audit cycle)
+
+- **`kill/2` reports lost signals.** `send_shepherd_command` now returns
+  `:ok | {:error, reason}`; a `CMD_KILL` that cannot reach a live shepherd
+  falls back to the direct probe-and-kill, and `kill/2` returns
+  `{:error, :not_running}` when the probe finds no process instead of a
+  misleading `:ok`. `set_window_size/3` likewise surfaces a failed send.
+- **Bounded UDS waits everywhere in the shepherd.** `send_fds` shared the
+  `write_fully` design but restarted its 5 s window on every `EAGAIN`
+  wakeup; both now use one `wait_pollout` helper with a single absolute
+  deadline (lazily computed, so a first-try write never reads the clock) and
+  a hard poll cap when the monotonic clock is unavailable.
+- **Option validation really is uniform.** `NetRunner.Daemon.start_link/1`
+  validates `:process_opts` in the caller (via the new
+  `NetRunner.Process.validate_opts!/1`) instead of raising inside `init/1`
+  and exiting the linked caller; `:kill_timeout` is range-checked
+  (`1..60_000`) and `:cgroup_path` rejects NUL bytes and non-binaries, so a
+  bad value raises `ArgumentError` instead of a silent 10 s
+  `:shepherd_connect_timeout`.
+- **`NetRunner.Process.Protocol.kill/1`** rejects signal numbers outside
+  `1..255` instead of truncating them to one byte.
+- **macOS test flake.** Timeout tests built a `sleep` duration from
+  `System.unique_integer/1`, which crossed `INT32_MAX` late in a full run;
+  macOS `/bin/sleep` then exited 1 with a usage error. `sleep_marker/0` keeps
+  it in range.
+
+### Added (review of the audit cycle)
+
+- **`Stats.shepherd_error`** — a post-spawn `MSG_ERROR` from the shepherd is
+  now exposed via `NetRunner.Process.stats/1` rather than buried in server
+  state.
+- Tests: Watcher probe on an orphaned child, direct `kill/2` after shepherd
+  death, `Protocol` encoder byte layouts, post-spawn `MSG_ERROR` recording,
+  Daemon client-side validation, `:kill_timeout` validation, `--` terminator;
+  the PTY-resize test's sentinel no longer matches its own failure message.
+  On the delegated Linux CI leg `NR_CGROUP_DELEGATED=1` makes the cgroup
+  tests' fail-closed branch a hard failure.
 
 ### Fixed
 
@@ -130,7 +234,7 @@ remaining findings across shepherd/NIF, lib, tests, docs, and CI).
 - **`Stats.read_count`** now counts read(2) calls under batched reads (one
   count per chunk), keeping its meaning unchanged.
 
-## [1.4.0] - 2026-08-31
+**The 2026-08-31 cycles.**
 
 Two cycles in one release. First, an audit-remediation pass over the
 2026-08-31 project-health audit: security hardening of the shepherd/NIF
@@ -161,7 +265,11 @@ cycle below (numbers are medians on an Apple M1 Max, OTP 29 / erts 17.0.3,
   cgroup directory it created itself; a pre-existing directory is attached to
   but never destroyed. `cgroup_path` must now sit under a `net_runner/`
   prefix and be under 256 bytes — over-length paths are rejected instead of
-  silently truncated to a different cgroup.
+  silently truncated to a different cgroup. **Breaking** for callers passing
+  an unprefixed path (they raise `ArgumentError`); 1.4.1 restores them with
+  a deprecation warning. The `net_runner/` parent is not created by this
+  release — pre-create `/sys/fs/cgroup/net_runner` or upgrade to 1.4.1
+  ([#24](https://github.com/nyo16/net_runner/issues/24)).
 - **Port FDs are CLOEXEC.** The shepherd marks fds 3/4 (the `:nouse_stdio`
   port channel) close-on-exec, so the child cannot inherit a handle to the
   BEAM.

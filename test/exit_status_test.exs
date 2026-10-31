@@ -4,6 +4,8 @@ defmodule NetRunner.ExitStatusTest do
   alias NetRunner.Process, as: Proc
   alias NetRunner.Process.Protocol
 
+  @echo System.find_executable("echo") || raise("these tests require `echo`")
+
   # The shepherd writes three separate segments into a SOCK_STREAM: the 1-byte
   # SCM_RIGHTS filler, MSG_CHILD_STARTED, and later MSG_CHILD_EXITED. A child
   # that exits before the BEAM's recvmsg gets all three coalesced into one
@@ -12,7 +14,7 @@ defmodule NetRunner.ExitStatusTest do
   # and report a synthetic 137 instead of the real status.
   describe "fast-exiting children (coalesced MSG_CHILD_EXITED)" do
     test "reports the real exit status, not a synthetic 137" do
-      assert {"hi\n", 0} = NetRunner.run(["/bin/echo", "hi"])
+      assert {"hi\n", 0} = NetRunner.run([@echo, "hi"])
     end
 
     test "preserves a non-zero status" do
@@ -22,7 +24,7 @@ defmodule NetRunner.ExitStatusTest do
     test "does not wait for the force-exit backstop" do
       # The backstop is 5 s. Anything near it means the status came from the
       # timeout rather than from the shepherd.
-      {us, {"hi\n", 0}} = :timer.tc(fn -> NetRunner.run(["/bin/echo", "hi"]) end)
+      {us, {"hi\n", 0}} = :timer.tc(fn -> NetRunner.run([@echo, "hi"]) end)
       assert us < 1_000_000
     end
 
@@ -105,6 +107,35 @@ defmodule NetRunner.ExitStatusTest do
       ref = Process.monitor(pid)
       Process.exit(second, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 2_000
+    end
+  end
+
+  describe "post-spawn MSG_ERROR" do
+    import ExUnit.CaptureLog
+
+    test "is recorded in stats as :shepherd_error" do
+      # The current shepherd only emits MSG_ERROR before the fd handshake, so
+      # the post-spawn path is driven by injecting the frame into the UDS
+      # carry and waking the drain the same way a readiness message would.
+      {:ok, pid} = Proc.start("sleep", ["100"])
+      assert Proc.stats(pid).shepherd_error == nil
+
+      msg = "cgroup_cleanup: write to cgroup.kill failed"
+      frame = <<0x82, byte_size(msg)::big-unsigned-16, msg::binary>>
+      %{uds_socket: socket} = :sys.get_state(pid)
+
+      log =
+        capture_log(fn ->
+          :sys.replace_state(pid, &%{&1 | uds_carry: &1.uds_carry <> frame})
+          send(pid, {:"$socket", socket, :select, make_ref()})
+          assert Proc.stats(pid).shepherd_error == msg
+        end)
+
+      assert log =~ "shepherd reported error"
+      assert Proc.alive?(pid)
+
+      Proc.kill(pid, :sigkill)
+      Proc.await_exit(pid)
     end
   end
 

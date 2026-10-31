@@ -44,7 +44,7 @@ defmodule NetRunner.PtyTest do
       i=0
       while [ "$(stty size)" != "40 120" ]; do
         i=$((i + 1))
-        [ "$i" -gt 100 ] && { echo "NEVER RESIZED: $(stty size)"; exit 1; }
+        [ "$i" -gt 100 ] && { echo "WINSIZE_UNCHANGED: $(stty size)"; exit 1; }
         sleep 0.05
       done
       echo RESIZED
@@ -54,7 +54,8 @@ defmodule NetRunner.PtyTest do
       assert :ok = Proc.set_window_size(pid, 40, 120)
 
       output = read_until_eof(pid, "")
-      assert output =~ "RESIZED", "child never saw 40x120: #{inspect(output)}"
+      assert output =~ ~r/^RESIZED/m, "child never saw 40x120: #{inspect(output)}"
+      refute output =~ "WINSIZE_UNCHANGED"
       assert {:ok, 0} = Proc.await_exit(pid, 10_000)
     end
 

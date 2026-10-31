@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 mix deps.get              # Fetch dependencies
 mix compile               # Compile Elixir + C code (via elixir_make)
-mix test                  # Run full test suite (47 tests)
+mix test                  # Run full test suite (~250 tests)
 mix test test/process_test.exs          # Run a single test file
 mix test test/process_test.exs:10       # Run a single test at line
 mix format                # Auto-format code
@@ -34,7 +34,7 @@ NetRunner is a safe OS process execution library for Elixir with NIF-based backp
 
 1. **Shepherd** — detects BEAM death (POLLHUP on UDS), kills child process group
 2. **Watcher GenServer** — monitors Process GenServer, kills OS process on DOWN
-3. **NIF destructor** — closes FDs on garbage collection
+3. **NIF owner monitor** — `io_resource_down` closes FDs when the owning process dies (the destructor only runs for resources with no live `enif_select`)
 
 ### Spawn Sequence
 
@@ -49,7 +49,8 @@ NetRunner is a safe OS process execution library for Elixir with NIF-based backp
 - `NetRunner` — top-level API (`run/2`, `stream!/2`, `stream/2`)
 - `NetRunner.Process` — GenServer owning the OS process lifecycle
 - `NetRunner.Process.Exec` — spawn logic (UDS, Port, SCM_RIGHTS, Pipe creation)
-- `NetRunner.Process.Nif` — NIF stubs (`nif_read`, `nif_write`, `nif_close`, `nif_create_fd`, `nif_kill`)
+- `NetRunner.Nif` — NIF stubs (`nif_read`, `nif_write`, `nif_close`, `nif_create_fd`, `nif_kill`)
+- `NetRunner.Process.Protocol` — shepherd wire protocol: frame constants, parser, command encoders
 - `NetRunner.Process.Pipe` — struct wrapping a NIF resource with owner/type metadata
 - `NetRunner.Process.Operations` — pending operation queue (park on EAGAIN, retry on select)
 - `NetRunner.Stream` — `Stream.resource` wrapper with concurrent input writer Task
@@ -96,3 +97,19 @@ Shepherd→BEAM: `MSG_CHILD_STARTED(pid)`, `MSG_CHILD_EXITED(status)`, `MSG_ERRO
   same machine state when a gate reads ambiguous. `@default_read_size`
   and scheduler placement are benchmark-pinned DO-NOT-REOPEN
   (`docs/decisions.md`).
+
+## Third-Party Contributions (maintainer policy)
+
+- **Respect the contributor's PR.** Never cherry-pick, copy, or
+  re-implement a third-party PR's work in our own commits. Review it,
+  then either merge their PR or request specific changes / a rebase from
+  the author. If master already covers it, say so on the PR and ask the
+  author how they want to proceed.
+- **Trust nothing: every third-party PR gets a security check** before
+  any recommendation to merge, assuming the author could be malicious or
+  compromised: build-time execution (Makefile/mix.exs), CI/workflow and
+  publish-job changes, C memory safety, auth/handshake, signal/pid
+  routing, env/secret leakage, hidden Unicode, per-commit provenance.
+  Dependency bumps (Dependabot included) get the `deps-audit` check.
+- **Never build or run third-party PR code on the host.** Static review
+  first; anything that must execute runs in a disposable container.

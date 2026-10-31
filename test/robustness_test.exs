@@ -27,20 +27,23 @@ defmodule NetRunner.RobustnessTest do
       Proc.stop(pid)
       eventually(fn -> not os_pid_alive?(os_pid) end, 5_000)
     end
-  end
 
-  # Parent-pid lookup that works on busybox too: Alpine's `ps` supports
-  # neither `-p` nor `ppid=`, but /proc is always there on Linux; macOS has
-  # no /proc and a full BSD ps.
-  defp parent_pid!(os_pid) do
-    case File.read("/proc/#{os_pid}/status") do
-      {:ok, status} ->
-        [_, ppid] = Regex.run(~r/^PPid:\s+(\d+)$/m, status)
-        String.to_integer(ppid)
+    test "kill/2 signals the orphaned child directly once the shepherd is gone" do
+      # With the shepherd alive, CMD_KILL over the UDS is the only signaller.
+      # Once the shepherd Port is dead nothing else can reach the child, so
+      # kill/2 must fall through to the probe-then-kill NIF path — a guard
+      # inverted to "only when alive" would leave `sleep` running here.
+      {:ok, pid} = Proc.start("sleep", ["100"])
+      os_pid = Proc.os_pid(pid)
 
-      {:error, _} ->
-        {out, 0} = System.cmd("ps", ["-o", "ppid=", "-p", to_string(os_pid)])
-        out |> String.trim() |> String.to_integer()
+      System.cmd("kill", ["-KILL", to_string(parent_pid!(os_pid))])
+      eventually(fn -> Port.info(:sys.get_state(pid).shepherd_port) == nil end)
+      assert os_pid_alive?(os_pid)
+
+      assert :ok = Proc.kill(pid, :sigkill)
+      eventually(fn -> not os_pid_alive?(os_pid) end)
+
+      Proc.stop(pid)
     end
   end
 

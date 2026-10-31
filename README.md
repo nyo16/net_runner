@@ -12,7 +12,7 @@ NetRunner combines NIF-based async I/O (`enif_select`) with a persistent **sheph
 ```elixir
 def deps do
   [
-    {:net_runner, "~> 1.3"}
+    {:net_runner, "~> 1.4"}
   ]
 end
 ```
@@ -408,7 +408,11 @@ Isolate child processes in a cgroup v2 hierarchy for resource control:
 )
 ```
 
-The shepherd creates the cgroup directory, moves the child into it, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the directory). No-op on macOS.
+The shepherd creates the cgroup directory (and its `net_runner/` parent if missing), moves the child into it *before* `execvp`, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the leaf; the shared parent is left in place). Spawns fail closed with `{:error, {:shepherd_error, msg}}` when the parent or leaf cannot be created, the leaf already exists, the migration is refused, or `cgroup.kill` (Linux ≥ 5.14) is unavailable. No-op on macOS.
+
+Requirements: cgroup v2, with `/sys/fs/cgroup` writable by the BEAM's user (root, or a delegated root), plus write access to the `cgroup.procs` of the nearest common ancestor of the BEAM's cgroup and the target (usually the root) so the child can be migrated. If an administrator pre-creates and delegates `/sys/fs/cgroup/net_runner` instead, only that subtree needs to be writable.
+
+Paths must sit under `net_runner/`. An unprefixed path (accepted by 1.3.x, rejected by 1.4.0) is placed under the prefix since 1.4.1 — `"job"` becomes `"net_runner/job"` — with a once-per-VM deprecation warning; it will raise in 2.0.
 
 ## Command DSL
 
@@ -516,7 +520,7 @@ end, max_concurrency: 20)
 | `:env` | map \| list of pairs \| `{:replace, map \| list}` | `nil` | Child environment changes. A binary sets a variable. `nil` removes it. `{:replace, environment}` removes all unselected variables. |
 | `:pty` | boolean | `false` | Use pseudo-terminal |
 | `:kill_timeout` | integer | `5000` | SIGTERM→SIGKILL escalation timeout in ms |
-| `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only); must sit under a `net_runner/` prefix and be under 256 bytes |
+| `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only) under a `net_runner/` prefix, under 256 bytes; unprefixed paths are prefixed (deprecated) |
 | `:cwd` | string | `nil` | Child working directory. Defaults to the BEAM working directory. |
 
 Unknown options raise `ArgumentError` (`Keyword.validate!/2`) instead of being
@@ -609,6 +613,33 @@ relying on them.
 - C compiler (`gcc` or `clang`)
 - `make`
 - Linux or macOS
+
+### Building for another target
+
+`make` writes the shepherd and NIF to `priv/`, or to the directory given as
+`PRIV_DIR` on its command line, and writes nothing else. A release for another
+target, such as one that ships a musl BEAM to glibc hosts, can build into its
+own `priv`. The NIF must be built against the ERTS that will load it. Run the
+build on a Linux host, because the Makefile selects its platform flags from the
+host's `uname`.
+
+```sh
+make -B all \
+  CC="zig cc -target x86_64-linux-musl" \
+  ERTS_INCLUDE_DIR=/path/to/target/erts-VERSION/include \
+  PRIV_DIR=/path/to/release/lib/net_runner-VERSION/priv
+```
+
+`-B` is required when `PRIV_DIR` already holds binaries, as an assembled
+release's `priv` does: `mix release` copies the host-built shepherd and NIF
+there with fresh timestamps, and make rebuilds only on source changes, not on
+a different `CC` or flags, so without `-B` it would report nothing to do and
+the host binaries would ship.
+
+zig cc already links musl targets statically. With gcc or clang and a static
+libc, such as musl's, `SHEPHERD_STATIC=1` links the shepherd as a static PIE.
+CI exercises `SHEPHERD_STATIC=1` with musl only. A static shepherd carries the
+libc it was linked against, so rebuild it to pick up libc security fixes.
 
 ## License
 

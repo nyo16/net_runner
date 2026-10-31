@@ -368,8 +368,8 @@ defmodule NetRunner do
         {:ok, exit_status} = Proc.await_exit(pid)
 
         if io.capture_stderr? do
-          # Read the tail only after the exit: the internal drain has seen
-          # stderr EOF by then, so the tail is complete.
+          # Read the tail only after the exit: the server drains whatever
+          # stderr is still buffered before await_exit/2 replies.
           {output, exit_status, Proc.stderr_tail(pid)}
         else
           {output, exit_status}

@@ -33,8 +33,15 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
+      # Run this before any other build step. Later steps build into priv/, and
+      # a stray write there would then go unnoticed.
+      - name: Build into another PRIV_DIR, leaving the tree unchanged
+        run: |
+          make all PRIV_DIR="$RUNNER_TEMP/priv"
+          test -z "$(git status --porcelain --ignored -- c_src priv)"
+
       - name: Cache deps & build
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             deps
@@ -63,7 +70,7 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: deps
           key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
@@ -85,7 +92,7 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps & build
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             deps
@@ -133,7 +140,7 @@ jobs:
           otp-version: ${{ matrix.otp }}
 
       - name: Cache deps & build
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             deps
@@ -148,16 +155,23 @@ jobs:
       # Delegate a cgroup v2 subtree to the runner user so the positive-path
       # cgroup tests (test/cgroup_test.exs) exercise the privileged branch.
       # The shepherd hardcodes /sys/fs/cgroup/<path> and the Elixir side only
-      # accepts paths under net_runner/, so no env var is needed — just a
-      # writable net_runner/ subtree. Root cgroup.procs must also be writable
-      # to migrate a process across the common ancestor (cgroup v2 delegation
-      # containment rule).
+      # accepts paths under net_runner/, so just a writable net_runner/
+      # subtree is needed (chowning the hosted runner's cgroup root does not
+      # make it writable). The shepherd's on-demand ancestor creation
+      # (issue #24) is still exercised: the nested-parent test creates a
+      # fresh net_runner/parent_N/ on every run. Root cgroup.procs must also
+      # be writable to migrate a process across the common ancestor (cgroup
+      # v2 delegation containment rule). NR_CGROUP_DELEGATED=1 turns the
+      # tests' degraded (fail-closed) branch into a hard failure on this leg,
+      # so a delegation regression cannot pass as a green build with zero
+      # cgroup coverage.
       - name: Delegate cgroup v2 subtree for cgroup tests
         if: runner.os == 'Linux'
         run: |
           sudo mkdir -p /sys/fs/cgroup/net_runner
           sudo chown -R "$(whoami)" /sys/fs/cgroup/net_runner
           sudo chown "$(whoami)" /sys/fs/cgroup/cgroup.procs
+          echo "NR_CGROUP_DELEGATED=1" >> "$GITHUB_ENV"
       - run: mix test
 
   test-alpine:
@@ -165,6 +179,10 @@ jobs:
     runs-on: ubuntu-latest
     # Digest-pinned (alpine:3.22 at time of pinning); Dependabot does not scan
     # `container:` keys, so bump this digest manually when moving minors.
+    # No cgroup delegation here (the container has no writable cgroup v2
+    # tree): the cgroup tests run their fail-closed branch and log
+    # "[degraded]"; the Ubuntu leg above is the one that covers the positive
+    # path.
     container: alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
     env:
       WERROR: "1"
@@ -181,6 +199,13 @@ jobs:
       - run: mix deps.compile
       - run: mix compile
       - run: mix test
+
+      - name: Link the shepherd as a static PIE
+        run: |
+          make all SHEPHERD_STATIC=1 PRIV_DIR=/tmp/static
+          readelf -h /tmp/static/shepherd | grep -q 'DYN'
+          if readelf -l /tmp/static/shepherd | grep -q INTERP; then exit 1; fi
+          /tmp/static/shepherd 2>&1 | grep -q '^usage: shepherd'
 
   deps-latest:
     # Simulates consumer dependency resolution: throw away the lockfile and
@@ -240,7 +265,7 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps & build
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             deps
@@ -250,7 +275,7 @@ jobs:
             ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
       - name: Cache PLTs
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: priv/plts
           key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
@@ -276,7 +301,7 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
 
       - name: Cache deps & build
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             deps
