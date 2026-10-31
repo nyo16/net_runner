@@ -1,6 +1,8 @@
 defmodule NetRunner.CgroupTest do
   use ExUnit.Case, async: true
 
+  import NetRunner.TestHelpers
+
   alias NetRunner.Process, as: Proc
 
   describe "cgroup support" do
@@ -29,6 +31,30 @@ defmodule NetRunner.CgroupTest do
                  "expected a shepherd MSG_ERROR, got: #{inspect(reason)}"
 
           degraded("cgroup plumbing test ran the fail-closed path: #{inspect(reason)}")
+      end
+    end
+
+    @tag :linux_only
+    test "creates missing ancestor cgroups and tears down only the leaf (issue #24)" do
+      # CI delegates a pre-created net_runner/ (the hosted runner's cgroup
+      # root is not writable even after chown), so a fresh intermediate
+      # parent stands in for a fresh hierarchy: same ancestor-creation path.
+      parent = "net_runner/parent_#{:rand.uniform(1_000_000)}"
+      path = parent <> "/leaf"
+      on_exit(fn -> File.rmdir("/sys/fs/cgroup/#{parent}") end)
+
+      case Proc.start("echo", ["hello"], cgroup_path: path) do
+        {:ok, pid} ->
+          {:ok, data} = Proc.read(pid)
+          assert data =~ "hello"
+          assert {:ok, 0} = Proc.await_exit(pid)
+
+          eventually(fn -> not File.exists?("/sys/fs/cgroup/#{path}") end)
+          assert File.dir?("/sys/fs/cgroup/#{parent}"), "shared ancestor was removed"
+
+        {:error, reason} ->
+          assert match?({:shepherd_error, _}, reason)
+          degraded("cgroup ancestor test ran the fail-closed path: #{inspect(reason)}")
       end
     end
 
@@ -90,13 +116,38 @@ defmodule NetRunner.CgroupTest do
       end
     end
 
-    test "rejects cgroup paths outside the net_runner/ prefix" do
-      assert_raise ArgumentError, ~r/net_runner\//, fn ->
-        Proc.start("echo", ["x"], cgroup_path: "system.slice/evil")
+    test "places an unprefixed path under net_runner/ with a one-time deprecation warning" do
+      # 1.3.x accepted unprefixed paths; 1.4.0 raised on them inside a minor
+      # release (issue #24). Until 2.0 they are prefixed instead. This is the
+      # only test in the suite that passes an unprefixed path, so the
+      # once-per-VM warning is still pending when it runs.
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert Proc.validate_opts!(cgroup_path: "legacy_job")[:cgroup_path] ==
+                   "net_runner/legacy_job"
+
+          assert Proc.validate_opts!(cgroup_path: "system.slice/x")[:cgroup_path] ==
+                   "net_runner/system.slice/x"
+        end)
+
+      assert length(String.split(log, "deprecated")) == 2,
+             "expected exactly one deprecation warning, got: #{log}"
+
+      assert Proc.validate_opts!(cgroup_path: "net_runner/job")[:cgroup_path] ==
+               "net_runner/job"
+    end
+
+    test "still rejects paths that name no cgroup or escape after prefixing" do
+      assert_raise ArgumentError, ~r/under net_runner\//, fn ->
+        Proc.start("echo", ["x"], cgroup_path: "net_runner/")
       end
 
-      assert_raise ArgumentError, ~r/net_runner\//, fn ->
-        Proc.start("echo", ["x"], cgroup_path: "net_runner/")
+      assert_raise ArgumentError, ~r/cannot contain '\.\.'/, fn ->
+        Proc.start("echo", ["x"], cgroup_path: "../evil")
+      end
+
+      assert_raise ArgumentError, ~r/256/, fn ->
+        Proc.start("echo", ["x"], cgroup_path: String.duplicate("a", 250))
       end
     end
 

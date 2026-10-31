@@ -149,11 +149,15 @@ jobs:
       # cgroup tests (test/cgroup_test.exs) exercise the privileged branch.
       # The shepherd hardcodes /sys/fs/cgroup/<path> and the Elixir side only
       # accepts paths under net_runner/, so just a writable net_runner/
-      # subtree is needed. Root cgroup.procs must also be writable to migrate
-      # a process across the common ancestor (cgroup v2 delegation
-      # containment rule). NR_CGROUP_DELEGATED=1 turns the tests' degraded
-      # (fail-closed) branch into a hard failure on this leg, so a delegation
-      # regression cannot pass as a green build with zero cgroup coverage.
+      # subtree is needed (chowning the hosted runner's cgroup root does not
+      # make it writable). The shepherd's on-demand ancestor creation
+      # (issue #24) is still exercised: the nested-parent test creates a
+      # fresh net_runner/parent_N/ on every run. Root cgroup.procs must also
+      # be writable to migrate a process across the common ancestor (cgroup
+      # v2 delegation containment rule). NR_CGROUP_DELEGATED=1 turns the
+      # tests' degraded (fail-closed) branch into a hard failure on this leg,
+      # so a delegation regression cannot pass as a green build with zero
+      # cgroup coverage.
       - name: Delegate cgroup v2 subtree for cgroup tests
         if: runner.os == 'Linux'
         run: |

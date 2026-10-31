@@ -88,6 +88,29 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
 
 ### Fixed
 
+- **cgroup parent is created on demand** ([#24](https://github.com/nyo16/net_runner/issues/24)).
+  The shepherd now creates the shared `net_runner/` parent (and any
+  intermediate components) when missing, tolerating `EEXIST` so concurrent
+  sibling spawns do not race; the documented `cgroup_path: "net_runner/job"`
+  failed with `mkdir failed: No such file or directory` on a fresh
+  hierarchy. Ancestors are shared and never torn down; the ownership guard
+  stays on the leaf. A parent that cannot be created gets its own error
+  (`"cgroup_setup: cannot create parent cgroup net_runner: Permission
+  denied"`) so a non-delegated root is distinguishable from a leaf
+  collision. The delegated Linux CI leg pre-creates `net_runner/`, which is
+  what hid this; a new test now spawns into a fresh nested parent so
+  on-demand creation runs on every build.
+- **Unprefixed `cgroup_path` works again** ([#24](https://github.com/nyo16/net_runner/issues/24)).
+  1.4.0 raised `ArgumentError` for a path outside `net_runner/`, breaking
+  1.3.x callers within a minor release. Such a path is now placed under the
+  prefix (`"job"` → `"net_runner/job"`) with a once-per-VM deprecation
+  warning; it will raise in 2.0.
+- **`stderr_tail/1` is complete once `await_exit/2` returns** ([#22](https://github.com/nyo16/net_runner/issues/22)).
+  In `:consume` mode (and `run/2` with `stderr: :capture`) the drain was only
+  driven by stderr readiness events, so when the shepherd's exit message won
+  the race the retained tail missed the child's last writes. The exit path
+  now drains buffered stderr before replying, as it already did for parked
+  readers.
 - **EINTR is retried** in the NIF `read(2)`/`write(2)` loops and shepherd
   I/O; a transient signal can no longer permanently wedge a drain loop.
 - **Shepherd diagnostics surface.** A spawn-stage `MSG_ERROR` (cgroup
@@ -192,7 +215,11 @@ cycle below (numbers are medians on an Apple M1 Max, OTP 29 / erts 17.0.3,
   cgroup directory it created itself; a pre-existing directory is attached to
   but never destroyed. `cgroup_path` must now sit under a `net_runner/`
   prefix and be under 256 bytes — over-length paths are rejected instead of
-  silently truncated to a different cgroup.
+  silently truncated to a different cgroup. **Breaking** for callers passing
+  an unprefixed path (they raise `ArgumentError`); the next release restores
+  them with a deprecation warning. The `net_runner/` parent is not created
+  by this release — pre-create `/sys/fs/cgroup/net_runner` (fixed next
+  release, [#24](https://github.com/nyo16/net_runner/issues/24)).
 - **Port FDs are CLOEXEC.** The shepherd marks fds 3/4 (the `:nouse_stdio`
   port channel) close-on-exec, so the child cannot inherit a handle to the
   BEAM.
