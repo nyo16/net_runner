@@ -97,3 +97,19 @@ Shepherd→BEAM: `MSG_CHILD_STARTED(pid)`, `MSG_CHILD_EXITED(status)`, `MSG_ERRO
   same machine state when a gate reads ambiguous. `@default_read_size`
   and scheduler placement are benchmark-pinned DO-NOT-REOPEN
   (`docs/decisions.md`).
+
+## Third-Party Contributions (maintainer policy)
+
+- **Respect the contributor's PR.** Never cherry-pick, copy, or
+  re-implement a third-party PR's work in our own commits. Review it,
+  then either merge their PR or request specific changes / a rebase from
+  the author. If master already covers it, say so on the PR and ask the
+  author how they want to proceed.
+- **Trust nothing: every third-party PR gets a security check** before
+  any recommendation to merge, assuming the author could be malicious or
+  compromised: build-time execution (Makefile/mix.exs), CI/workflow and
+  publish-job changes, C memory safety, auth/handshake, signal/pid
+  routing, env/secret leakage, hidden Unicode, per-commit provenance.
+  Dependency bumps (Dependabot included) get the `deps-audit` check.
+- **Never build or run third-party PR code on the host.** Static review
+  first; anything that must execute runs in a disposable container.
