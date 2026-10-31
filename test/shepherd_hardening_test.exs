@@ -8,7 +8,6 @@ defmodule NetRunner.ShepherdHardeningTest do
   # failure does not exercise it: that path was already gated before.
   use ExUnit.Case, async: true
 
-  import ExUnit.CaptureLog
   import NetRunner.TestHelpers
 
   alias NetRunner.{Daemon, Nif, Signal}
@@ -174,15 +173,13 @@ defmodule NetRunner.ShepherdHardeningTest do
       os_pid = Proc.os_pid(pid)
       shepherd = parent_pid!(os_pid)
 
-      log =
-        capture_log(fn ->
-          System.cmd("kill", ["-TERM", to_string(shepherd)])
-          # Default-action death reported nothing and the BEAM synthesised
-          # 137 (finish_orphaned); the ladder SIGTERMs sleep → 128 + 15.
-          assert {:ok, 143} = Proc.await_exit(pid, 5_000)
-        end)
-
-      refute log =~ "without reporting the child's exit"
+      System.cmd("kill", ["-TERM", to_string(shepherd)])
+      # Default-action death reported nothing and the BEAM synthesised 137
+      # (finish_orphaned); the ladder SIGTERMs sleep and reports 128 + 15, so
+      # the status alone proves the real exit frame arrived. (No capture_log
+      # assertion: it collects every process's logs, and concurrent tests kill
+      # shepherds on purpose.)
+      assert {:ok, 143} = Proc.await_exit(pid, 5_000)
       eventually(fn -> not os_pid_alive?(os_pid) end)
       Proc.stop(pid)
     end
