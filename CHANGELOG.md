@@ -97,8 +97,9 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
   stays on the leaf. A parent that cannot be created gets its own error
   (`"cgroup_setup: cannot create parent cgroup net_runner: Permission
   denied"`) so a non-delegated root is distinguishable from a leaf
-  collision. The delegated Linux CI leg no longer pre-creates
-  `net_runner/`, which is what hid this.
+  collision. The delegated Linux CI leg pre-creates `net_runner/`, which is
+  what hid this; a new test now spawns into a fresh nested parent so
+  on-demand creation runs on every build.
 - **Unprefixed `cgroup_path` works again** ([#24](https://github.com/nyo16/net_runner/issues/24)).
   1.4.0 raised `ArgumentError` for a path outside `net_runner/`, breaking
   1.3.x callers within a minor release. Such a path is now placed under the

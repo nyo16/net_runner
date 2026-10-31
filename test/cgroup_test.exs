@@ -36,9 +36,9 @@ defmodule NetRunner.CgroupTest do
 
     @tag :linux_only
     test "creates missing ancestor cgroups and tears down only the leaf (issue #24)" do
-      # A fresh intermediate parent stands in for a fresh hierarchy: CI's
-      # delegation no longer pre-creates net_runner/ either, so the first
-      # cgroup spawn of the run also creates that one.
+      # CI delegates a pre-created net_runner/ (the hosted runner's cgroup
+      # root is not writable even after chown), so a fresh intermediate
+      # parent stands in for a fresh hierarchy: same ancestor-creation path.
       parent = "net_runner/parent_#{:rand.uniform(1_000_000)}"
       path = parent <> "/leaf"
       on_exit(fn -> File.rmdir("/sys/fs/cgroup/#{parent}") end)
