@@ -8,8 +8,19 @@ defmodule NetRunner.SpawnFailureTest do
 
   describe "a shepherd that cannot start" do
     test "is reported as a spawn failure, not a connect timeout" do
-      assert {:error, {:shepherd_spawn_failed, _reason}} =
-               NetRunner.run([@sh, "-c", @unexecable_arg])
+      # The token write races the failed exec; with the port linked, the
+      # resulting :epipe exit used to kill the spawning process ({:error,
+      # :epipe}) in roughly one run in ten. Repeat enough to catch that.
+      results =
+        1..50
+        |> Task.async_stream(fn _ -> NetRunner.run([@sh, "-c", @unexecable_arg]) end,
+          max_concurrency: 8,
+          timeout: 30_000
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      assert Enum.all?(results, &match?({:error, {:shepherd_spawn_failed, _}}, &1)),
+             "got: #{inspect(Enum.uniq(results))}"
     end
   end
 

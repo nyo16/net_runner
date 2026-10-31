@@ -74,6 +74,40 @@ defmodule NetRunner.CwdTest do
     end
   end
 
+  describe "cwd: and env: through the other entry points" do
+    test "stream!/2", %{dir: dir, physical: physical} do
+      assert [@pwd] |> NetRunner.stream!(cwd: dir) |> Enum.join() |> String.trim() == physical
+    end
+
+    test "Process.start/3", %{dir: dir, physical: physical} do
+      {:ok, pid} =
+        NetRunner.Process.start("/bin/sh", ["-c", "pwd -P; echo $PROBE_ONE"],
+          cwd: dir,
+          env: {:replace, %{"PROBE_ONE" => "one"}}
+        )
+
+      assert read_all(pid) == physical <> "\none\n"
+      assert {:ok, 0} = NetRunner.Process.await_exit(pid)
+    end
+
+    test "Daemon process_opts", %{dir: dir, physical: physical} do
+      Process.flag(:trap_exit, true)
+      test = self()
+
+      {:ok, daemon} =
+        NetRunner.Daemon.start_link(
+          cmd: @pwd,
+          args: [],
+          process_opts: [cwd: dir],
+          on_output: fn data -> send(test, {:output, data}) end
+        )
+
+      assert_receive {:output, data}, 2_000
+      assert String.trim(data) == physical
+      assert_receive {:EXIT, ^daemon, {:shutdown, {:exit_status, 0}}}, 5_000
+    end
+  end
+
   describe "a cwd that is not a path" do
     test "is refused before anything is spawned" do
       assert_raise ArgumentError, ~r/:cwd/, fn -> NetRunner.run([@pwd], cwd: "") end
@@ -84,6 +118,13 @@ defmodule NetRunner.CwdTest do
 
       assert_raise ArgumentError, ~r/:cwd/, fn -> NetRunner.run([@pwd], cwd: :tmp) end
       assert_raise ArgumentError, ~r/:cwd/, fn -> NetRunner.run([@pwd], cwd: ~c"/tmp") end
+    end
+  end
+
+  defp read_all(pid, acc \\ "") do
+    case NetRunner.Process.read(pid) do
+      {:ok, data} -> read_all(pid, acc <> data)
+      :eof -> acc
     end
   end
 

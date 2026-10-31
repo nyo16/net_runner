@@ -58,6 +58,64 @@ defmodule NetRunner.EnvReplaceTest do
       assert {"1\n", 0} = NetRunner.run([@sh, "-c", script])
     end
 
+    test "the shepherd filters the child's environment on its own" do
+      # Drives the shepherd directly, so the BEAM-side unset layer is out of
+      # the picture: NET_RUNNER_LATE_VARIABLE reaches the shepherd, and only
+      # its --replace-env allowlist can keep it from the child.
+      dir = tmp_dir("nr_allowlist")
+      socket_path = Path.join(dir, "shepherd.sock")
+      result_path = Path.join(dir, "result")
+      shepherd = Path.join(to_string(:code.priv_dir(:net_runner)), "shepherd")
+      token = String.duplicate("0", 32)
+
+      {:ok, listener} = :socket.open(:local, :stream)
+      :ok = :socket.bind(listener, %{family: :local, path: socket_path})
+      :ok = :socket.listen(listener)
+
+      script = "printf %s \"${NET_RUNNER_LATE_VARIABLE-absent}\" > #{result_path}"
+
+      port =
+        Port.open(
+          {:spawn_executable, shepherd},
+          [
+            :nouse_stdio,
+            :exit_status,
+            :binary,
+            args: [socket_path, "--token-fd", "--replace-env", "0", "--", @sh, "-c", script],
+            env: [{~c"NET_RUNNER_LATE_VARIABLE", ~c"leaked"}]
+          ]
+        )
+
+      true = Port.command(port, token)
+      {:ok, connection} = :socket.accept(listener, 5_000)
+
+      assert_receive {^port, {:exit_status, 0}}, 5_000
+      assert File.read!(result_path) == "absent"
+
+      :socket.close(connection)
+      :socket.close(listener)
+    end
+
+    test "flag-like names stay names, never shepherd flags" do
+      # The allowlist sits before "--" in the shepherd argv and is consumed by
+      # count; a name like "--cwd" must not be parsed as an option.
+      env = System.find_executable("env") || flunk("this test needs `env` as an executable")
+
+      assert {output, 0} =
+               NetRunner.run([env],
+                 env: {:replace, %{"--" => "a", "--cwd" => "/", "--pty" => "b"}}
+               )
+
+      assert output |> String.split("\n", trim: true) |> Enum.sort() ==
+               ["--=a", "--cwd=/", "--pty=b"]
+    end
+
+    test "a non-ASCII UTF-8 name survives the replacement" do
+      env = System.find_executable("env") || flunk("this test needs `env` as an executable")
+
+      assert {"NAMÉ=x\n", 0} = NetRunner.run([env], env: {:replace, %{"NAMÉ" => "x"}})
+    end
+
     test "a non-ASCII UTF-8 value survives the replacement" do
       assert {"héllo", 0} =
                NetRunner.run([@sh, "-c", "printf %s \"$PROBE_ONE\""],

@@ -32,9 +32,10 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 - **The native build writes no object files.** Each binary is compiled and
   linked in one step, so `make PRIV_DIR=…` leaves the source tree unchanged.
-- **`:env` names and values must be valid UTF-8.** Port environment entries
-  are now character lists; non-UTF-8 values, previously passed as raw bytes,
-  raise `ArgumentError`.
+- **Breaking: `:env` names and values must be valid UTF-8.** 1.4.x passed
+  values as raw bytes (and documented that non-UTF-8 values no longer
+  raise); they are now converted to port charlists, and a non-UTF-8 name or
+  value raises `ArgumentError`.
 
 ### Fixed
 

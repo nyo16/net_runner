@@ -469,7 +469,7 @@ defmodule NetRunner.Process.Exec do
 
   defp normalize_environment!(environment) do
     raise ArgumentError,
-          ":env must be a map or a list of {name, value} pairs, got: #{inspect(environment)}"
+          ":env must be a map or a list of {name, value} pairs, got #{env_shape(environment)}"
   end
 
   defp normalize_env_entries!([], environment), do: Map.to_list(environment)
@@ -488,12 +488,24 @@ defmodule NetRunner.Process.Exec do
   end
 
   defp normalize_env_entries!([other | _rest], _environment) do
-    raise ArgumentError, ":env entry must be a {name, value} pair, got: #{inspect(other)}"
+    raise ArgumentError, ":env entry must be a {name, value} pair, got #{env_shape(other)}"
   end
 
   defp normalize_env_entries!(tail, _environment) do
-    raise ArgumentError, ":env must be a proper list, got tail: #{inspect(tail)}"
+    raise ArgumentError, ":env must be a proper list, got an improper tail: #{env_shape(tail)}"
   end
+
+  # Describes a malformed :env term without echoing it. Environment values
+  # are often secrets, and ArgumentError messages end up in logs and crash
+  # reports; names are shown (via inspect) elsewhere, values never.
+  defp env_shape(term) when is_struct(term), do: "a %#{inspect(term.__struct__)}{} struct"
+  defp env_shape(term) when is_tuple(term), do: "a #{tuple_size(term)}-tuple"
+  defp env_shape(term) when is_binary(term), do: "a binary"
+  defp env_shape(term) when is_list(term), do: "a list"
+  defp env_shape(term) when is_map(term), do: "a map"
+  defp env_shape(term) when is_atom(term), do: inspect(term)
+  defp env_shape(term) when is_number(term), do: "a number"
+  defp env_shape(_term), do: "an unsupported term"
 
   defp validate_env_name!(name) do
     cond do
@@ -513,10 +525,10 @@ defmodule NetRunner.Process.Exec do
   defp validate_env_value!(name, value) do
     cond do
       String.contains?(value, <<0>>) ->
-        raise ArgumentError, ":env value for #{name} must not contain NUL bytes"
+        raise ArgumentError, ":env value for #{inspect(name)} must not contain NUL bytes"
 
       not String.valid?(value) ->
-        raise ArgumentError, ":env value for #{name} must be UTF-8 text"
+        raise ArgumentError, ":env value for #{inspect(name)} must be UTF-8 text"
 
       true ->
         :ok
@@ -734,12 +746,23 @@ defmodule NetRunner.Process.Exec do
     :error, :badarg -> :ok
   end
 
-  # Port environment entries are character lists. Byte lists double-encode UTF-8.
+  # The port interprets env charlists in the VM's native filename encoding:
+  # under :utf8 each element is a codepoint, under :latin1 each element is one
+  # byte. Byte lists on a UTF-8 VM double-encode non-ASCII text (`é` arrives as
+  # c3 83 c2 a9); codepoint lists on a latin1 VM corrupt it (`é` arrives as
+  # e9) or raise above U+00FF. Either way the child gets the binary's bytes.
   defp format_env(env) do
     Enum.map(env, fn
-      {name, nil} -> {String.to_charlist(name), false}
-      {name, value} -> {String.to_charlist(name), String.to_charlist(value)}
+      {name, nil} -> {env_chars(name), false}
+      {name, value} -> {env_chars(name), env_chars(value)}
     end)
+  end
+
+  defp env_chars(binary) do
+    case :file.native_name_encoding() do
+      :utf8 -> String.to_charlist(binary)
+      :latin1 -> :binary.bin_to_list(binary)
+    end
   end
 
   defp environment_options(nil), do: {[], nil}

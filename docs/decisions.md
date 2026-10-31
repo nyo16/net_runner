@@ -205,8 +205,9 @@ the BEAM.
   `PATH` to resolve the executable.
 - A port cannot set a variable to an empty value. `""` and `nil` both remove
   the variable.
-- Port environment entries are character lists, so names and values must be
-  valid UTF-8.
+- Port environment entries are character lists in the VM's native filename
+  encoding (codepoints under `:utf8`, bytes under `:latin1`), so names and
+  values must be valid UTF-8; the child always receives their UTF-8 bytes.
 - Invalid entries raise `ArgumentError` before NetRunner starts the shepherd.
 - An environment over the platform limit returns
   `{:shepherd_spawn_failed, reason}`.
