@@ -19,6 +19,17 @@
  *   MSG_CHILD_STARTED [0x80] [pid: 4 bytes, big-endian]
  *   MSG_CHILD_EXITED  [0x81] [status: 4 bytes, big-endian]
  *   MSG_ERROR         [0x82] [length: 2 bytes, big-endian] [message: N bytes]
+ *
+ * Hand-off order: SCM_RIGHTS fds, then MSG_CHILD_STARTED; the child execs
+ * only after both were sent. The SCM_RIGHTS message carries
+ * [stdin_w, stdout_r, stderr_r] (pipe mode) or [master] (PTY mode),
+ * followed on Linux by a pidfd for the child when pidfd_open succeeded.
+ * An unknown command opcode makes the shepherd ignore all further command
+ * bytes (sticky); BEAM death is still detected.
+ *
+ * MSG_CHILD_EXITED status is the exit code (0..255), 128 + signal for a
+ * signal death, or EXIT_STATUS_UNKNOWN for any other wait status. It is
+ * sent after the child's process group was swept and its cgroup removed.
  */
 
 /* BEAM -> Shepherd commands */
@@ -43,5 +54,9 @@
 
 /* Default kill escalation timeout: SIGTERM -> wait -> SIGKILL */
 #define DEFAULT_KILL_TIMEOUT_MS 5000
+
+/* MSG_CHILD_EXITED status for a wait status that is neither an exit nor a
+ * signal death (never -1 / 0xFFFFFFFF on the wire) */
+#define EXIT_STATUS_UNKNOWN 255
 
 #endif /* NET_RUNNER_PROTOCOL_H */
