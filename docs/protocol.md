@@ -10,18 +10,23 @@ Communication between the BEAM and the shepherd binary occurs over a Unix domain
    directory) and generates a per-spawn 16-byte random token
 2. BEAM spawns shepherd via `Port.open` with the UDS path as argv[1] and the
    `--token-fd` flag, then writes the 32-byte hex token to the shepherd over
-   the private fd-3 port channel
+   the private fd-3 port channel. For a replacement environment, the port
+   environment already unsets every unselected variable the BEAM saw, and
+   `--replace-env` carries the selected-name allowlist
 3. Shepherd reads the token from fd 3, connects to the UDS and writes the
    32 hex bytes verbatim as its very first frame
 4. BEAM verifies the token (and, where the platform exposes peer
    credentials, the peer uid); a failed or stalling connection is closed and
    the BEAM keeps accepting until the deadline
-5. Shepherd forks the child process
-6. Shepherd sends pipe FDs via `SCM_RIGHTS` (1 message)
-7. Shepherd sends `MSG_CHILD_STARTED` (may be in same recv as FDs)
-8. Bidirectional command/notification flow begins
-9. On child exit: `MSG_CHILD_EXITED`, shepherd exits
-10. On BEAM death: shepherd sees `POLLHUP`, kills child
+5. Shepherd enters `--cwd` when present (`MSG_ERROR` and exit on failure)
+6. For a replacement environment, shepherd removes every variable outside the
+   selected-name allowlist
+7. Shepherd forks the child process
+8. Shepherd sends pipe FDs via `SCM_RIGHTS` (1 message)
+9. Shepherd sends `MSG_CHILD_STARTED` (can share the FD receive)
+10. Bidirectional command/notification flow starts
+11. On child exit: `MSG_CHILD_EXITED`, shepherd exits
+12. On BEAM death: shepherd sees `POLLHUP`, kills child
 
 ## Authentication Handshake
 
@@ -44,6 +49,15 @@ so an impostor costs only its own connection.
 
 The shepherd binary and the Elixir library always ship together, so there is
 no compatibility shim for token-less shepherds.
+
+The shepherd applies `--cwd` after sending its token (it never learns whether
+the BEAM accepted it). The token must remain the first frame on the socket.
+
+A shepherd that never receives its token exits after `TOKEN_READ_TIMEOUT_MS`
+(10 s, the BEAM's accept deadline). The BEAM unlinks the port for the token
+write, so a spawner killed before writing need not close fd 3; this bound
+keeps such a shepherd from waiting forever. It has no child yet, so nothing
+else is left behind.
 
 ## FD Passing (SCM_RIGHTS)
 
@@ -99,7 +113,7 @@ real status.
 |------|---------|---------|-------------|
 | `0x80` | `MSG_CHILD_STARTED` | `pid` (4 bytes, big-endian) | Child process PID after successful fork+exec |
 | `0x81` | `MSG_CHILD_EXITED` | `status` (4 bytes, big-endian) | Child exit status (exit code or 128+signal) |
-| `0x82` | `MSG_ERROR` | `length` (2 bytes, big-endian) + `message` (N bytes) | Error message string |
+| `0x82` | `MSG_ERROR` | `length` (2 bytes, big-endian) + `message` (N bytes) | Error text (up to 255 bytes). Before FD passing, this frame has no FDs |
 
 ## Exit Status Encoding
 

@@ -172,6 +172,42 @@ When `pty: true` is passed:
 - BEAM dups the FD for independent stdin/stdout NIF resources
 - `set_window_size/3` sends `CMD_SET_WINSIZE` to shepherd, which calls `ioctl(TIOCSWINSZ)`
 
+## Working Directory
+
+The `cwd:` option has this flow:
+- BEAM accepts a non-empty binary without NUL and passes it to the shepherd as
+  `--cwd <dir>`
+- Shepherd calls `chdir()` after sending its token and before `fork()`
+- A failed `chdir()` sends `MSG_ERROR` before the shepherd starts a child
+- The UDS and cgroup paths are absolute, so the directory change does not
+  affect them
+- The directory name is part of the shepherd command line, which any local
+  user can read (`ps`, `/proc/<pid>/cmdline`) just like the child's own
+  arguments, so it must not contain secrets
+
+See ADR-10 in `decisions.md`.
+
+## Environment
+
+The `env:` option has this flow:
+- BEAM validates each name and value and passes them to the `Port.open` `env`
+  option
+- The shepherd and child inherit the resulting environment
+- The values do not appear in the shepherd command line
+- The child uses its `PATH` to resolve the executable
+- `nil` and `""` both remove a variable
+- Names and values must contain valid UTF-8
+
+Replacement mode has two layers. The shepherd gets the selected names as a
+`--replace-env` allowlist and, after sending its token, removes every other
+variable before `fork()`, so the child's environment does not depend on
+timing. The BEAM also unsets, in the port environment, every variable from an
+`:os.env/0` snapshot that the caller did not select, so the shepherd itself
+normally never holds ambient values such as `RELEASE_COOKIE`. The BEAM
+environment does not change.
+
+See ADR-11 and ADR-12 in `decisions.md`.
+
 ## cgroup Support (Linux Only)
 
 When `cgroup_path:` is set (a binary under the `net_runner/` prefix, < 256

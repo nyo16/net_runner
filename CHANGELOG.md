@@ -10,17 +10,45 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 - **`SHEPHERD_STATIC=1`** links the shepherd as a static PIE (Linux only), for
   a release that runs where the build's libc may be absent.
+- **`:cwd` sets the child working directory.** `NetRunner.run/2`, `stream!/2`,
+  `stream/2`, and `NetRunner.Process.start/3` accept `cwd: path`.
+  `NetRunner.Daemon` accepts it in `process_opts`. If the shepherd cannot enter
+  the directory, the spawn returns `{:error, {:shepherd_error, reason}}`.
+  Relative paths use the BEAM working directory. This option does not change
+  `PWD`. See ADR-10 in `docs/decisions.md`.
+- **`:env` accepts maps and lists of `{name, value}` pairs.** A `nil` or empty
+  value removes the variable because a port cannot set an empty value. See
+  ADR-11 in `docs/decisions.md`.
+- **`env: {:replace, environment}` defines the complete child environment.**
+  The shepherd removes every unselected variable before it forks, and the
+  port environment already unsets the unselected variables the BEAM can see,
+  so ambient values such as `RELEASE_COOKIE` normally never reach the
+  shepherd either. An empty map or list gives the child an empty
+  environment. The child uses only the selected `PATH` to resolve its
+  executable. Untagged `env:` remains an overlay. See ADR-12 in
+  `docs/decisions.md`.
 
 ### Changed
 
 - **The native build writes no object files.** Each binary is compiled and
   linked in one step, so `make PRIV_DIR=…` leaves the source tree unchanged.
+- **Breaking: `:env` names and values must be valid UTF-8.** 1.4.x passed
+  values as raw bytes (and documented that non-UTF-8 values no longer
+  raise); they are now converted to port charlists, and a non-UTF-8 name or
+  value raises `ArgumentError`.
 
 ### Fixed
 
 - **The shepherd is compiled with `-fPIE`.** The flag was passed only when
   linking, so a compiler that does not produce position-independent code by
   default could not link the shepherd.
+- **Non-ASCII `:env` values are no longer double-encoded.** Values were passed
+  to the port as byte lists, which the port re-encoded byte by byte, so `é`
+  reached the child as `c3 83 c2 a9`.
+- **Startup failures return promptly.** If the OS rejects the shepherd's
+  arguments or environment, NetRunner returns
+  `{:error, {:shepherd_spawn_failed, reason}}` without waiting for the 10 s
+  socket timeout. An immediate child exit remains a valid spawn.
 
 ## [1.4.1] - 2026-10-31
 

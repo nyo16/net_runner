@@ -68,6 +68,41 @@ static void child_fail(const char *tag, const char *detail) {
     _exit(127);
 }
 
+static void exec_child(char *cmd, char **args, int allow_execvp) {
+    if (!allow_execvp) child_fail("execvp", cmd);
+    execvp(cmd, args);
+    child_fail("execvp", cmd);
+}
+
+extern char **environ;
+
+static char **kept_environment_names = NULL;
+static size_t kept_environment_name_count = 0;
+
+static int keep_environment_entry(const char *entry) {
+    const char *equals = strchr(entry, '=');
+    if (equals == NULL) return 0;
+
+    size_t name_len = (size_t)(equals - entry);
+    for (size_t i = 0; i < kept_environment_name_count; i++) {
+        const char *kept = kept_environment_names[i];
+        if (strlen(kept) == name_len && memcmp(entry, kept, name_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void restrict_environment(void) {
+    if (kept_environment_names == NULL) return;
+
+    char **write = environ;
+    for (char **read = environ; *read != NULL; read++) {
+        if (keep_environment_entry(*read)) *write++ = *read;
+    }
+    *write = NULL;
+}
+
 static void sigchld_handler(int sig) {
     (void)sig;
     int saved_errno = errno;
@@ -98,6 +133,10 @@ static int64_t monotonic_ms(void) {
 /* Bound on how long any single shepherd->BEAM frame may wait for socket
  * buffer space before being dropped. */
 #define UDS_WRITE_TIMEOUT_MS 5000
+
+/* Upper bound on waiting for the handshake token on fd 3; matches the BEAM's
+ * accept deadline, after which the spawn is abandoned anyway. */
+#define TOKEN_READ_TIMEOUT_MS 10000
 
 /*
  * Absolute deadline for one bounded POLLOUT wait, initialised lazily so a
@@ -745,24 +784,29 @@ static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
 }
 
 /*
- * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] [--cgroup-path <rel>] [--] <cmd> [args...]
+ * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] [--cgroup-path <rel>] [--cwd <dir>] [--replace-env <count> <names...>] [--] <cmd> [args...]
  *
  *   uds_path:       Path to the UDS listener socket created by the BEAM
  *   --kill-timeout:  SIGTERM->SIGKILL escalation timeout in ms (default 5000)
  *   --token-fd:     read the 32-char hex handshake token from fd 3 (the
  *                   BEAM port channel) and send it verbatim as the first
  *                   frame after connect so the BEAM can authenticate us
+ *   --cwd:          Directory to run the child in (default: inherited)
+ *   --replace-env:  Count followed by the environment names the child keeps
  *   cmd:            Command to execute
  *   args:           Arguments for the command
  */
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         fprintf(stderr,
-                "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] [--cgroup-path <rel>] [--] <cmd> [args...]\n");
+                "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] "
+                "[--cgroup-path <rel>] [--cwd <dir>] [--replace-env <count> <names...>] "
+                "[--] <cmd> [args...]\n");
         return 1;
     }
 
     const char *uds_path = argv[1];
+    const char *child_cwd = NULL;
     int cmd_idx = 2;
     int token_from_fd = 0;
     char token[TOKEN_HEX_LEN + 1] = {0};
@@ -788,6 +832,25 @@ int main(int argc, char *argv[]) {
              * to exactly the same-uid attacker it exists to stop. */
             token_from_fd = 1;
             cmd_idx += 1;
+        } else if (strcmp(argv[cmd_idx], "--cwd") == 0 && cmd_idx + 1 < argc) {
+            if (argv[cmd_idx + 1][0] == '\0') {
+                fprintf(stderr, "error: --cwd must not be empty\n");
+                return 1;
+            }
+            child_cwd = argv[cmd_idx + 1];
+            cmd_idx += 2;
+        } else if (strcmp(argv[cmd_idx], "--replace-env") == 0 && cmd_idx + 1 < argc) {
+            char *endptr;
+            long count = strtol(argv[cmd_idx + 1], &endptr, 10);
+            long available = (long)argc - cmd_idx - 3;
+            if (*endptr != '\0' || endptr == argv[cmd_idx + 1] ||
+                count < 0 || count > available) {
+                fprintf(stderr, "error: invalid --replace-env count\n");
+                return 1;
+            }
+            kept_environment_names = &argv[cmd_idx + 2];
+            kept_environment_name_count = (size_t)count;
+            cmd_idx += 2 + (int)count;
         } else if (strcmp(argv[cmd_idx], "--cgroup-path") == 0 && cmd_idx + 1 < argc) {
             const char *path = argv[cmd_idx + 1];
             /* Reject path traversal: no ".." components, no leading "/" */
@@ -829,10 +892,31 @@ int main(int argc, char *argv[]) {
     set_cloexec(4);
 
     /* Read the handshake token from the BEAM before touching the UDS. The
-     * port channel is private to the BEAM and this process. */
+     * port channel is private to the BEAM and this process. The BEAM unlinks
+     * the port for this write, so a spawner killed before writing need not
+     * close fd 3: bound the wait by the BEAM's own accept deadline instead of
+     * blocking forever. */
     if (token_from_fd) {
         size_t got = 0;
+        int64_t deadline = monotonic_ms();
+        if (deadline >= 0) deadline += TOKEN_READ_TIMEOUT_MS;
         while (got < TOKEN_HEX_LEN) {
+            int wait_ms = TOKEN_READ_TIMEOUT_MS;
+            if (deadline >= 0) {
+                int64_t now = monotonic_ms();
+                wait_ms = (now < 0 || now >= deadline) ? 0 : (int)(deadline - now);
+            }
+            struct pollfd pfd = { .fd = 3, .events = POLLIN, .revents = 0 };
+            int ready = poll(&pfd, 1, wait_ms);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                perror("token poll");
+                return 1;
+            }
+            if (ready == 0) {
+                fprintf(stderr, "error: timed out waiting for token\n");
+                return 1;
+            }
             ssize_t n = read(3, token + got, TOKEN_HEX_LEN - got);
             if (n < 0) {
                 if (errno == EINTR) continue;
@@ -928,6 +1012,22 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Keep chdir after the token write so the token remains the first frame.
+     * Keep it before fork so a failure can use MSG_ERROR. */
+    if (child_cwd != NULL && chdir(child_cwd) != 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "chdir failed: %s", strerror(errno));
+        send_error(uds_fd, msg);
+        close(uds_fd);
+        return 1;
+    }
+
+    restrict_environment();
+
+    /* A missing PATH normally enables an execvp default. Replacement mode must not. */
+    int allow_execvp = kept_environment_names == NULL ||
+                       strchr(cmd, '/') != NULL || getenv("PATH") != NULL;
+
     pid_t child_pid;
     int shepherd_stdin_w = -1;
 
@@ -1004,8 +1104,7 @@ int main(int argc, char *argv[]) {
             signal(SIGPIPE, SIG_DFL);
 
             setpgid(0, 0);
-            execvp(cmd, cmd_args);
-            child_fail("execvp", cmd);
+            exec_child(cmd, cmd_args, allow_execvp);
         }
 
         /* === Shepherd (PTY) === */
@@ -1184,8 +1283,7 @@ int main(int argc, char *argv[]) {
             signal(SIGPIPE, SIG_DFL);
 
             setpgid(0, 0);
-            execvp(cmd, cmd_args);
-            child_fail("execvp", cmd);
+            exec_child(cmd, cmd_args, allow_execvp);
         }
 
         /* === Shepherd (pipe) === */

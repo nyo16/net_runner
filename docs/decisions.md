@@ -172,3 +172,82 @@ default argument, so there is no second definition to drift.
 Regression guard: `test/io_pipelining_test.exs`, "a saturated stdout read
 returns full-capacity chunks". Reproduce with
 `MIX_ENV=prod mix run bench/claims.exs`, section B.
+
+## ADR-10: Set the Working Directory in the Shepherd
+
+**Context**: Callers sometimes need to set a child working directory. NetRunner
+can set it through the `Port.open` `cd:` option, in the child between `fork()`
+and `exec()`, or in the shepherd before `fork()`.
+
+**Decision**: Pass `--cwd <dir>` to the shepherd. The shepherd calls `chdir()`
+after sending its token and before `fork()`.
+
+**Consequences**:
+- A failed `chdir()` returns `MSG_ERROR` with `strerror(errno)` before a child
+  starts.
+- `Port.open` with `cd:` cannot report this error through the shepherd.
+- A child-side `chdir()` failure would look like an exit status from the child.
+- The selected directory controls relative paths and relative executables.
+- The shepherd also changes directory. Its later filesystem paths are absolute.
+- The directory name appears in the shepherd command line, readable by any
+  local user like the child's own arguments; directory names must not carry
+  secrets. Moving it to the private fd-3 channel was considered and deferred:
+  it would add parsing to the authentication path for a value that is
+  usually as visible as the child's argv.
+
+## ADR-11: Pass the Environment through the Port
+
+**Context**: Callers need to change the environment that the child inherits.
+NetRunner can pass these values through the shepherd command line or through
+the `Port.open` `env:` option.
+
+**Decision**: Use the `Port.open` `env:` option. Validate each name and value in
+the BEAM.
+
+**Consequences**:
+- Environment values do not appear in the shepherd command line.
+- The shepherd and child receive the same environment. `execvp` uses its
+  `PATH` to resolve the executable.
+- A port cannot set a variable to an empty value. `""` and `nil` both remove
+  the variable.
+- Port environment entries are character lists in the VM's native filename
+  encoding (codepoints under `:utf8`, bytes under `:latin1`), so names and
+  values must be valid UTF-8; the child always receives their UTF-8 bytes.
+- Invalid entries raise `ArgumentError` before NetRunner starts the shepherd.
+- An environment over the platform limit returns
+  `{:shepherd_spawn_failed, reason}`.
+
+## ADR-12: Filter Replacement Environments in the Shepherd, Pre-Cleared by the BEAM
+
+**Context**: An overlay cannot remove inherited variables that the caller does
+not know about. Some callers need to define the complete child environment.
+Filtering only in the shepherd leaves ambient values (`RELEASE_COOKIE`, cloud
+credentials) in the shepherd's own environment for the child's lifetime.
+Clearing only in the BEAM, from an `:os.env/0` snapshot, races
+`System.put_env/2` calls made between the snapshot and `Port.open`, and a
+variable set in that window would reach the child.
+
+**Decision**: Add `env: {:replace, environment}` with two layers. The shepherd
+receives the selected names as a `--replace-env` allowlist and removes every
+other variable before `fork()`; this is authoritative for the child. The BEAM
+also unsets, in the `Port.open` environment, every variable from an
+`:os.env/0` snapshot that the caller did not select. Untagged `env:` remains
+an overlay.
+
+**Consequences**:
+- The child receives exactly the selection, independent of timing.
+- The shepherd normally holds no unselected variable; one put into the BEAM
+  environment during the snapshot/`Port.open` window reaches the shepherd but
+  not the child.
+- Values use the same port transport and validation in both modes.
+- Selected names (not values) appear in the shepherd command line and count
+  toward both the argument and environment size limits.
+- Without `PATH`, the shepherd prevents `execvp` from using a default search
+  path.
+- Caller-supplied values, including `LD_PRELOAD`/`DYLD_*`, reach the shepherd
+  as well as the child in both modes, so `env:` must come from trusted input.
+- The BEAM-side clearing also applies to the shepherd's own exec, so loader
+  variables such as `LD_LIBRARY_PATH` are gone unless selected. A shepherd
+  that needs one to start (for example a dynamically linked build under Nix)
+  then fails with `{:shepherd_spawn_failed, _}`; select the variable (it also
+  reaches the child) or build with `SHEPHERD_STATIC=1`.

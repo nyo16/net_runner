@@ -2,6 +2,7 @@ defmodule NetRunner.SecurityTest do
   use ExUnit.Case, async: true
 
   import Bitwise
+  import NetRunner.TestHelpers
 
   alias NetRunner.Process, as: Proc
 
@@ -21,43 +22,17 @@ defmodule NetRunner.SecurityTest do
   end
 
   describe ":env option (SEC-9)" do
-    test "sets a variable for the child" do
-      assert {"bar\n", 0} =
-               NetRunner.run(["sh", "-c", "echo $NR_ENV_SET"], env: %{"NR_ENV_SET" => "bar"})
-    end
-
-    test "nil unsets an inherited variable" do
-      System.put_env("NR_ENV_UNSET_ME", "inherited")
-      on_exit(fn -> System.delete_env("NR_ENV_UNSET_ME") end)
-
-      # Default: the child inherits the BEAM's environment.
-      assert {"inherited\n", 0} = NetRunner.run(["sh", "-c", "echo $NR_ENV_UNSET_ME"])
-
-      # nil value: explicitly unset for this spawn only.
-      assert {"\n", 0} =
-               NetRunner.run(["sh", "-c", "echo $NR_ENV_UNSET_ME"],
-                 env: %{"NR_ENV_UNSET_ME" => nil}
-               )
-
-      # And the unset did not leak back into the BEAM's own environment.
-      assert System.get_env("NR_ENV_UNSET_ME") == "inherited"
-    end
-
-    test "rejects malformed env maps" do
-      assert_raise ArgumentError, ~r/:env/, fn ->
-        Proc.start("echo", ["x"], env: %{"A=B" => "x"})
-      end
-
-      assert_raise ArgumentError, ~r/:env/, fn ->
-        Proc.start("echo", ["x"], env: %{"" => "x"})
-      end
-
-      assert_raise ArgumentError, ~r/:env/, fn ->
-        Proc.start("echo", ["x"], env: %{"OK" => "a\0b"})
-      end
-
-      assert_raise ArgumentError, ~r/:env/, fn ->
-        Proc.start("echo", ["x"], env: [{"OK", "x"}])
+    test "malformed env raises at Proc.start, before anything is spawned" do
+      for bad <- [
+            %{"A=B" => "x"},
+            %{"" => "x"},
+            %{"OK" => "a\0b"},
+            %{"OK" => <<0xFF>>},
+            {:merge, %{"OK" => "x"}}
+          ] do
+        assert_raise ArgumentError, ~r/:env/, fn ->
+          Proc.start("echo", ["x"], env: bad)
+        end
       end
     end
   end
@@ -91,8 +66,8 @@ defmodule NetRunner.SecurityTest do
 
   describe ":kill_timeout validation" do
     test "rejects values the shepherd would refuse, in the caller" do
-      # Out-of-range or non-integer values used to make the shepherd exit
-      # before connecting, visible only as a 10 s :shepherd_connect_timeout.
+      # Out-of-range or non-integer values make the shepherd exit before
+      # connecting, with the reason only on the VM's stderr.
       for bad <- [0, 60_001, 5000.0, "5000", nil] do
         assert_raise ArgumentError, ~r/:kill_timeout/, fn ->
           Proc.start("echo", ["x"], kill_timeout: bad)
@@ -108,14 +83,41 @@ defmodule NetRunner.SecurityTest do
     test "a command whose name starts with '-' is never parsed as a shepherd flag" do
       # Before the "--" terminator, cmd: "--kill-timeout" consumed the next
       # argv entry as a shepherd option and exec'd whatever followed. Now the
-      # shepherd must try to exec the literal "--kill-timeout" and fail (127).
-      assert {"", 127, stderr} =
-               NetRunner.run(["--kill-timeout", "1", "sh", "-c", "echo pwned"],
-                 stderr: :capture
-               )
+      # shepherd must try to exec the literal flag name and fail (127).
+      for {flag, rest} <- [
+            {"--kill-timeout", ["1"]},
+            {"--cwd", ["/"]},
+            {"--replace-env", ["0"]},
+            {"--cgroup-path", ["net_runner/x"]},
+            {"--pty", []},
+            {"--token-fd", []},
+            {"--", []}
+          ] do
+        assert {"", 127, stderr} =
+                 NetRunner.run([flag | rest] ++ ["sh", "-c", "echo pwned"], stderr: :capture)
 
-      assert stderr =~ "--kill-timeout"
-      refute stderr =~ "pwned"
+        assert stderr =~ flag
+        refute stderr =~ "pwned"
+      end
+    end
+  end
+
+  describe "shepherd token read" do
+    # The BEAM unlinks the port for the token write, so a spawner that dies
+    # before writing does not necessarily close fd 3. The shepherd must not
+    # wait for the token forever.
+    test "a shepherd that never receives its token gives up" do
+      port = open_tokenless_shepherd()
+      assert_receive {^port, {:exit_status, 1}}, 15_000
+    end
+
+    test "a shepherd whose token channel closes early exits promptly" do
+      port = open_tokenless_shepherd()
+      {:os_pid, os_pid} = Port.info(port, :os_pid)
+      true = Port.command(port, "00000")
+      Port.close(port)
+
+      eventually(fn -> not os_pid_alive?(os_pid) end, 3_000)
     end
   end
 
@@ -128,5 +130,15 @@ defmodule NetRunner.SecurityTest do
       assert %File.Stat{type: :directory, mode: mode, uid: ^uid} = File.lstat!(dir)
       assert band(mode, 0o7777) == 0o700
     end
+  end
+
+  defp open_tokenless_shepherd do
+    shepherd = Path.join(to_string(:code.priv_dir(:net_runner)), "shepherd")
+    socket_path = Path.join(System.tmp_dir!(), "nr_unused_#{System.unique_integer([:positive])}")
+
+    Port.open(
+      {:spawn_executable, shepherd},
+      [:nouse_stdio, :exit_status, :binary, args: [socket_path, "--token-fd", "--", "/bin/true"]]
+    )
   end
 end

@@ -123,4 +123,19 @@ defmodule NetRunner.TestHelpers do
         false
     end
   end
+
+  @doc """
+  Creates a fresh directory under the system temp dir, removed on test exit.
+
+  The name is random and `File.mkdir/1` refuses an existing path, so a
+  directory pre-created by another local user (who could plant scripts the
+  test then runs) is never adopted.
+  """
+  def tmp_dir(prefix) do
+    random = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+    dir = Path.join(System.tmp_dir!(), "#{prefix}_#{random}")
+    :ok = File.mkdir(dir)
+    ExUnit.Callbacks.on_exit(fn -> File.rm_rf(dir) end)
+    dir
+  end
 end
