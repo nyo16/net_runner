@@ -342,7 +342,7 @@ The shepherd creates the cgroup directory (and its `net_runner/` parent if missi
 
 Requirements: cgroup v2, with `/sys/fs/cgroup` writable by the BEAM's user (root, or a delegated root), plus write access to the `cgroup.procs` of the nearest common ancestor of the BEAM's cgroup and the target (usually the root) so the child can be migrated. If an administrator pre-creates and delegates `/sys/fs/cgroup/net_runner` instead, only that subtree needs to be writable.
 
-Paths must sit under `net_runner/`. An unprefixed path (accepted by 1.3.x, rejected by 1.4.0) is placed under the prefix — `"job"` becomes `"net_runner/job"` — with a once-per-VM deprecation warning; it will raise in 2.0.
+Paths must sit under `net_runner/`. An unprefixed path (accepted by 1.3.x, rejected by 1.4.0) is placed under the prefix since 1.4.1 — `"job"` becomes `"net_runner/job"` — with a once-per-VM deprecation warning; it will raise in 2.0.
 
 ## Command DSL
 
