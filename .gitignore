@@ -28,6 +28,8 @@ net_runner-*.tar
 priv/*.so
 priv/*.dylib
 priv/shepherd
+# Object files from builds before the one-step compile+link; kept ignored so
+# stale copies in existing checkouts are never committed.
 c_src/*.o
 
 # Dialyzer

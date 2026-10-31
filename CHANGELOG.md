@@ -6,6 +6,22 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`SHEPHERD_STATIC=1`** links the shepherd as a static PIE (Linux only), for
+  a release that runs where the build's libc may be absent.
+
+### Changed
+
+- **The native build writes no object files.** Each binary is compiled and
+  linked in one step, so `make PRIV_DIR=…` leaves the source tree unchanged.
+
+### Fixed
+
+- **The shepherd is compiled with `-fPIE`.** The flag was passed only when
+  linking, so a compiler that does not produce position-independent code by
+  default could not link the shepherd.
+
 ## [1.4.1] - 2026-10-31
 
 ### Fixed
