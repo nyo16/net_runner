@@ -36,6 +36,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   values as raw bytes (and documented that non-UTF-8 values no longer
   raise); they are now converted to port charlists, and a non-UTF-8 name or
   value raises `ArgumentError`.
+- **Linux pipe growth is smaller for stdin and stderr.** The shepherd grew
+  all three pipes to 1 MiB, charging 768 pages per spawn to the user's
+  `pipe-user-pages-soft` budget; at ~21 concurrent commands the budget ran
+  out and the kernel capped every new pipe for that user (any program, not
+  just NetRunner) at 8 KiB. stdout stays at 1 MiB; stdin and stderr now get
+  256 KiB, for 384 pages per spawn (~42 concurrent). Measured: `run/2` with
+  16 MiB of input within noise, bulk stderr drain about 22% slower
+  (`bench/LINUX_VERIFICATION.md`).
 
 ### Fixed
 

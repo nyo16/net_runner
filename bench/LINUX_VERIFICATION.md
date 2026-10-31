@@ -164,9 +164,9 @@ that is deliberate — on the kill path the cleanup *is* the point. Do not
 rationale in ADR-9 in `docs/decisions.md`). Measured on macOS: 64 MiB read goes
 from 1773–1834 chunks / 26–31 ms to **1024 chunks / 18–19 ms**, every round.
 
-Linux is expected to show a **smaller** win, because the shepherd sets
-`F_SETPIPE_SZ` to 1 MiB on all three pipes (the `fcntl(F_SETPIPE_SZ, 1 << 20)`
-calls in `shepherd.c`'s pipe-mode spawn path), so a full
+Linux is expected to show a **smaller** win, because the shepherd grows the
+stdout pipe to 1 MiB with `fcntl(F_SETPIPE_SZ, 1 << 20)` (stdin and stderr get
+256 KiB; see "Pipe sizes and the per-user budget" below), so a full stdout
 pipe already yields sixteen 64 KiB reads rather than one. The alignment
 argument largely evaporates there.
 
@@ -240,26 +240,50 @@ OTP 29 / erts 17.0.3, `MIX_ENV=prod`:
 | probe | macOS result | why Linux may differ |
 |---|---|---|
 | `deadlock_probe.exs` | all six sizes OK, both columns | should be identical; the deadlock was never platform-specific |
-| stdin round trip, 16 MiB via `cat` | `run/2` 1002–1163 MB/s vs `stream!/2` 1074–1130 | 1 MiB pipes mean fewer round trips; both should rise together |
-| stderr drain | 928–978 MB/s | 1 MiB stderr pipe → a drain pass is more likely to hit the 16-chunk budget and use the `:consume_stderr_more` resume path (see below) |
+| stdin round trip, 16 MiB via `cat` | `run/2` 1002–1163 MB/s vs `stream!/2` 1074–1130 | grown pipes (stdin 256 KiB, stdout 1 MiB) mean fewer round trips; both should rise together |
+| stderr drain | 928–978 MB/s | 256 KiB stderr pipe → four chunks per full pipe, below the 16-chunk drain budget |
 | spawn | 4.4–7.2 ms | Linux `posix_spawn`/`vfork` is usually faster than macOS |
 | spawn with `cgroup_path:` | n/a (macOS no-op) | `cgroup_setup` (mkdir + `cgroup.procs` write on cgroupfs) now runs *before* the child's `execvp`, gated by a sync pipe. Run `spawn_breakdown.exs` with and without `cgroup_path:` on a delegated subtree and record the delta here |
-| ≥32 concurrent 64 MiB `stream!/2` reads | n/a (64 KiB pipes regardless) | `pipe-user-pages-soft` (default 64 MiB) is exhausted by ~21 concurrent 3×1 MiB spawns; later pipes fall back to 64 KiB. Compare the per-stream chunk count (`Proc.stats/1` `read_count`) at 1, 16 and 32 concurrent streams — a ≥10× jump between 16 and 32 confirms the cliff. Chunk counts are structural, so no median/variance discipline is needed |
+| ≥48 concurrent 64 MiB `stream!/2` reads | n/a (64 KiB pipes regardless) | `pipe-user-pages-soft` (default 64 MiB) is exhausted by ~42 concurrent spawns at 384 pages each; past it every new pipe for the uid is capped at 8 KiB. Compare the per-stream chunk count (`Proc.stats/1` `read_count`) at 1, 32 and 48 concurrent streams — a jump of 8× or more confirms the cliff. Chunk counts are structural, so no median/variance discipline is needed |
 
 ### One Linux-specific behaviour to watch
 
 `consume_stderr/1` is capped at `@stderr_drain_chunks` (16) per pass. On macOS a
-64 KiB pipe holds exactly one chunk, so the budget almost never fires. **On
-Linux a full 1 MiB pipe is exactly sixteen chunks**, so the resume path
-(`handle_info(:consume_stderr_more, …)`) will be exercised routinely rather than
-rarely.
+64 KiB pipe holds exactly one chunk, so the budget almost never fires. On
+Linux the stderr pipe is 256 KiB (four chunks), so a single full pipe still
+does not reach the budget; the resume path
+(`handle_info(:consume_stderr_more, …)`) runs only when the child keeps
+refilling the pipe during a pass.
 
-That is the intended design, and the guard test
-(`test/io_pipelining_test.exs`, "draining resumes after a pass exhausts its
-chunk budget") already forces it. But it means Linux is where a bug in that path
-would actually bite, so watch for stalled drains or `await_exit` timeouts in the
-stderr tests. Symptom of a regression there: the child blocks forever on a full
-stderr pipe, and the test fails by timeout rather than by assertion.
+The guard test (`test/io_pipelining_test.exs`, "draining resumes after a pass
+exhausts its chunk budget") forces that path on every platform. Watch for
+stalled drains or `await_exit` timeouts in the stderr tests: the symptom of a
+regression there is a child blocked forever on a full stderr pipe, and the
+test fails by timeout rather than by assertion.
+
+## Pipe sizes and the per-user budget (measured 2026-10-31)
+
+Every pipe page counts against `/proc/sys/fs/pipe-user-pages-soft` (16384 pages
+by default) for the pipe's lifetime, and a user at that limit gets two-page
+(8 KiB) pipes for **everything** it creates afterwards (pipe(7)). With 1 MiB on
+all three pipes, ~21 concurrent spawns exhausted it; the symptom in CI was
+`io_pipelining_test.exs` reading 16 MiB as 2048 × 8 KiB chunks.
+
+A/B in one Linux container (Docker `elixir:1.18`, arm64, `--cpus=4`,
+`MIX_ENV=prod mix run bench/perf.exs`, variants interleaved, medians of 3–5 runs,
+MB/s; the ~11% run-to-run noise floor applies, and the `stream!` row is the
+noisiest):
+
+| variant | pages/spawn | ~concurrent | `cat` 16 MiB `run/2` | `cat` 16 MiB `stream!` | stderr drain 16 MiB |
+|---|---|---|---|---|---|
+| all three 1 MiB (≤ 1.4.1) | 768 | 21 | 2282 | 2646 | 2903 |
+| stdout 1 MiB only | 288 | 56 | 1484 | 1524 | 1263 |
+| all three 256 KiB | 192 | 85 | 1844 | 2077 | 2247 |
+| **stdout 1 MiB, stdin/stderr 256 KiB (chosen)** | 384 | 42 | 2148 | 1905 | 2276 |
+
+The chosen variant doubles the headroom, keeps `run/2` with large input within
+noise and stdout `read_batch` at up to 16 chunks, and costs about 22% on bulk
+stderr drains.
 
 ---
 

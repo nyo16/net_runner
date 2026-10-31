@@ -1237,16 +1237,26 @@ int main(int argc, char *argv[]) {
 #endif
 
 #ifdef __linux__
-        /* Grow the pipe buffers from the default 64 KiB to 1 MiB. Each
-         * buffer-sized chunk costs the BEAM a full read -> EAGAIN ->
-         * enif_select -> message round trip, so a 16x bigger buffer cuts the
-         * round trips per MiB by ~16x. Best effort: the kernel caps the size
-         * via /proc/sys/fs/pipe-max-size and an unprivileged process may not
-         * be permitted to grow it at all, in which case the default stands.
-         * macOS has no equivalent knob. */
+        /* Grow the pipe buffers from the default 64 KiB. Each buffer-sized
+         * chunk costs the BEAM a full read -> EAGAIN -> enif_select ->
+         * message round trip, so bigger buffers cut round trips per MiB.
+         *
+         * Every page is charged to the uid's pipe-user-pages-soft budget
+         * (16384 pages by default) for the pipe's lifetime, and once that
+         * budget is spent the kernel caps EVERY new pipe the user creates at
+         * two pages (8 KiB), not just ours. So: stdout, the bulk path, gets
+         * 1 MiB (256 pages; read_batch can take up to 16 chunks per call);
+         * stdin and stderr get 256 KiB (64 pages each). 384 pages per spawn
+         * leaves room for ~42 concurrent commands, where 1 MiB on all three
+         * (768 pages) ran out at ~21. Measured on Linux against 1 MiB
+         * everywhere: 16 MiB through cat via run/2 within noise, stderr drain
+         * about 22% slower; stdout-only growth cost 35-56% on those rows
+         * (bench/LINUX_VERIFICATION.md). Best effort: the kernel caps sizes at
+         * /proc/sys/fs/pipe-max-size and may refuse growth, in which case the
+         * default stands. macOS has no equivalent knob. */
         (void)fcntl(stdout_pipe[0], F_SETPIPE_SZ, 1 << 20);
-        (void)fcntl(stderr_pipe[0], F_SETPIPE_SZ, 1 << 20);
-        (void)fcntl(stdin_pipe[1], F_SETPIPE_SZ, 1 << 20);
+        (void)fcntl(stderr_pipe[0], F_SETPIPE_SZ, 1 << 18);
+        (void)fcntl(stdin_pipe[1], F_SETPIPE_SZ, 1 << 18);
 #endif
 
         /* cgroup/exec ordering gate — see the PTY path for rationale. */
