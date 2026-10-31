@@ -37,9 +37,9 @@ defmodule NetRunner do
   Malformed options are programmer errors and raise `ArgumentError` — unknown
   keys (`Keyword.validate!/2`) as well as invalid values (`:output`,
   `:input_buffer`, `:stderr`, `:stderr_tail_bytes`, `:cgroup_path`, `:cwd`,
-  `:env`). Runtime spawn failures (an invalid command, shepherd errors) return
-  `{:error, reason}` instead. This convention holds at every NetRunner entry
-  point.
+  `:env`, `:no_new_privs`). Runtime spawn failures (an invalid command,
+  shepherd errors) return `{:error, reason}` instead. This convention holds
+  at every NetRunner entry point.
 
   ## Options
 
@@ -91,6 +91,11 @@ defmodule NetRunner do
       Wrap the input in `{:replace, environment}` to remove every unselected
       variable; in that mode, leaving out `PATH` means only commands
       containing `/` can run. Other mode tags raise `ArgumentError`.
+    * `:no_new_privs` - when `true`, the child calls
+      `prctl(PR_SET_NO_NEW_PRIVS, 1)` before exec, so neither it nor anything
+      it executes can gain privileges through setuid/setgid binaries or file
+      capabilities. Linux only; accepted and ignored elsewhere. Default
+      `false`. Must be a boolean.
 
   Also accepted and passed through to the underlying process: `:pty`,
   `:cgroup_path`, `:kill_timeout`.
@@ -138,7 +143,8 @@ defmodule NetRunner do
     :pty,
     :cgroup_path,
     :kill_timeout,
-    :env
+    :env,
+    :no_new_privs
   ]
 
   @spec run(NetRunner.Command.t() | [String.t()], keyword()) ::
@@ -270,7 +276,7 @@ defmodule NetRunner do
       writes of up to that many bytes for throughput. Eager lists always
       coalesce.
     * `:stderr` - `:consume` (default) or `:disabled`
-    * `:cwd`, `:env` - as in `run/2`
+    * `:cwd`, `:env`, `:no_new_privs` - as in `run/2`
 
   `:timeout` and `:max_output_size` are `run/2`-only options and are rejected
   here — a lazy stream has no single wall-clock to bound. Unknown options

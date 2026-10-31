@@ -28,8 +28,9 @@ defmodule NetRunner.Process.Exec do
   1. Creates a UDS listener with a temp path
   2. Opens the shepherd via Port.open with :nouse_stdio
   3. Accepts the shepherd's UDS connection
-  4. Receives pipe FDs via SCM_RIGHTS
-  5. Receives MSG_CHILD_STARTED with the OS pid
+  4. Receives pipe FDs (plus, on Linux, the child's pidfd) via SCM_RIGHTS
+  5. Receives MSG_CHILD_STARTED with the OS pid (the shepherd lets the child
+     exec only after sending both)
   6. Wraps FDs in NIF resources
 
   Returns `{:ok, state}` or `{:error, reason}`.
@@ -323,6 +324,7 @@ defmodule NetRunner.Process.Exec do
       stdin: pipes.stdin,
       stdout: pipes.stdout,
       stderr: pipes.stderr,
+      pidfd: pipes.pidfd,
       os_pid: os_pid,
       cmd: cmd,
       args: args,
@@ -367,6 +369,7 @@ defmodule NetRunner.Process.Exec do
     validate_cgroup_path!(Keyword.get(opts, :cgroup_path, nil))
     validate_kill_timeout!(Keyword.get(opts, :kill_timeout, @default_kill_timeout_ms))
     validate_cwd!(Keyword.get(opts, :cwd, nil))
+    validate_no_new_privs!(Keyword.get(opts, :no_new_privs, false))
     environment = normalize_env!(Keyword.get(opts, :env, nil))
     warn_if_prefixed(requested_cgroup_path, Keyword.get(opts, :cgroup_path, nil))
 
@@ -564,6 +567,12 @@ defmodule NetRunner.Process.Exec do
     raise ArgumentError, ":cgroup_path must be a binary, got: #{inspect(path)}"
   end
 
+  defp validate_no_new_privs!(value) when is_boolean(value), do: :ok
+
+  defp validate_no_new_privs!(value) do
+    raise ArgumentError, ":no_new_privs must be a boolean, got: #{inspect(value)}"
+  end
+
   defp validate_cwd!(nil), do: :ok
 
   defp validate_cwd!(cwd) when is_binary(cwd) do
@@ -625,7 +634,9 @@ defmodule NetRunner.Process.Exec do
 
   defp create_uds_base_dir(attempts) do
     random = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
-    dir = Path.join(System.tmp_dir!(), "net_runner_#{random}")
+    # Expanded: a relative TMPDIR would yield a relative socket path, which
+    # the shepherd rejects (it must connect to an absolute uds_path).
+    dir = Path.join(Path.expand(System.tmp_dir!()), "net_runner_#{random}")
 
     case Nif.nif_mkdir_private(dir) do
       :ok ->
@@ -702,12 +713,19 @@ defmodule NetRunner.Process.Exec do
 
     shepherd_flags = if cwd, do: shepherd_flags ++ ["--cwd", cwd], else: shepherd_flags
 
+    # Linux-only in the shepherd (prctl(PR_SET_NO_NEW_PRIVS) before exec);
+    # accepted and ignored on other platforms.
+    shepherd_flags =
+      if Keyword.get(opts, :no_new_privs, false),
+        do: shepherd_flags ++ ["--no-new-privs"],
+        else: shepherd_flags
+
     {environment_flags, port_environment} =
       environment_options(Keyword.get(opts, :env, nil))
 
     # "--" ends shepherd option parsing: a cmd beginning with "-" must reach
     # execvp verbatim, never be read as a shepherd flag (--cgroup-path,
-    # --kill-timeout, --pty, --cwd, --replace-env).
+    # --kill-timeout, --pty, --cwd, --replace-env, --no-new-privs).
     port_args = [uds_path | shepherd_flags ++ environment_flags] ++ ["--", cmd | args]
 
     port_opts = [
@@ -812,6 +830,9 @@ defmodule NetRunner.Process.Exec do
   In pipe mode: 3 FDs (stdin_w, stdout_r, stderr_r).
   In PTY mode: 1 FD (bidirectional master).
 
+  On Linux the shepherd appends the child's pidfd as an optional trailing
+  fd, so 4 (pipe) or 2 (PTY) are accepted as well.
+
   Returns `{:ok, fds, iov_rest}`.
   """
   def receive_fds(socket, pty_mode \\ false) do
@@ -825,9 +846,9 @@ defmodule NetRunner.Process.Exec do
             do: binary_part(iov_data, 1, byte_size(iov_data) - 1),
             else: <<>>
 
-        expected = if pty_mode, do: 1, else: 3
+        base = io_fd_count(pty_mode)
 
-        if length(fds) == expected do
+        if length(fds) in [base, base + 1] do
           {:ok, fds, iov_rest}
         else
           handle_fd_count_mismatch(socket, fds, iov_data)
@@ -852,10 +873,49 @@ defmodule NetRunner.Process.Exec do
     end
   end
 
+  defp io_fd_count(true), do: 1
+  defp io_fd_count(false), do: 3
+
   # On any failure every fd handed in is released: wrapped ones through their
   # NIF resource, unwrapped ones via nif_close_fd. nif_create_fd's contract is
   # that on error the caller retains ownership of the raw fd.
-  defp wrap_fds([stdin_fd, stdout_fd, stderr_fd], owner, false) do
+  defp wrap_fds(fds, owner, pty_mode) do
+    {io_fds, pidfd_fd} = split_pidfd(fds, pty_mode)
+
+    case wrap_io_fds(io_fds, owner, pty_mode) do
+      {:ok, pipes} ->
+        {:ok, Map.put(pipes, :pidfd, wrap_pidfd(pidfd_fd, owner))}
+
+      {:error, _} = error ->
+        if pidfd_fd, do: Nif.nif_close_fd(pidfd_fd)
+        error
+    end
+  end
+
+  # The pidfd, when present, is always the last fd of the SCM_RIGHTS message.
+  defp split_pidfd(fds, pty_mode) do
+    case Enum.split(fds, io_fd_count(pty_mode)) do
+      {io_fds, [pidfd_fd]} -> {io_fds, pidfd_fd}
+      {io_fds, []} -> {io_fds, nil}
+    end
+  end
+
+  # The pidfd is an optimisation (race-free direct kill), not a requirement:
+  # if it cannot be wrapped, close it and carry on without one.
+  defp wrap_pidfd(nil, _owner), do: nil
+
+  defp wrap_pidfd(fd, owner) do
+    case Pipe.new(fd, owner) do
+      {:ok, pipe} ->
+        pipe
+
+      {:error, _} ->
+        Nif.nif_close_fd(fd)
+        nil
+    end
+  end
+
+  defp wrap_io_fds([stdin_fd, stdout_fd, stderr_fd], owner, false) do
     with {:ok, stdin} <- wrap_or_close(stdin_fd, owner, [], [stdout_fd, stderr_fd]),
          {:ok, stdout} <- wrap_or_close(stdout_fd, owner, [stdin], [stderr_fd]),
          {:ok, stderr} <- wrap_or_close(stderr_fd, owner, [stdin, stdout], []) do
@@ -863,7 +923,7 @@ defmodule NetRunner.Process.Exec do
     end
   end
 
-  defp wrap_fds([master_fd], owner, true) do
+  defp wrap_io_fds([master_fd], owner, true) do
     # PTY: single bidirectional FD. Dup it so stdin and stdout
     # have independent NIF resources that can be closed separately.
     with {:ok, write_fd} <- dup_or_close(master_fd),
@@ -875,7 +935,7 @@ defmodule NetRunner.Process.Exec do
 
   # Wraps `fd`; on failure releases *everything* — already-wrapped pipes via
   # their NIF resource, `fd` and the still-raw fds via nif_close_fd — so
-  # wrap_fds's on-error contract (no fd survives) holds at every step.
+  # wrap_io_fds's on-error contract (no fd survives) holds at every step.
   # nif_create_fd's contract is that on error the caller retains ownership
   # of the raw fd.
   defp wrap_or_close(fd, owner, wrapped_pipes, raw_fds) do

@@ -9,6 +9,9 @@ defmodule NetRunner.Process.State do
     :stdin,
     :stdout,
     :stderr,
+    # Linux-only pidfd for the child, wrapped like a pipe so the owner
+    # monitor closes it; nil where the shepherd sent none (macOS, old kernels).
+    :pidfd,
     :os_pid,
     :exit_status,
     :cmd,
@@ -45,6 +48,7 @@ defmodule NetRunner.Process.State do
           stdin: Pipe.t() | nil,
           stdout: Pipe.t() | nil,
           stderr: Pipe.t() | nil,
+          pidfd: Pipe.t() | nil,
           os_pid: non_neg_integer() | nil,
           exit_status: non_neg_integer() | nil,
           cmd: String.t(),

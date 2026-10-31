@@ -68,19 +68,21 @@ defmodule NetRunner.Process do
     :cgroup_path,
     :kill_timeout,
     :cwd,
-    :env
+    :env,
+    :no_new_privs
   ]
 
   @doc """
   Starts the process GenServer linked to the caller.
 
   Malformed options — unknown keys or invalid values for `:stderr`,
-  `:stderr_tail_bytes`, `:cgroup_path`, `:cwd` or `:env` — are programmer
-  errors and raise `ArgumentError` here, in the caller, matching every other
-  NetRunner entry point. `{:error, reason}` is reserved for runtime spawn
-  failures (invalid command bytes, shepherd handshake errors, ...).
+  `:stderr_tail_bytes`, `:cgroup_path`, `:kill_timeout`, `:cwd`, `:env` or
+  `:no_new_privs` — are programmer errors and raise `ArgumentError` here, in
+  the caller, matching every other NetRunner entry point. `{:error, reason}`
+  is reserved for runtime spawn failures (invalid command bytes, shepherd
+  handshake errors, ...).
 
-  `:cwd` and `:env` behave as described in `NetRunner.run/2`.
+  `:cwd`, `:env` and `:no_new_privs` behave as described in `NetRunner.run/2`.
   """
   @spec start_link(String.t(), [String.t()], keyword()) :: GenServer.on_start()
   def start_link(cmd, args \\ [], opts \\ []) do
@@ -659,9 +661,11 @@ defmodule NetRunner.Process do
   # Once the shepherd Port is dead the pid IS recyclable: an orphaned child
   # is reaped by PID 1 the moment it exits. The Port's exit message settles
   # the process (finish_orphaned/2), but a kill/2 queued ahead of that message
-  # still lands here, so the direct path probes first. That narrows the
-  # exposure to the microseconds between kill(pid, 0) and kill(pid, sig); it
-  # cannot close it.
+  # still lands here. On Linux the shepherd hands over a pidfd, which names
+  # the process itself rather than a pid number, so the direct path is
+  # race-free there. Without one (macOS, pre-5.3 kernels) the direct path
+  # probes first, which narrows the exposure to the microseconds between
+  # kill(pid, 0) and kill(pid, sig); it cannot close it.
   defp signal_child(state, sig_num) do
     if shepherd_alive?(state) do
       case send_shepherd_command(state, Protocol.kill(sig_num)) do
@@ -673,7 +677,20 @@ defmodule NetRunner.Process do
     end
   end
 
-  defp direct_kill(state, sig_num) do
+  defp direct_kill(%{pidfd: %Pipe{resource: resource}} = state, sig_num)
+       when is_reference(resource) do
+    case Nif.nif_pidfd_send_signal(resource, sig_num) do
+      :ok -> :ok
+      {:error, :esrch} -> {:error, :not_running}
+      # The kernel refused the pidfd path (e.g. seccomp-filtered syscall):
+      # fall back to the probe-then-kill path rather than fail the signal.
+      {:error, _reason} -> probe_and_kill(state, sig_num)
+    end
+  end
+
+  defp direct_kill(state, sig_num), do: probe_and_kill(state, sig_num)
+
+  defp probe_and_kill(state, sig_num) do
     if Nif.nif_is_os_pid_alive(state.os_pid) do
       Nif.nif_kill(state.os_pid, sig_num)
     else
@@ -688,6 +705,7 @@ defmodule NetRunner.Process do
     if state.stdin, do: Pipe.close(state.stdin)
     if state.stdout, do: Pipe.close(state.stdout)
     if state.stderr, do: Pipe.close(state.stderr)
+    if state.pidfd, do: Pipe.close(state.pidfd)
 
     if state.uds_socket do
       :socket.close(state.uds_socket)
@@ -1219,11 +1237,18 @@ defmodule NetRunner.Process do
   # the kernel never reuses a pid as a group id while a member of that group
   # lives, so this reaches the orphan and anything it spawned in its group,
   # not a stranger. ESRCH (already dead, e.g. via PR_SET_PDEATHSIG) is fine.
+  #
+  # The shepherd reports the child only after it leads its group (parent
+  # setpgid in pipe mode, the ready gate after setsid in PTY mode), so the
+  # group kill normally covers the leader. A leader that moved itself to
+  # another group is also signalled through its pidfd when there is one
+  # (race-free). Without a pidfd a group ESRCH means the group is gone, and a
+  # direct kill by number could hit a recycled pid, so none is attempted.
   defp finish_orphaned(state, shepherd_status) do
     require Logger
 
     {:ok, sigkill} = Signal.resolve(:sigkill)
-    _ = Nif.nif_kill_group(state.os_pid, sigkill)
+    kill_orphan(state, sigkill)
 
     Logger.warning(
       "[NetRunner] shepherd for #{inspect(state.cmd)} exited (status " <>
@@ -1232,6 +1257,20 @@ defmodule NetRunner.Process do
     )
 
     finish_exit(state, 137)
+  end
+
+  defp kill_orphan(state, sigkill) do
+    _ = Nif.nif_kill_group(state.os_pid, sigkill)
+    if state.pidfd != nil, do: _ = direct_kill(state, sigkill)
+    :ok
+  end
+
+  # Reaped: the pidfd now names a dead process and can never be useful again.
+  defp close_pidfd(%{pidfd: nil} = state), do: state
+
+  defp close_pidfd(state) do
+    Pipe.close(state.pidfd)
+    %{state | pidfd: nil}
   end
 
   defp finish_exit(state, exit_status) do
@@ -1255,6 +1294,7 @@ defmodule NetRunner.Process do
       |> retry_reads_for({:read, :stdout})
       |> retry_reads_for({:read, :stderr})
       |> maybe_consume_stderr()
+      |> close_pidfd()
 
     # Reply to all awaiting callers
     Enum.each(state.awaiting_exit, fn from ->

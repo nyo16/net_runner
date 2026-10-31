@@ -37,6 +37,7 @@ defmodule NetRunner.Stream do
     :kill_timeout,
     :cwd,
     :env,
+    :no_new_privs,
     :owner,
     :name
   ]
