@@ -553,14 +553,22 @@ build on a Linux host, because the Makefile selects its platform flags from the
 host's `uname`.
 
 ```sh
-make all \
+make -B all \
   CC="zig cc -target x86_64-linux-musl" \
   ERTS_INCLUDE_DIR=/path/to/target/erts-VERSION/include \
   PRIV_DIR=/path/to/release/lib/net_runner-VERSION/priv
 ```
 
+`-B` is required when `PRIV_DIR` already holds binaries, as an assembled
+release's `priv` does: `mix release` copies the host-built shepherd and NIF
+there with fresh timestamps, and make rebuilds only on source changes, not on
+a different `CC` or flags, so without `-B` it would report nothing to do and
+the host binaries would ship.
+
 zig cc already links musl targets statically. With gcc or clang and a static
 libc, such as musl's, `SHEPHERD_STATIC=1` links the shepherd as a static PIE.
+CI exercises `SHEPHERD_STATIC=1` with musl only. A static shepherd carries the
+libc it was linked against, so rebuild it to pick up libc security fixes.
 
 ## License
 
