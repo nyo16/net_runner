@@ -7,42 +7,55 @@ defmodule NetRunner.RobustnessTest do
   alias NetRunner.Process.Pipe
 
   describe "shepherd crash (TEST-1)" do
-    test "a SIGKILLed shepherd surfaces a synthetic exit and the child does not leak" do
-      # The shepherd is the child's parent; kill -9 it out from under a live
-      # child. The BEAM must (a) unblock await_exit with the synthetic 137
-      # after the force-exit backstop, and (b) not leak the child: closing
-      # our pipe ends on stop gives the writing child EPIPE and it dies.
-      {:ok, pid} = Proc.start("yes", [])
-      os_pid = Proc.os_pid(pid)
+    # The shepherd is the child's parent and its only supervisor. When it is
+    # SIGKILLed out from under a live child, nothing will ever reap or kill
+    # that child, so the BEAM must kill the orphaned process group itself and
+    # settle the process with 137 right away, not leave it running.
+    import ExUnit.CaptureLog
 
-      shepherd_pid = parent_pid!(os_pid)
-      assert shepherd_pid > 1
-
-      System.cmd("kill", ["-KILL", to_string(shepherd_pid)])
-
-      # No real status can arrive; the @force_exit_timeout (5s) backstop
-      # synthesises 137.
-      assert {:ok, 137} = Proc.await_exit(pid, 10_000)
-
-      Proc.stop(pid)
-      eventually(fn -> not os_pid_alive?(os_pid) end, 5_000)
-    end
-
-    test "kill/2 signals the orphaned child directly once the shepherd is gone" do
-      # With the shepherd alive, CMD_KILL over the UDS is the only signaller.
-      # Once the shepherd Port is dead nothing else can reach the child, so
-      # kill/2 must fall through to the probe-then-kill NIF path — a guard
-      # inverted to "only when alive" would leave `sleep` running here.
+    test "a child that ignores its pipes is killed, not leaked" do
+      # `sleep` never touches stdout, so closing our pipe ends would not stop
+      # it: only an explicit kill does.
       {:ok, pid} = Proc.start("sleep", ["100"])
       os_pid = Proc.os_pid(pid)
 
-      System.cmd("kill", ["-KILL", to_string(parent_pid!(os_pid))])
-      eventually(fn -> Port.info(:sys.get_state(pid).shepherd_port) == nil end)
-      assert os_pid_alive?(os_pid)
+      log =
+        capture_log(fn ->
+          System.cmd("kill", ["-KILL", to_string(parent_pid!(os_pid))])
+          assert {:ok, 137} = Proc.await_exit(pid, 2_000)
+        end)
 
-      assert :ok = Proc.kill(pid, :sigkill)
+      assert log =~ "without reporting the child's exit"
       eventually(fn -> not os_pid_alive?(os_pid) end)
+      assert {:error, :not_running} = Proc.kill(pid, :sigkill)
+      Proc.stop(pid)
+    end
 
+    test "the whole group dies, including a TERM-ignoring grandchild" do
+      marker = sleep_marker()
+      {:ok, pid} = Proc.start("sh", ["-c", "trap '' TERM; sleep #{marker} & wait"])
+      os_pid = Proc.os_pid(pid)
+      eventually(fn -> pgrep(marker) != [] end)
+
+      capture_log(fn ->
+        System.cmd("kill", ["-KILL", to_string(parent_pid!(os_pid))])
+        assert {:ok, 137} = Proc.await_exit(pid, 2_000)
+      end)
+
+      eventually(fn -> not os_pid_alive?(os_pid) and pgrep(marker) == [] end)
+      Proc.stop(pid)
+    end
+
+    test "a child writing to stdout is settled the same way" do
+      {:ok, pid} = Proc.start("yes", [])
+      os_pid = Proc.os_pid(pid)
+
+      capture_log(fn ->
+        System.cmd("kill", ["-KILL", to_string(parent_pid!(os_pid))])
+        assert {:ok, 137} = Proc.await_exit(pid, 2_000)
+      end)
+
+      eventually(fn -> not os_pid_alive?(os_pid) end)
       Proc.stop(pid)
     end
   end
@@ -209,6 +222,13 @@ defmodule NetRunner.RobustnessTest do
 
       assert Proc.stats(pid).bytes_err == 4
       GenServer.stop(pid)
+    end
+  end
+
+  defp pgrep(pattern) do
+    case System.cmd("pgrep", ["-f", "sleep #{pattern}"]) do
+      {out, 0} -> String.split(out, "\n", trim: true)
+      {_, _} -> []
     end
   end
 end

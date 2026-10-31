@@ -50,10 +50,6 @@ defmodule NetRunner.Process do
   # caller stays parked and the remaining sub-binary resumes via self-send.
   @write_budget 16
 
-  # Backstop only. Exit status normally arrives over the UDS; this fires when
-  # the shepherd died without delivering one.
-  @force_exit_timeout 5_000
-
   # Graceful stop budget for stop/1. terminate/2 only closes FDs and a Port,
   # so this is a backstop against a wedged server, not an expected wait.
   @stop_timeout_ms 5_000
@@ -556,32 +552,19 @@ defmodule NetRunner.Process do
   end
 
   # Shepherd port exit. Normally the exit status already arrived over the UDS
-  # and this is a no-op; it is the fallback for a shepherd that died without
-  # delivering one.
-  def handle_info({port, {:exit_status, _status}}, state)
+  # and this is a no-op. Otherwise the shepherd died (SIGKILL, OOM, crash)
+  # without reporting it. Whatever it wrote before dying is already in the
+  # socket buffer, so one sweep is final; if it finds nothing, the child is an
+  # unsupervised orphan (on Linux the kernel has usually SIGKILLed it already
+  # via PR_SET_PDEATHSIG).
+  def handle_info({port, {:exit_status, shepherd_status}}, state)
       when port == state.shepherd_port do
     state = maybe_read_exit_status(state)
 
-    if state.status != :exited do
-      Process.send_after(self(), :force_exit_timeout, @force_exit_timeout)
-    end
-
-    {:noreply, state}
-  end
-
-  def handle_info(:force_exit_timeout, state) do
-    if state.status != :exited do
-      require Logger
-
-      Logger.warning(
-        "[NetRunner] no exit status from shepherd for #{inspect(state.cmd)} after " <>
-          "#{@force_exit_timeout}ms; synthesising 137. A real status should have " <>
-          "arrived over the UDS — this path losing a genuine exit code is a bug."
-      )
-
-      {:noreply, finish_exit(state, 137)}
-    else
+    if state.status == :exited do
       {:noreply, state}
+    else
+      {:noreply, finish_orphaned(state, shepherd_status)}
     end
   end
 
@@ -595,7 +578,7 @@ defmodule NetRunner.Process do
   def handle_info({:"$socket", socket, :abort, _info}, state)
       when socket == state.uds_socket do
     # Socket torn down — nothing further will arrive. The shepherd Port exit
-    # and the force-exit backstop still cover the exit status.
+    # still covers the exit status (finish_orphaned/2 if none was delivered).
     {:noreply, state}
   end
 
@@ -674,11 +657,11 @@ defmodule NetRunner.Process do
   # direct kill is still safe for the same reason.
   #
   # Once the shepherd Port is dead the pid IS recyclable: an orphaned child
-  # is reaped by PID 1 the moment it exits, and a MSG_CHILD_EXITED the
-  # shepherd failed to deliver (write_fully drops frames on POLLOUT timeout)
-  # leaves `status: :running` until the force-exit backstop fires. The
-  # direct path therefore probes first. That narrows the exposure to the
-  # microseconds between kill(pid, 0) and kill(pid, sig); it cannot close it.
+  # is reaped by PID 1 the moment it exits. The Port's exit message settles
+  # the process (finish_orphaned/2), but a kill/2 queued ahead of that message
+  # still lands here, so the direct path probes first. That narrows the
+  # exposure to the microseconds between kill(pid, 0) and kill(pid, sig); it
+  # cannot close it.
   defp signal_child(state, sig_num) do
     if shepherd_alive?(state) do
       case send_shepherd_command(state, Protocol.kill(sig_num)) do
@@ -1154,8 +1137,8 @@ defmodule NetRunner.Process do
     # our carry or still sitting in the socket buffer, so one non-blocking
     # sweep gets it. There is deliberately no retry ladder: a blocking recv
     # here wedges the GenServer (no calls answered, no readiness serviced, no
-    # stderr drained) and the force-exit backstop already covers a shepherd
-    # that wrote nothing at all.
+    # stderr drained), and a shepherd that wrote nothing at all is handled by
+    # finish_orphaned/2.
     arm_uds(state)
   end
 
@@ -1228,6 +1211,27 @@ defmodule NetRunner.Process do
     Logger.warning("[NetRunner] shepherd reported error: #{inspect(msg)}")
     # Recorded, not just logged: `stats/1` exposes it as `:shepherd_error`.
     %{state | stats: Stats.record_shepherd_error(state.stats, msg)}
+  end
+
+  # The shepherd died without reporting the child's exit, so nothing will ever
+  # reap or supervise the child: SIGKILL its process group and report 137, the
+  # status a SIGKILL produces. The child leads its group (setpgid/setsid), and
+  # the kernel never reuses a pid as a group id while a member of that group
+  # lives, so this reaches the orphan and anything it spawned in its group,
+  # not a stranger. ESRCH (already dead, e.g. via PR_SET_PDEATHSIG) is fine.
+  defp finish_orphaned(state, shepherd_status) do
+    require Logger
+
+    {:ok, sigkill} = Signal.resolve(:sigkill)
+    _ = Nif.nif_kill_group(state.os_pid, sigkill)
+
+    Logger.warning(
+      "[NetRunner] shepherd for #{inspect(state.cmd)} exited (status " <>
+        "#{shepherd_status}) without reporting the child's exit; killed the " <>
+        "orphaned process group and reporting 137"
+    )
+
+    finish_exit(state, 137)
   end
 
   defp finish_exit(state, exit_status) do

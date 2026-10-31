@@ -24,15 +24,19 @@ defmodule NetRunner.ZombieTest do
 
     test "the Watcher SIGTERMs an orphan when the GenServer crashes after the shepherd" do
       # Remove the shepherd first so its POLLHUP ladder cannot be the thing
-      # that kills the child. The crashed GenServer closes its pipes, but
-      # `sleep` never reads stdin, so only the Watcher's probe can end it.
+      # that kills the child, and suspend the GenServer so it cannot settle
+      # the orphan itself on the Port exit (finish_orphaned). The crashed
+      # GenServer closes its pipes, but `sleep` never reads stdin, so only
+      # the Watcher's probe can end it (on Linux PR_SET_PDEATHSIG usually got
+      # there first, which this test also accepts).
       {:ok, pid} = Proc.start("sleep", ["100"])
       os_pid = Proc.os_pid(pid)
       %{watcher: watcher} = :sys.get_state(pid)
+      :ok = :sys.suspend(pid)
 
       System.cmd("kill", ["-KILL", to_string(parent_pid!(os_pid))])
       eventually(fn -> Port.info(:sys.get_state(pid).shepherd_port) == nil end)
-      assert os_pid_alive?(os_pid)
+      if match?({:unix, :darwin}, :os.type()), do: assert(os_pid_alive?(os_pid))
 
       Process.exit(pid, :kill)
 

@@ -33,6 +33,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+
 /* PTY headers — platform-specific */
 #ifdef __APPLE__
 #include <util.h>
@@ -66,6 +70,24 @@ static void child_fail(const char *tag, const char *detail) {
     }
     (void)!write(STDERR_FILENO, "\n", 1);
     _exit(127);
+}
+
+/* Child side, right after fork(): if the shepherd dies (SIGKILL, OOM, crash)
+ * before reaping us, have the kernel SIGKILL us instead of leaving an
+ * unsupervised orphan that nothing will ever kill. The getppid() check closes
+ * the window where the shepherd died between fork() and prctl(). The setting
+ * survives execve (except into set-id binaries), so it covers the exec'd
+ * command; it does not reach grandchildren, which the BEAM's process-group
+ * kill and cgroup.kill cover. Two raw syscalls: async-signal-safe. Linux
+ * only; elsewhere the BEAM's group kill is the only layer. */
+static void die_with_shepherd(pid_t shepherd_pid) {
+#ifdef __linux__
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != shepherd_pid) {
+        _exit(127);
+    }
+#else
+    (void)shepherd_pid;
+#endif
 }
 
 static void exec_child(char *cmd, char **args, int allow_execvp) {
@@ -1052,6 +1074,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
+        pid_t shepherd_pid = getpid();
         child_pid = fork();
         if (child_pid < 0) {
             send_error(uds_fd, "fork failed");
@@ -1063,6 +1086,7 @@ int main(int argc, char *argv[]) {
 
         if (child_pid == 0) {
             /* === Child process (PTY) === */
+            die_with_shepherd(shepherd_pid);
             close(uds_fd);
             close(signal_pipe[0]);
             close(signal_pipe[1]);
@@ -1236,6 +1260,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
+        pid_t shepherd_pid = getpid();
         child_pid = fork();
         if (child_pid < 0) {
             send_error(uds_fd, "fork failed");
@@ -1248,6 +1273,7 @@ int main(int argc, char *argv[]) {
 
         if (child_pid == 0) {
             /* === Child process (pipe) === */
+            die_with_shepherd(shepherd_pid);
             close(uds_fd);
             close(signal_pipe[0]);
             close(signal_pipe[1]);

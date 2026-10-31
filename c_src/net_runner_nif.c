@@ -614,6 +614,38 @@ static ERL_NIF_TERM nif_kill(ErlNifEnv *env, int argc,
 }
 
 /*
+ * nif_kill_group(pgid, signal) -> :ok | {:error, reason}
+ *
+ * Sends a signal to every process in a process group (killpg). Used for a
+ * child orphaned by its shepherd's death: the child is its group's leader
+ * (setpgid/setsid), and the kernel never reuses a pid as a group id while
+ * any member of that group lives, so this cannot reach an unrelated group
+ * unless the whole group is already gone and its id recycled. pgid 0 and 1
+ * (our own group, init) are refused outright.
+ */
+static ERL_NIF_TERM nif_kill_group(ErlNifEnv *env, int argc,
+                                   const ERL_NIF_TERM argv[]) {
+    ASSERT_ARGC(env, argc, 2);
+
+    int pgid;
+    if (!enif_get_int(env, argv[0], &pgid) || pgid <= 1) {
+        return enif_make_badarg(env);
+    }
+
+    int sig;
+    if (!enif_get_int(env, argv[1], &sig) || sig < 1 || sig > 31) {
+        return enif_make_badarg(env);
+    }
+
+    if (killpg((pid_t)pgid, sig) == 0) {
+        return atom_ok;
+    }
+
+    return enif_make_tuple2(env, atom_error,
+                            MAKE_ATOM(env, errno_to_atom(errno)));
+}
+
+/*
  * nif_is_os_pid_alive(os_pid) -> true | false
  *
  * Checks if an OS process exists using kill(pid, 0).
@@ -703,6 +735,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_close_fd", 1, nif_close_fd, 0},
     {"nif_mkdir_private", 1, nif_mkdir_private, 0},
     {"nif_kill", 2, nif_kill, 0},
+    {"nif_kill_group", 2, nif_kill_group, 0},
     {"nif_is_os_pid_alive", 1, nif_is_os_pid_alive, 0},
     {"nif_signal_number", 1, nif_signal_number, 0}
 };

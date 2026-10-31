@@ -84,6 +84,7 @@ graph TD
 | Layer | Trigger | Mechanism | Covers |
 |-------|---------|-----------|--------|
 | Shepherd | BEAM process dies | UDS POLLHUP → kill child group | BEAM SIGKILL, OOM kill, segfault |
+| Process GenServer | Shepherd dies without reporting an exit | Port exit → `killpg(child, SIGKILL)`, status 137 (`finish_orphaned/2`); on Linux also `PR_SET_PDEATHSIG` in the child | Shepherd SIGKILL/OOM/crash, a child killing its parent |
 | Watcher | GenServer crashes | Process.monitor → one SIGTERM probe via NIF | Elixir-level crashes, unhandled errors |
 | NIF owner monitor | Owner process dies | `down` callback + destructor close(fd) → child SIGPIPE/EOF | Owner killed without cleanup, FD leaks |
 
@@ -93,10 +94,11 @@ shepherd has usually seen POLLHUP, run its own SIGTERM→SIGKILL ladder and
 *reaped* the child — a later `alive?` → `kill` from a process with no reap
 authority is a check-then-act race against OS pid reuse and can SIGKILL an
 innocent process. Escalation is the shepherd's job (Layer 1); the Watcher's
-single probe only covers a shepherd that died before its ladder ran, where
-the orphaned child's pid stays occupied (unreaped) and the probe is safe.
+single probe only covers a shepherd that died before its ladder ran *and*
+before the GenServer handled the shepherd's Port exit, where the orphaned
+child's pid stays occupied (unreaped) and the probe is safe.
 
-Layer 3 is likewise not garbage collection: a NIF resource with a live
+The NIF owner-monitor layer is likewise not garbage collection: a NIF resource with a live
 `enif_select` registration is never destructed, so the leak safety net is the
 owner-process monitor — `io_resource_down` in `c_src/net_runner_nif.c` closes
 the fd when the owning process dies without cleaning up; the destructor only
