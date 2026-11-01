@@ -6,9 +6,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Shepherd hardening from the 1.5.0 audit (`.claude/audit/shepherd/`).
+## [1.6.0] - 2026-10-31
+
+Shepherd hardening from a six-slice audit of 1.5.0 (static security review,
+ASan/UBSan, valgrind, strace, fuzzing, soak, threat model). The shepherd's
+teardown now reaches the child's whole process group on every exit path, and
+a documented security model states what is and is not contained.
 **Behaviour change:** a child's process group no longer outlives it (see
-Fixed, H2).
+Fixed, H2); use `setsid` for jobs that must.
 
 ### Added
 
