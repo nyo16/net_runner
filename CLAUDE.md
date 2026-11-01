@@ -49,7 +49,7 @@ NetRunner is a safe OS process execution library for Elixir with NIF-based backp
 - `NetRunner` — top-level API (`run/2`, `stream!/2`, `stream/2`)
 - `NetRunner.Process` — GenServer owning the OS process lifecycle
 - `NetRunner.Process.Exec` — spawn logic (UDS, Port, SCM_RIGHTS, Pipe creation)
-- `NetRunner.Nif` — NIF stubs (`nif_read`, `nif_write`, `nif_close`, `nif_create_fd`, `nif_kill`)
+- `NetRunner.Nif` — NIF stubs (`nif_read`, `nif_write`, `nif_close`, `nif_create_fd`, `nif_kill`, `nif_kill_group`, `nif_pidfd_send_signal`, …)
 - `NetRunner.Process.Protocol` — shepherd wire protocol: frame constants, parser, command encoders
 - `NetRunner.Process.Pipe` — struct wrapping a NIF resource with owner/type metadata
 - `NetRunner.Process.Operations` — pending operation queue (park on EAGAIN, retry on select)

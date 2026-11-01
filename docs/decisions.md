@@ -251,3 +251,137 @@ an overlay.
   that needs one to start (for example a dynamically linked build under Nix)
   then fails with `{:shepherd_spawn_failed, _}`; select the variable (it also
   reaches the child) or build with `SHEPHERD_STATIC=1`.
+
+## ADR-13: Threat Model — Careless Children, Not Same-uid Adversaries
+
+**Context**: The 1.5.0 shepherd audit (`.claude/audit/shepherd/`) showed
+that a child running under the BEAM's uid can always undo NetRunner's
+containment: SIGSTOP or SIGKILL its shepherd, write its own pid into another
+cgroup's `cgroup.procs`, ptrace the shepherd (Yama permitting), or signal the
+BEAM itself. No amount of shepherd hardening changes that; only the kernel's
+uid and namespace boundaries do.
+
+**Decision**: NetRunner contains **crashing, buggy or careless** children. It
+does **not** contain an **adversarial child running under the BEAM's uid**.
+Untrusted code needs a separate uid or a user+cgroup namespace. Hardening
+that is cheap and local still lands where it narrows what a careless or
+merely curious child can do: non-dumpable shepherd on Linux
+(`PR_SET_DUMPABLE(0)`; `execve` resets it for the child), signal state reset
+in the child, an opt-in `no_new_privs`.
+
+**Consequences**:
+- (+) The guarantees in the README are ones the code can actually keep.
+- (+) `no_new_privs: true` is opt-in, default off: it would break legitimate
+  `sudo`/`su`/`fusermount`/`newuidmap` use by children.
+- (−) The cgroup teardown claim holds for cooperative descendants only; a
+  child that leaves its leaf escapes `cgroup.kill`.
+- (−) Debugging the shepherd with gdb/lsof needs root (non-dumpable).
+
+## ADR-14: Sweep the Process Group Before Reaping the Leader
+
+**Context**: The shepherd only SIGKILLed the child's group when the
+**leader** outlived the SIGTERM wait (S-01): a leader that died on SIGTERM
+left TERM-ignoring members running, reparented to init. A leader that simply
+exited never swept its group at all (`sh -c 'sleep … & exit 0'` left an
+unreachable orphan without a cgroup and a killed one with — inconsistent).
+Sweeping *after* `waitpid` is unsafe: once the leader is reaped its pid, and
+with it the pgid, can be reused, so `kill(-pid, …)` could hit a stranger's
+group.
+
+**Decision**: Every exit path observes the leader's exit with
+`waitid(P_PID, pid, …, WEXITED | WNOWAIT)` — which leaves it a zombie — then
+`kill(-pid, SIGKILL)` (direct-pid fallback), then reaps, then runs
+`cgroup_cleanup`, and only then sends `MSG_CHILD_EXITED` with the leader's
+real status. The teardown ladder always ends in that SIGKILL; a leader that
+exits on its own gets the sweep immediately, with no grace period.
+
+**Consequences**:
+- (+) "Zero orphans" holds without cgroups, on Linux and macOS.
+- (+) No pid-reuse window: a zombie leader pins its pid and pgid.
+- (+) The exit frame arrives after cleanup, so a same-path respawn (Daemon
+  restart) never sees a stale cgroup leaf.
+- (−) **Behaviour change**: background members of the child's group are
+  SIGKILLed when the child exits. A job that must outlive the command has to
+  leave the group (`setsid`). SIGKILL rather than SIGTERM-then-SIGKILL is
+  deliberate: the leader is already gone, and a grace period would hold the
+  exit status hostage to whatever it left behind.
+
+## ADR-15: Unconditional Exec Gate; Hand Off Before Exec
+
+**Context**: The sync-pipe gate existed only for cgroup spawns, and even then
+`'G'` was written before `send_fds`/`MSG_CHILD_STARTED`. So the command ran
+before the BEAM had its fds; a hand-off failure returned `{:error, _}` after
+the command's side effects (a retry ran it twice), and that failure path used
+the graceful ladder. Separately, `MSG_CHILD_STARTED` could precede the
+child's `setpgid`/`setsid`, so a BEAM-side `killpg` (`finish_orphaned/2`)
+could get `ESRCH` against a live child — fatal on macOS, which has no
+`PR_SET_PDEATHSIG`.
+
+**Decision**: The gate is unconditional, in pipe and PTY mode. Order: fork →
+child joins/creates its group, resets signals, blocks on the gate → parent
+(pipe mode) `setpgid(child, child)`; PTY mode waits for the child's `'R'`
+after `setsid()` → `cgroup_setup` → `send_fds` → `MSG_CHILD_STARTED` → `'G'`.
+Any failure before `'G'` closes the gate (the child `_exit(127)`s without
+exec), SIGKILLs and reaps it, then reports `MSG_ERROR`. On the BEAM side
+`finish_orphaned/2` additionally falls back to a direct kill of the leader on
+a group `ESRCH`.
+
+**Consequences**:
+- (+) A spawn that returns an error never ran the command.
+- (+) The child leads its group before anyone can signal it by group.
+- (+) One code path for cgroup and non-cgroup spawns.
+- (−) One extra pipe and two extra context switches on every spawn's
+  critical path, measured against the spawn-latency floor (Spawn Cost in
+  `architecture.md`) with `MIX_ENV=prod mix run bench/perf.exs` (≥ 3 runs,
+  medians; ~11% run-to-run noise).
+
+## ADR-16: Hand a pidfd to the BEAM (Linux)
+
+**Context**: Inside the shepherd a pid is safe to signal: the shepherd is the
+parent and holds the zombie until it reaps. The BEAM has no such guarantee.
+Once the shepherd is gone (or has reaped), `direct_kill` and
+`finish_orphaned/2` signal a pid number that may already belong to someone
+else; probe-then-kill only narrows that window.
+
+**Decision**: On Linux the shepherd calls `pidfd_open(child, 0)` right after
+`fork` and appends the pidfd as the optional last `SCM_RIGHTS` fd. The BEAM
+wraps it with `nif_create_fd/2` (owner monitor closes it), signals through
+`nif_pidfd_send_signal/2` whenever it would otherwise `kill(2)` the pid
+directly, and closes it as soon as the exit status arrives. `ESRCH` maps to
+`{:error, :not_running}`. Without a pidfd (macOS, kernels < 5.3, seccomp
+denying the syscall, any `pidfd_open` failure) both sides fall back to the
+old fd counts and the probe-then-kill path.
+
+**Consequences**:
+- (+) Direct kills from the BEAM are race-free on Linux, even after the
+  shepherd died.
+- (+) No protocol version bump: the BEAM accepts either fd count.
+- (−) One more fd per running child on Linux.
+- (−) A pidfd signals one process; a group-wide pidfd signal needs Linux ≥
+  6.9 (`PIDFD_SIGNAL_PROCESS_GROUP`), so the orphan path still pairs it with
+  `killpg`.
+
+## ADR-17: Deferred Isolation Mechanisms
+
+**Context**: The audit evaluated further structural options (slice F §5).
+
+**Decision**: Not implemented; recorded so they are not re-proposed without
+new information.
+
+- **`clone3(CLONE_INTO_CGROUP)`** (Linux ≥ 5.7): atomic cgroup placement at
+  creation would remove the `cgroup.procs` write and the "forked before
+  migration" class. Deferred: raw syscall without a glibc wrapper, fork-like
+  libc caveats, a leaf dir fd to manage — and the unconditional exec gate
+  (ADR-15) already closes the escape window. Worth a prototype if cgroup
+  spawn latency matters.
+- **User + cgroup namespaces**: the only structural answer to a same-uid
+  adversarial child (ADR-13), since `nsdelegate` turns the leaf into a real
+  boundary. Deferred: unprivileged user namespaces are often restricted by
+  distributions and container runtimes, the uid map is visible to the child,
+  and the feature surface is large. Candidate for a future opt-in.
+- **seccomp on the shepherd**: rejected. Filters survive `execve` into the
+  arbitrary child, and libc/arch/sanitizer syscall variance makes a filter
+  brittle.
+- **`posix_spawn` instead of `fork`**: rejected. It cannot portably do
+  `PR_SET_PDEATHSIG`, the exec gate or `TIOCSCTTY`, and spawn cost is
+  dominated by the two `exec`s anyway (Spawn Cost in `architecture.md`).

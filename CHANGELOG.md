@@ -6,6 +6,82 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Shepherd hardening from the 1.5.0 audit (`.claude/audit/shepherd/`).
+**Behaviour change:** a child's process group no longer outlives it (see
+Fixed, H2).
+
+### Added
+
+- **`no_new_privs: true`** sets `PR_SET_NO_NEW_PRIVS` in the child before
+  exec, so neither it nor anything it executes can gain privileges through
+  setuid/setgid binaries or file capabilities. Accepted by `run/2`,
+  `stream!/2`, `stream/2`, `NetRunner.Process.start/3`/`start_link/3` and
+  `Daemon` `process_opts`; default `false`; a non-boolean raises
+  `ArgumentError`. Linux only, accepted and ignored elsewhere.
+- **pidfd-based kills on Linux.** The shepherd hands the BEAM a pidfd for the
+  child (optional last `SCM_RIGHTS` fd; Linux ≥ 5.3). Direct kills from the
+  BEAM — `kill/2` when the shepherd cannot take the command, the orphan path
+  after a shepherd crash — go through it and can no longer hit a reused pid;
+  a reaped child reports `{:error, :not_running}`. ADR-16.
+- **README "Security model" section** stating the threat model: NetRunner
+  contains crashing, buggy or careless children, not an adversarial child
+  running under the BEAM's uid. ADR-13.
+
+### Changed
+
+- **Exec failures exit 126 or 127 and name the errno.** A command that is not
+  found exits `127`; one that is found but cannot run (no execute
+  permission, bad format, …) now exits `126` instead of `127`. stderr reads
+  `execvp: <cmd>: <reason> (errno N)`.
+- **Termination signals to the shepherd are handled.** SIGTERM, SIGINT,
+  SIGHUP and SIGQUIT (e.g. `systemctl stop`, a stray `kill`) run the same
+  teardown as BEAM death — ladder, group SIGKILL, cgroup cleanup — and the
+  real exit status is still reported, instead of the shepherd dying
+  silently and the BEAM synthesising `137`.
+- **The command is exec'd only after the shepherd has handed the BEAM its
+  fds and pid.** The exec gate is now unconditional; a spawn that fails inside
+  the shepherd (cgroup setup, fd hand-off) returns `{:error, _}` without the
+  command ever having run. ADR-15.
+- **The child starts with a clean signal state**: every disposition at its
+  default and an empty signal mask, instead of inheriting what the BEAM's
+  launcher ignored or blocked (erts: SIGFPE; `nohup`/`+Bi`: SIGHUP/SIGINT).
+- **The shepherd is non-dumpable on Linux**, so a same-uid child cannot read
+  its memory or environment through `/proc` without `CAP_SYS_PTRACE`.
+- **Unknown opcodes on the shepherd socket** discard the rest of the buffer
+  (logged once) instead of resynchronising byte by byte.
+
+### Fixed
+
+- **S-01 / H1: teardown always SIGKILLs the process group.** The SIGKILL
+  step ran only if the group leader outlived `kill_timeout`; when the leader
+  died on SIGTERM, TERM-ignoring members survived as orphans. The ladder now
+  always ends in a group SIGKILL, with a direct-pid fallback (H12).
+- **H2: a child's normal exit sweeps its process group.** `sh -c 'worker &
+  exit 0'` left `worker` running, unreachable, with no cgroup (and killed it
+  with one). The shepherd now SIGKILLs the remaining group members while the
+  exited leader is still a zombie (so the pgid cannot be reused), then reaps.
+  **Behaviour change:** background members of the child's group die with it;
+  a job that must outlive the command must `setsid` itself. ADR-14.
+- **H3: commands queued before the BEAM hangs up are honoured.** A
+  `kill(pid, :sigkill)` followed immediately by `stop/1` was dropped in
+  favour of the SIGTERM ladder, delaying the kill by up to `kill_timeout`.
+  Readable commands are now drained before acting on the hang-up.
+- **H4: SIGTERM/SIGINT/SIGHUP/SIGQUIT to the shepherd** no longer skip the
+  ladder and leak the cgroup leaf (see Changed).
+- **H5/H6: cgroup leaves are cleaned up reliably and before the exit is
+  reported.** A child-created sub-cgroup made the leaf `rmdir` fail silently,
+  so the leaf leaked and later spawns on that path failed "already exists".
+  The leaf, including any sub-cgroups the child created, is now removed recursively
+  (giving up is logged), and `MSG_CHILD_EXITED` is sent only after cleanup,
+  so a same-path respawn (Daemon restart) right after `await_exit/2` works.
+- **H7: the child leads its process group before it is reported.** The pipe
+  mode parent now also calls `setpgid(child, child)` and PTY mode waits for
+  the child's `setsid()`; the BEAM's orphan kill falls back to a direct kill
+  of the leader if the group kill finds no group.
+- **H11: shepherd failure paths report the reaped status** when the socket is
+  still usable, instead of reaping silently and leaving the BEAM to `killpg` a
+  recyclable pgid.
+
 ## [1.5.0] - 2026-10-31
 
 Child launch context (`:cwd`, `:env` lists and `{:replace, env}`, from #16 by

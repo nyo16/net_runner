@@ -2,9 +2,11 @@
  * net_runner_nif.c - NIF for async I/O on raw file descriptors
  *
  * Every function here runs on a NORMAL scheduler, deliberately. nif_create_fd
- * puts each fd in O_NONBLOCK and rejects anything that is not a pipe, socket
- * or character device (a PTY master), so every syscall in this file is
- * bounded: read/write cannot wait, and kill/dup/fcntl/close never could.
+ * puts each fd in O_NONBLOCK and rejects anything that is not a pipe, socket,
+ * character device (a PTY master) or Linux pidfd (only ever signalled via
+ * nif_pidfd_send_signal; read/write on it fail with EINVAL at once), so every
+ * syscall in this file is bounded: read/write cannot wait, and
+ * kill/dup/fcntl/close never could.
  * Readiness is delivered by enif_select through BEAM's own epoll/kqueue loop,
  * so there is nothing here to block on.
  *
@@ -29,6 +31,10 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 #include "erl_nif.h"
 #include "protocol.h"
@@ -152,10 +158,24 @@ static const char *errno_to_atom(int err) {
     case ENOENT:     return "enoent";
     case EMFILE:     return "emfile";
     case ENFILE:     return "enfile";
-    case EFAULT:     return "efault";
     case EINTR:      return "eintr";
+    case ENOSYS:     return "enotsup";
     default:         return "unknown";
     }
+}
+
+/* 1 if fd is a pidfd (Linux): pidfd_send_signal with signal 0 only checks
+ * the target, and fails with EBADF/EINVAL for anything that is not a
+ * pidfd. EPERM is NOT accepted: a seccomp/LSM policy that returns EPERM for
+ * pidfd_send_signal would otherwise let every fd type through this gate. */
+static int is_pidfd(int fd) {
+#if defined(__linux__) && defined(SYS_pidfd_send_signal)
+    if (syscall(SYS_pidfd_send_signal, fd, 0, NULL, 0) == 0) return 1;
+    return errno == ESRCH;
+#else
+    (void)fd;
+    return 0;
+#endif
 }
 
 /*
@@ -207,7 +227,7 @@ static ERL_NIF_TERM nif_create_fd(ErlNifEnv *env, int argc,
                                 MAKE_ATOM(env, "invalid_fd"));
     }
     if (!S_ISFIFO(st.st_mode) && !S_ISSOCK(st.st_mode) &&
-        !S_ISCHR(st.st_mode)) {
+        !S_ISCHR(st.st_mode) && !is_pidfd(fd)) {
         return enif_make_tuple2(env, atom_error,
                                 MAKE_ATOM(env, "unsupported_fd_type"));
     }
@@ -646,6 +666,50 @@ static ERL_NIF_TERM nif_kill_group(ErlNifEnv *env, int argc,
 }
 
 /*
+ * nif_pidfd_send_signal(resource, signal) -> :ok | {:error, reason}
+ *
+ * Signals the process a pidfd (wrapped by nif_create_fd) refers to. Unlike
+ * kill(pid), this can never reach a recycled pid: once the process is
+ * reaped the pidfd yields {:error, :esrch}. {:error, :enotsup} off Linux or
+ * on kernels without pidfd_send_signal (< 5.1); {:error, :ebadf} after the
+ * resource was closed.
+ */
+static ERL_NIF_TERM nif_pidfd_send_signal(ErlNifEnv *env, int argc,
+                                          const ERL_NIF_TERM argv[]) {
+    ASSERT_ARGC(env, argc, 2);
+
+    io_resource_t *res;
+    if (!enif_get_resource(env, argv[0], io_resource_type, (void **)&res)) {
+        return enif_make_badarg(env);
+    }
+
+    int sig;
+    if (!enif_get_int(env, argv[1], &sig) || sig < 1 || sig > 31) {
+        return enif_make_badarg(env);
+    }
+
+#if defined(__linux__) && defined(SYS_pidfd_send_signal)
+    /* Hold the lock across the syscall so a concurrent nif_close cannot
+     * close (and let the kernel recycle) the fd number under us. */
+    enif_mutex_lock(res->lock);
+    if (res->closed || res->fd < 0) {
+        enif_mutex_unlock(res->lock);
+        return enif_make_tuple2(env, atom_error, MAKE_ATOM(env, "ebadf"));
+    }
+    long rc = syscall(SYS_pidfd_send_signal, res->fd, sig, NULL, 0);
+    int err = errno;
+    enif_mutex_unlock(res->lock);
+
+    if (rc == 0) return atom_ok;
+    return enif_make_tuple2(env, atom_error,
+                            MAKE_ATOM(env, errno_to_atom(err)));
+#else
+    (void)res;
+    return enif_make_tuple2(env, atom_error, MAKE_ATOM(env, "enotsup"));
+#endif
+}
+
+/*
  * nif_is_os_pid_alive(os_pid) -> true | false
  *
  * Checks if an OS process exists using kill(pid, 0).
@@ -737,7 +801,8 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_kill", 2, nif_kill, 0},
     {"nif_kill_group", 2, nif_kill_group, 0},
     {"nif_is_os_pid_alive", 1, nif_is_os_pid_alive, 0},
-    {"nif_signal_number", 1, nif_signal_number, 0}
+    {"nif_signal_number", 1, nif_signal_number, 0},
+    {"nif_pidfd_send_signal", 2, nif_pidfd_send_signal, 0}
 };
 
 ERL_NIF_INIT(Elixir.NetRunner.Nif, nif_funcs, load, NULL, NULL, NULL)

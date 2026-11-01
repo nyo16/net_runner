@@ -3,15 +3,22 @@
  *
  * Lifecycle:
  *   1. BEAM opens this binary via Port.open with :nouse_stdio
- *   2. Shepherd connects to BEAM's UDS listener (path passed as argv[1])
- *   3. Shepherd forks child, execvp's the command
- *   4. Sends child's pipe FDs to BEAM via SCM_RIGHTS over UDS
- *   5. Sends MSG_CHILD_STARTED with child PID
- *   6. Enters poll() loop watching:
- *      - UDS for commands from BEAM (KILL, CLOSE_STDIN)
- *      - Signal pipe for SIGCHLD (child death)
- *   7. On BEAM death (UDS POLLHUP): SIGTERM child, wait, SIGKILL if needed
- *   8. On child death: send MSG_CHILD_EXITED, exit
+ *   2. Shepherd reads the handshake token from fd 3, connects to the BEAM's
+ *      UDS listener (path passed as argv[1]) and echoes the token
+ *   3. Shepherd forks the child. The child takes its own process group (pipe
+ *      mode) or session (PTY mode), resets its signal state and parks on the
+ *      exec gate
+ *   4. Shepherd places the child in its cgroup (if requested), sends the
+ *      child's FDs (plus a pidfd on Linux) via SCM_RIGHTS, sends
+ *      MSG_CHILD_STARTED, and only then releases the gate: the command never
+ *      runs before the BEAM holds its FDs
+ *   5. Enters a poll() loop watching:
+ *      - UDS for commands from BEAM (KILL, CLOSE_STDIN, SET_WINSIZE)
+ *      - Signal pipe for SIGCHLD (child death) and termination signals
+ *   6. On child death: sweep the child's process group, reap, clean up the
+ *      cgroup, send MSG_CHILD_EXITED, exit
+ *   7. On BEAM death (UDS hangup) or a termination signal: SIGTERM the
+ *      group, wait up to kill_timeout, SIGKILL the group, reap, clean up
  *
  * The shepherd NEVER calls execvp on itself - it stays alive as a watchdog.
  */
@@ -35,6 +42,7 @@
 
 #ifdef __linux__
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #endif
 
 /* PTY headers — platform-specific */
@@ -50,26 +58,83 @@
 /* Self-pipe for signal handling */
 static int signal_pipe[2] = {-1, -1};
 
+/* Last termination signal (SIGTERM/INT/HUP/QUIT) received, 0 if none. The
+ * byte the handler writes to the self-pipe only wakes poll(); this flag is
+ * what the shepherd acts on. */
+static volatile sig_atomic_t term_signal = 0;
+
+/* How long the PTY parent waits for the child to report that it leads its
+ * session, and how long any post-SIGKILL reap may take. */
+#define CHILD_READY_TIMEOUT_MS 5000
+#define REAP_TIMEOUT_MS 3000
+
+/* ---- Post-fork helpers (async-signal-safe only) ---- */
+
+static size_t bounded_strlen(const char *s, size_t cap) {
+    size_t i = 0;
+    while (i < cap && s[i] != '\0') i++;
+    return i;
+}
+
+static void write_str(const char *s, size_t cap) {
+    (void)!write(STDERR_FILENO, s, bounded_strlen(s, cap));
+}
+
+/* Fixed texts for the errnos an exec or child setup typically fails with:
+ * strerror() is not async-signal-safe. They match glibc/musl/macOS wording,
+ * so callers can match them regardless of platform. */
+static const char *child_errno_text(int err) {
+    switch (err) {
+    case ENOENT:  return "No such file or directory";
+    case EACCES:  return "Permission denied";
+    case ENOEXEC: return "Exec format error";
+    case ENOTDIR: return "Not a directory";
+    case E2BIG:   return "Argument list too long";
+    case ENOMEM:  return "Cannot allocate memory";
+    case ELOOP:   return "Too many levels of symbolic links";
+    case ETXTBSY: return "Text file busy";
+    case EPERM:   return "Operation not permitted";
+    case EINVAL:  return "Invalid argument";
+    case EISDIR:  return "Is a directory";
+    case EMFILE:  return "Too many open files";
+    default:      return "error";
+    }
+}
+
 /*
  * Async-signal-safe post-fork failure path. Between fork() and exec*(),
  * POSIX allows only async-signal-safe functions, so we cannot call
  * fprintf / strerror / malloc. This helper uses write(2) on a stack
- * buffer only.
+ * buffer only. Writes "tag[: detail][: reason][ (errno N)]\n" and exits
+ * with code. reason NULL and err != 0 uses the errno's fixed text.
  */
-static void child_fail(const char *tag, const char *detail) {
-    if (tag) {
-        size_t i = 0;
-        while (i < 64 && tag[i] != '\0') i++;
-        (void)!write(STDERR_FILENO, tag, i);
-        (void)!write(STDERR_FILENO, ": ", 2);
-    }
+__attribute__((noreturn))
+static void child_fail(const char *tag, const char *detail, const char *reason,
+                       int err, int code) {
+    write_str(tag, 64);
     if (detail) {
-        size_t i = 0;
-        while (i < 256 && detail[i] != '\0') i++;
-        (void)!write(STDERR_FILENO, detail, i);
+        (void)!write(STDERR_FILENO, ": ", 2);
+        write_str(detail, 256);
+    }
+    if (reason == NULL && err != 0) reason = child_errno_text(err);
+    if (reason) {
+        (void)!write(STDERR_FILENO, ": ", 2);
+        write_str(reason, 128);
+    }
+    if (err > 0) {
+        char num[16];
+        size_t pos = sizeof(num);
+        num[--pos] = ')';
+        unsigned int v = (unsigned int)err;
+        do {
+            num[--pos] = (char)('0' + v % 10);
+            v /= 10;
+        } while (v != 0 && pos > 0);
+        (void)!write(STDERR_FILENO, " (errno ", 8);
+        (void)!write(STDERR_FILENO, num + pos, sizeof(num) - pos);
     }
     (void)!write(STDERR_FILENO, "\n", 1);
-    _exit(127);
+    _exit(code);
 }
 
 /* Child side, right after fork(): if the shepherd dies (SIGKILL, OOM, crash)
@@ -90,10 +155,50 @@ static void die_with_shepherd(pid_t shepherd_pid) {
 #endif
 }
 
+/* libc refuses to touch its reserved real-time signals (glibc 32-33, musl
+ * 32-34), yet an inherited SIG_IGN on them survives exec like any other.
+ * Reset them with the raw syscall: an all-zero kernel sigaction is SIG_DFL
+ * with no flags and an empty mask whatever the architecture's field order.
+ * The kernel sigset is 8 bytes on most architectures, 16 on MIPS. */
+static void reset_reserved_signal(int sig) {
+#if defined(__linux__) && defined(SYS_rt_sigaction)
+    unsigned long zero[8] = {0};
+    if (syscall(SYS_rt_sigaction, sig, zero, NULL, (size_t)8) != 0 && errno == EINVAL)
+        (void)syscall(SYS_rt_sigaction, sig, zero, NULL, (size_t)16);
+#else
+    (void)sig;
+#endif
+}
+
+/* Give the child the signal state a shell would: every disposition back to
+ * SIG_DFL (inherited SIG_IGNs such as erts' SIGFPE or nohup's SIGHUP survive
+ * exec otherwise; our own handlers would run in the child until exec) and an
+ * empty mask (the parent blocked everything across fork()). */
+static void child_reset_signals(void) {
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    for (int s = 1; s < NSIG; s++) {
+        if (s == SIGKILL || s == SIGSTOP) continue;
+        if (sigaction(s, &dfl, NULL) != 0) reset_reserved_signal(s);
+    }
+    sigset_t none;
+    sigemptyset(&none);
+    (void)sigprocmask(SIG_SETMASK, &none, NULL);
+}
+
+/* exec, or fail with the shell's codes: 127 when the command was not found,
+ * 126 when it was found but could not be executed. */
+__attribute__((noreturn))
 static void exec_child(char *cmd, char **args, int allow_execvp) {
-    if (!allow_execvp) child_fail("execvp", cmd);
+    if (!allow_execvp) {
+        child_fail("execvp", cmd,
+                   "PATH is not set in the replacement environment", 0, 127);
+    }
     execvp(cmd, args);
-    child_fail("execvp", cmd);
+    int err = errno;
+    child_fail("execvp", cmd, NULL, err, err == ENOENT ? 127 : 126);
 }
 
 extern char **environ;
@@ -125,12 +230,22 @@ static void restrict_environment(void) {
     *write = NULL;
 }
 
+/* Wake poll() — ignore failure in a signal handler (pipe full = already
+ * awake). errno is preserved for the interrupted code. */
+static void wake_event_loop(char byte) {
+    int saved_errno = errno;
+    if (write(signal_pipe[1], &byte, 1) < 0) { /* nothing to do */ }
+    errno = saved_errno;
+}
+
 static void sigchld_handler(int sig) {
     (void)sig;
-    int saved_errno = errno;
-    /* Write a single byte to wake up poll() — ignore failure in signal handler */
-    if (write(signal_pipe[1], "C", 1) < 0) { /* nothing to do */ }
-    errno = saved_errno;
+    wake_event_loop('C');
+}
+
+static void term_handler(int sig) {
+    term_signal = sig;
+    wake_event_loop('T');
 }
 
 static int set_nonblocking(int fd) {
@@ -145,11 +260,37 @@ static int set_cloexec(int fd) {
     return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
+/* Create a CLOEXEC pipe (atomically where the platform allows). */
+static int cloexec_pipe(int fds[2]) {
+#ifdef __linux__
+    return pipe2(fds, O_CLOEXEC);
+#else
+    if (pipe(fds) != 0) return -1;
+    set_cloexec(fds[0]);
+    set_cloexec(fds[1]);
+    return 0;
+#endif
+}
+
 /* Milliseconds on a monotonic clock, or -1 if the clock is unavailable. */
 static int64_t monotonic_ms(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Remaining milliseconds until deadline (from monotonic_ms() + budget, or
+ * -1 when the clock is unavailable, in which case the full budget is
+ * returned once and 0 afterwards via *spent). */
+static int remaining_ms(int64_t deadline, int budget_ms, int *spent) {
+    if (deadline < 0) {
+        if (*spent) return 0;
+        *spent = 1;
+        return budget_ms;
+    }
+    int64_t now = monotonic_ms();
+    if (now < 0 || now >= deadline) return 0;
+    return (int)(deadline - now);
 }
 
 /* Bound on how long any single shepherd->BEAM frame may wait for socket
@@ -212,12 +353,9 @@ static int wait_pollout(int fd, struct write_deadline *dl, int timeout_ms) {
  *
  * The UDS is deliberately non-blocking for writes: a BEAM that stops
  * draining the socket must not park the shepherd in write(2) forever.
- * The critical case is send_child_exited after the child was reaped — a
- * shepherd wedged there never runs cgroup_cleanup(), leaking the cgroup
- * and any processes still in it. On persistent EAGAIN we drop the frame
- * instead: the peer is wedged or gone, it will observe the UDS close
- * when we exit, and a lost frame is recoverable where a wedged shepherd
- * is not.
+ * On persistent EAGAIN we drop the frame instead: the peer is wedged or
+ * gone, it will observe the UDS close when we exit, and a lost frame is
+ * recoverable where a wedged shepherd is not.
  */
 static int write_fully(int fd, const uint8_t *buf, size_t len,
                        int timeout_ms) {
@@ -242,8 +380,9 @@ static int write_fully(int fd, const uint8_t *buf, size_t len,
 }
 
 /*
- * Send file descriptors over UDS using SCM_RIGHTS.
- * Sends stdin_w, stdout_r, stderr_r to the BEAM.
+ * Send file descriptors over UDS using SCM_RIGHTS: [stdin_w, stdout_r,
+ * stderr_r] in pipe mode or [master] in PTY mode, each followed by the
+ * child's pidfd when one could be opened (Linux).
  */
 static int send_fds(int uds_fd, int *fds, int nfds) {
     char buf[1] = {0};
@@ -318,6 +457,7 @@ static int send_child_started(int uds_fd, pid_t pid) {
     return send_message(uds_fd, MSG_CHILD_STARTED, &pid_be, sizeof(pid_be));
 }
 
+/* status is always 0..255 (see encode_wait_status). */
 static int send_child_exited(int uds_fd, int status) {
     uint32_t status_be = htonl((uint32_t)status);
     return send_message(uds_fd, MSG_CHILD_EXITED, &status_be, sizeof(status_be));
@@ -352,14 +492,13 @@ static char cgroup_path[CGROUP_PATH_MAX] = {0};
 static char cgroup_errmsg[256] = "cgroup setup failed";
 
 #ifdef __linux__
+#include <dirent.h>
+
 /* Set only when this shepherd created the cgroup directory itself. A
  * pre-existing directory belongs to someone else: attach the child to it,
- * but never cgroup.kill it or rmdir it on teardown. */
+ * but never cgroup.kill it or rmdir it on teardown. Cleared once the
+ * directory is removed, so cleanup is idempotent. */
 static int cgroup_owned = 0;
-#endif
-
-#ifdef __linux__
-#include <dirent.h>
 
 #define CGROUP_ROOT "/sys/fs/cgroup/"
 
@@ -497,6 +636,31 @@ static int cgroup_setup(pid_t child_pid) {
     return 0;
 }
 
+/* Depth-first rmdir of path and every sub-cgroup below it (the child may
+ * have created some). path is modified in place but restored; cap bounds
+ * both the path and, with it, the recursion depth. cgroupfs has no
+ * symlinks. Returns rmdir(path)'s result. */
+static int cgroup_rmdir_tree(char *path, size_t cap) {
+    DIR *d = opendir(path);
+    if (d != NULL) {
+        size_t len = strlen(path);
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_type != DT_DIR && e->d_type != DT_UNKNOWN) continue;
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+                continue;
+            size_t name_len = strlen(e->d_name);
+            if (len + 1 + name_len + 1 > cap) continue;
+            path[len] = '/';
+            memcpy(path + len + 1, e->d_name, name_len + 1);
+            (void)cgroup_rmdir_tree(path, cap);
+            path[len] = '\0';
+        }
+        closedir(d);
+    }
+    return rmdir(path);
+}
+
 static void cgroup_cleanup(void) {
     if (cgroup_path[0] == '\0' || !cgroup_owned) return;
 
@@ -507,9 +671,10 @@ static void cgroup_cleanup(void) {
                      cgroup_path);
     if (n < 0 || (size_t)n >= sizeof(full_path)) return;
 
-    /* Kill all processes in the cgroup via cgroup.kill (cgroup v2).
-     * cgroup_setup() verified the file was writable, so a failure here is
-     * worth a log line: it means descendants may outlive the teardown. */
+    /* Kill all processes in the cgroup — recursively, sub-cgroups
+     * included — via cgroup.kill (cgroup v2). cgroup_setup() verified the
+     * file was writable, so a failure here is worth a log line: it means
+     * descendants may outlive the teardown. */
     n = snprintf(kill_path, sizeof(kill_path), "%s/cgroup.kill", full_path);
     if (n < 0 || (size_t)n >= sizeof(kill_path)) return;
     FILE *f = fopen(kill_path, "w");
@@ -521,13 +686,20 @@ static void cgroup_cleanup(void) {
                   strerror(errno));
     }
 
-    /* Poll for rmdir success rather than a fixed sleep — the kernel needs
-     * a moment to reap the killed processes. Bail after ~1s (10 * 100ms). */
+    /* Poll for removal rather than a fixed sleep — the kernel needs a
+     * moment to reap the killed processes. Bail after ~1s (10 * 100ms). */
+    int err = 0;
     for (int i = 0; i < 10; i++) {
-        if (rmdir(full_path) == 0) return;
-        if (errno != EBUSY && errno != ENOTEMPTY) return; /* real error */
+        if (cgroup_rmdir_tree(full_path, sizeof(full_path)) == 0 ||
+            errno == ENOENT) {
+            cgroup_owned = 0;
+            return;
+        }
+        err = errno;
+        if (err != EBUSY && err != ENOTEMPTY) break; /* real error */
         usleep(100000);
     }
+    ERROR_LOG("cgroup_cleanup: %s not removed: %s", full_path, strerror(err));
 }
 #else
 static int cgroup_setup(pid_t child_pid) {
@@ -537,85 +709,116 @@ static int cgroup_setup(pid_t child_pid) {
 static void cgroup_cleanup(void) {}
 #endif
 
+/* ---- Child exit observation and teardown ---- */
+
+/* Drain the non-blocking self-pipe. EAGAIN when already empty is expected. */
+static void drain_signal_pipe(void) {
+    char drain[64];
+    while (read(signal_pipe[0], drain, sizeof(drain)) > 0) {}
+}
+
+/* 1 if child_pid has exited, WITHOUT reaping it: the zombie keeps its pid
+ * and process-group id pinned, so the group can still be signalled with no
+ * pid-reuse risk. ECHILD (nothing to wait for) also counts as exited. */
+static int child_has_exited(pid_t child_pid) {
+    for (;;) {
+        siginfo_t si;
+        memset(&si, 0, sizeof(si));
+        int r = waitid(P_PID, (id_t)child_pid, &si,
+                       WEXITED | WNOHANG | WNOWAIT);
+        /* si_code guard: macOS waitid() can report a *stopped* child even
+         * with only WEXITED requested (golang/go#19314). */
+        if (r == 0) {
+            return si.si_pid == child_pid &&
+                   (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
+                    si.si_code == CLD_DUMPED);
+        }
+        if (errno == EINTR) continue;
+        return errno == ECHILD;
+    }
+}
+
 /*
- * Wait up to timeout_ms for child_pid to be reaped. Returns 1 if it was reaped
- * (or was already gone), 0 on timeout.
+ * Wait up to timeout_ms for child_pid to exit, without reaping it. Returns 1
+ * if it exited, 0 on timeout.
  *
  * Blocks in poll() on the SIGCHLD self-pipe rather than sleeping in fixed
- * slices: a child that died 1 ms after SIGTERM used to cost a full 100 ms
- * usleep tick, twice over. The deadline comes from a monotonic clock so that
- * EINTR (SIGCHLD itself interrupts poll) and wakeups for some other child
- * cannot extend it; if the clock is unavailable the loop collapses to a single
- * bounded poll, which is still bounded.
+ * slices. The deadline comes from a monotonic clock so that EINTR and
+ * wakeups for other signals cannot extend it; if the clock is unavailable
+ * the loop collapses to a single bounded poll, which is still bounded.
  */
-static int wait_for_child(pid_t child_pid, int timeout_ms) {
+static int wait_for_exit(pid_t child_pid, int timeout_ms) {
     int64_t now = monotonic_ms();
     int64_t deadline = (now < 0) ? -1 : now + timeout_ms;
-    int wait_ms = timeout_ms;
+    int spent = 0;
 
     for (;;) {
-        pid_t ret = waitpid(child_pid, NULL, WNOHANG);
-        if (ret > 0 || (ret < 0 && errno == ECHILD)) return 1;
+        if (child_has_exited(child_pid)) return 1;
+        int wait_ms = remaining_ms(deadline, timeout_ms, &spent);
         if (wait_ms <= 0) return 0;
 
-        struct pollfd pfd;
-        pfd.fd = signal_pipe[0];
-        pfd.events = POLLIN;
-        pfd.revents = 0;
+        struct pollfd pfd = {.fd = signal_pipe[0], .events = POLLIN, .revents = 0};
         int pret = poll(&pfd, 1, wait_ms);
         if (pret < 0 && errno != EINTR) {
             /* poll is broken — give up rather than spin on it. */
-            return 0;
+            return child_has_exited(child_pid);
         }
-        if (pret > 0 && (pfd.revents & POLLIN)) {
-            /* Drain the self-pipe. It is non-blocking and the event loop may
-             * have drained it already, so EAGAIN here is expected. */
-            char drain[64];
-            while (read(signal_pipe[0], drain, sizeof(drain)) > 0) {}
-        }
-
-        if (deadline < 0) {
-            wait_ms = 0; /* No clock: one poll, then a final waitpid. */
-        } else {
-            now = monotonic_ms();
-            wait_ms = (now < 0) ? 0 : (int)(deadline - now);
-        }
+        if (pret > 0 && (pfd.revents & POLLIN)) drain_signal_pipe();
     }
+}
+
+/* Map a waitpid status to the 0..255 value MSG_CHILD_EXITED carries:
+ * exit code, 128 + signal, or EXIT_STATUS_UNKNOWN for anything else. */
+static int encode_wait_status(int status) {
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return EXIT_STATUS_UNKNOWN;
+}
+
+/* Signal the child's process group, falling back to the child itself when
+ * the group does not exist (yet). */
+static void signal_group(pid_t child_pid, int sig) {
+    if (kill(-child_pid, sig) != 0) (void)kill(child_pid, sig);
+}
+
+/* Reap child_pid after it was sent SIGKILL. Bounded — a child wedged in
+ * uninterruptible kernel sleep (D-state) never exits, and we must not hang
+ * the shepherd on it; the kernel completes the SIGKILL later, so that case
+ * reports 128 + SIGKILL. */
+static int reap_killed_child(pid_t child_pid) {
+    (void)wait_for_exit(child_pid, REAP_TIMEOUT_MS);
+    int status;
+    pid_t r;
+    do {
+        r = waitpid(child_pid, &status, WNOHANG);
+    } while (r < 0 && errno == EINTR);
+    if (r == child_pid) return encode_wait_status(status);
+    return 128 + SIGKILL;
 }
 
 /*
- * Kill child process group, with escalation from SIGTERM to SIGKILL.
- * The child called setpgid(0,0) so its pgid == child_pid.
- * Using kill(-pgid, sig) catches grandchildren too.
+ * Teardown ladder: SIGTERM the group, wait up to kill_timeout for the leader
+ * to exit (without reaping), then ALWAYS SIGKILL the group — members that
+ * ignore SIGTERM must not outlive a leader that obeyed it — reap, and clean
+ * up the cgroup. Returns the leader's status for MSG_CHILD_EXITED.
  */
-static void kill_child(pid_t child_pid) {
-    if (child_pid <= 0) return;
-
-    /* First try SIGTERM to the whole process group */
-    if (kill(-child_pid, SIGTERM) != 0) {
-        /* Process group may not exist; try direct kill */
-        if (kill(child_pid, SIGTERM) != 0 && errno == ESRCH)
-            return; /* Already dead */
+static int kill_child(pid_t child_pid) {
+    int status = EXIT_STATUS_UNKNOWN;
+    if (child_pid > 0) {
+        signal_group(child_pid, SIGTERM);
+        (void)wait_for_exit(child_pid, kill_timeout_ms);
+        signal_group(child_pid, SIGKILL);
+        status = reap_killed_child(child_pid);
     }
-
-    /* Wait for graceful exit (configurable, default 5s) */
-    if (!wait_for_child(child_pid, kill_timeout_ms)) {
-        /* Escalate to SIGKILL the whole process group */
-        kill(-child_pid, SIGKILL);
-
-        /* Bounded — a child wedged in uninterruptible kernel sleep (D-state)
-         * never reaps, and we must not hang the shepherd on it. cgroup
-         * cleanup and the kernel take over from there. */
-        (void)wait_for_child(child_pid, 3000);
-    }
-
-    /* Cleanup cgroup (kills any remaining processes, removes dir) */
     cgroup_cleanup();
+    return status;
 }
+
+/* ---- BEAM commands ---- */
 
 /*
  * Length of a single framed command given its opcode. Returns 0 if the
- * opcode is unknown (in which case the parser will skip one byte).
+ * opcode is unknown.
  */
 static size_t command_length(uint8_t opcode) {
     switch (opcode) {
@@ -627,35 +830,26 @@ static size_t command_length(uint8_t opcode) {
 }
 
 /*
- * Handle a single command frame.
+ * Handle a single, complete command frame.
  */
-static void handle_command(int uds_fd, pid_t child_pid, int stdin_w,
-                           uint8_t *buf, size_t len) {
-    (void)uds_fd;
-    if (len < 1) return;
-
+static void handle_command(pid_t child_pid, int *stdin_w, const uint8_t *buf) {
     switch (buf[0]) {
-    case CMD_KILL:
-        if (len >= 2 && child_pid > 0) {
-            int sig = buf[1];
-            /* Validate signal is in POSIX range */
-            if (sig < 1 || sig > 31) break;
-            /* Kill the process group (catches grandchildren).
-             * Fall back to direct kill if group doesn't exist. */
-            if (kill(-child_pid, sig) != 0) {
-                kill(child_pid, sig);
-            }
-        }
+    case CMD_KILL: {
+        int sig = buf[1];
+        /* Validate signal is in POSIX range */
+        if (child_pid > 0 && sig >= 1 && sig <= 31) signal_group(child_pid, sig);
         break;
+    }
 
     case CMD_CLOSE_STDIN:
-        if (stdin_w >= 0) {
-            close(stdin_w);
+        if (*stdin_w >= 0) {
+            close(*stdin_w);
+            *stdin_w = -1;
         }
         break;
 
     case CMD_SET_WINSIZE:
-        if (len >= 5 && pty_master_fd >= 0) {
+        if (pty_master_fd >= 0) {
             struct winsize ws;
             memset(&ws, 0, sizeof(ws));
             ws.ws_row = (unsigned short)((buf[1] << 8) | buf[2]);
@@ -665,7 +859,6 @@ static void handle_command(int uds_fd, pid_t child_pid, int stdin_w,
         break;
 
     default:
-        DEBUG_LOG("unknown command: 0x%02x", buf[0]);
         break;
     }
 }
@@ -673,174 +866,202 @@ static void handle_command(int uds_fd, pid_t child_pid, int stdin_w,
 /*
  * Parse and dispatch all framed commands present in buf. Returns the number
  * of bytes consumed (may be less than len if a tail command is truncated).
+ *
+ * An unknown opcode is a protocol error: from then on ALL input is
+ * discarded (sticky, across reads) rather than resynchronised, which could
+ * execute payload bytes of a frame from a newer protocol (e.g. 0x01 0x09) as
+ * commands, also when that frame is split across reads. Logged once so a
+ * misbehaving peer cannot flood the node's stderr. BEAM death (POLLHUP) is
+ * still detected and still tears down.
  */
-static size_t handle_commands(int uds_fd, pid_t child_pid, int *stdin_w,
-                              uint8_t *buf, size_t len) {
+static size_t handle_commands(pid_t child_pid, int *stdin_w,
+                              const uint8_t *buf, size_t len) {
+    static int protocol_error = 0;
     size_t off = 0;
+    if (protocol_error) return len;
     while (off < len) {
         size_t clen = command_length(buf[off]);
         if (clen == 0) {
-            /* Unknown opcode: skip one byte to make progress rather than
-             * stalling the parser on bad input. */
-            DEBUG_LOG("unknown command opcode 0x%02x, skipping", buf[off]);
-            off += 1;
-            continue;
+            protocol_error = 1;
+            ERROR_LOG("unknown command opcode 0x%02x; ignoring all further commands",
+                      buf[off]);
+            return len;
         }
         if (off + clen > len) {
             /* Partial tail — caller must carry this over to the next read. */
             break;
         }
-        uint8_t op = buf[off];
-        handle_command(uds_fd, child_pid, *stdin_w, &buf[off], clen);
-        if (op == CMD_CLOSE_STDIN) {
-            *stdin_w = -1;
-        }
+        handle_command(child_pid, stdin_w, &buf[off]);
         off += clen;
     }
     return off;
+}
+
+/* Carry-over buffer for partially-framed commands across reads. Max
+ * incoming frame is CMD_SET_WINSIZE (5 bytes); keep a little slack. */
+struct command_buffer {
+    uint8_t data[64];
+    size_t used;
+};
+
+/*
+ * Read and dispatch BEAM commands. With hangup set (POLLHUP/POLLERR), keep
+ * reading until EOF so commands the BEAM queued before closing — typically
+ * CMD_KILL SIGKILL — are honoured before the teardown ladder runs. Returns
+ * 1 while the BEAM is connected, 0 once it is gone.
+ */
+static int read_commands(int uds_fd, pid_t child_pid, int *stdin_w,
+                         struct command_buffer *cb, int hangup) {
+    for (;;) {
+        ssize_t n = read(uds_fd, cb->data + cb->used, sizeof(cb->data) - cb->used);
+        if (n > 0) {
+            cb->used += (size_t)n;
+            size_t consumed = handle_commands(child_pid, stdin_w, cb->data,
+                                              cb->used);
+            if (consumed > 0 && consumed < cb->used) {
+                memmove(cb->data, cb->data + consumed, cb->used - consumed);
+            }
+            cb->used -= consumed;
+            if (!hangup) return 1;
+            continue;
+        }
+        if (n == 0) return 0; /* BEAM closed the socket */
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return !hangup;
+        if (!hangup) ERROR_LOG("read(uds) failed: %s", strerror(errno));
+        return 0;
+    }
+}
+
+/* The leader exited on its own: sweep what is left of its process group
+ * while the unreaped zombie still pins the pgid, reap it, remove the
+ * cgroup, and only then report — so a caller that respawns on the exit
+ * frame never collides with our leftover cgroup. */
+static int finish_child_exit(int uds_fd, pid_t child_pid) {
+    (void)kill(-child_pid, SIGKILL);
+    int status = reap_killed_child(child_pid);
+    cgroup_cleanup();
+    send_child_exited(uds_fd, status);
+    return 0;
+}
+
+/* The BEAM is gone, or the shepherd was asked to terminate: run the ladder
+ * and report the real status when the socket can still carry it. */
+static int teardown(int uds_fd, pid_t child_pid, int report) {
+    int status = kill_child(child_pid);
+    if (report) send_child_exited(uds_fd, status);
+    return -1;
 }
 
 /*
  * Main event loop using poll().
  *
  * Watches:
- *   - UDS socket for BEAM commands and POLLHUP (BEAM death)
- *   - Signal pipe for SIGCHLD (child death)
+ *   - UDS socket for BEAM commands and hangup (BEAM death)
+ *   - Signal pipe for SIGCHLD (child death) and termination signals
+ *
+ * Returns 0 after a normal child exit, -1 after a teardown.
  */
 static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
     struct pollfd fds[2];
-    int child_status = -1;
-    int child_exited = 0;
-
-    /* Carry-over buffer for partially-framed commands across reads. Max
-     * incoming frame is CMD_SET_WINSIZE (5 bytes); keep a little slack. */
-    uint8_t cbuf[64];
-    size_t cbuf_used = 0;
+    struct command_buffer cb;
+    cb.used = 0;
 
     fds[0].fd = uds_fd;
     fds[0].events = POLLIN;
     fds[1].fd = signal_pipe[0];
     fds[1].events = POLLIN;
 
-    while (!child_exited) {
+    for (;;) {
         int ret = poll(fds, 2, -1);
         if (ret < 0) {
             if (errno == EINTR) continue;
             ERROR_LOG("poll failed: %s", strerror(errno));
-            kill_child(child_pid);
-            return -1;
+            return teardown(uds_fd, child_pid, 1);
         }
 
-        /* Check UDS for BEAM death or commands */
-        if (fds[0].revents & (POLLHUP | POLLERR)) {
-            /* BEAM died - kill child and exit */
-            DEBUG_LOG("BEAM connection lost (POLLHUP), killing child %d",
-                      child_pid);
-            kill_child(child_pid);
-            return -1;
-        }
-
-        if (fds[0].revents & POLLIN) {
-            ssize_t n = read(uds_fd, cbuf + cbuf_used, sizeof(cbuf) - cbuf_used);
-            if (n > 0) {
-                cbuf_used += (size_t)n;
-                size_t consumed = handle_commands(uds_fd, child_pid, stdin_w,
-                                                  cbuf, cbuf_used);
-                if (consumed > 0 && consumed < cbuf_used) {
-                    memmove(cbuf, cbuf + consumed, cbuf_used - consumed);
-                }
-                cbuf_used -= consumed;
-            } else if (n == 0) {
-                /* BEAM closed the socket */
-                DEBUG_LOG("BEAM closed UDS, killing child %d", child_pid);
-                kill_child(child_pid);
-                return -1;
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK &&
-                       errno != EINTR) {
-                ERROR_LOG("read(uds) failed: %s", strerror(errno));
-                kill_child(child_pid);
-                return -1;
+        if (fds[1].revents & POLLIN) {
+            drain_signal_pipe();
+            if (child_has_exited(child_pid))
+                return finish_child_exit(uds_fd, child_pid);
+            if (term_signal != 0) {
+                DEBUG_LOG("signal %d, killing child %d", (int)term_signal,
+                          child_pid);
+                return teardown(uds_fd, child_pid, 1);
             }
         }
 
-        /* Check signal pipe for SIGCHLD */
-        if (fds[1].revents & POLLIN) {
-            /* Drain the signal pipe */
-            char drain[64];
-            while (read(signal_pipe[0], drain, sizeof(drain)) > 0) {}
-
-            /* Reap any and all children that have exited. SIGCHLD is
-             * coalesced by the kernel — multiple pending exits can deliver
-             * as a single SIGCHLD. Loop until no more reapable children
-             * remain. We only flip child_exited when the managed child is
-             * reaped; other reapees (should be none today, future-proof)
-             * are still cleaned up. */
-            int status;
-            pid_t ret_pid;
-            while ((ret_pid = waitpid(-1, &status, WNOHANG)) > 0) {
-                if (ret_pid != child_pid) continue;
-                child_exited = 1;
-                if (WIFEXITED(status)) {
-                    child_status = WEXITSTATUS(status);
-                } else if (WIFSIGNALED(status)) {
-                    /* Encode signal death as 128 + signal */
-                    child_status = 128 + WTERMSIG(status);
-                } else {
-                    child_status = -1;
-                }
+        short ur = fds[0].revents;
+        if (ur & POLLNVAL) {
+            ERROR_LOG("UDS fd invalid (POLLNVAL), killing child %d", child_pid);
+            return teardown(uds_fd, child_pid, 0);
+        }
+        if (ur & (POLLIN | POLLHUP | POLLERR)) {
+            int hangup = (ur & (POLLHUP | POLLERR)) != 0;
+            if (!read_commands(uds_fd, child_pid, stdin_w, &cb, hangup)) {
+                DEBUG_LOG("BEAM connection lost, killing child %d", child_pid);
+                return teardown(uds_fd, child_pid, 1);
             }
         }
     }
-
-    /* Notify BEAM of the child exit FIRST. cgroup_cleanup() retries rmdir up
-     * to ten times with usleep(100000) between, so doing it first parks the
-     * caller's await_exit for up to a full second on a status we already hold
-     * in child_status. Nothing in cgroup_cleanup() can change child_status or
-     * uds_fd, so the order is free to swap. (kill_child's ordering at :352 is
-     * deliberately the other way round — there the cleanup is the point.) */
-    send_child_exited(uds_fd, child_status);
-
-    /* Cleanup cgroup on normal exit too */
-    cgroup_cleanup();
-    return child_status;
 }
 
+/* ---- Startup ---- */
+
+/* Parsed command line. Option globals (kill_timeout_ms, pty_mode,
+ * cgroup_path, kept_environment_names) are still written by parse_args. */
+struct options {
+    const char *uds_path;
+    const char *child_cwd;
+    int token_from_fd;
+    int no_new_privs;
+    char **cmd_args; /* cmd + args, NULL-terminated by the OS */
+};
+
 /*
- * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] [--cgroup-path <rel>] [--cwd <dir>] [--replace-env <count> <names...>] [--] <cmd> [args...]
+ * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] [--cgroup-path <rel>] [--cwd <dir>] [--replace-env <count> <names...>] [--no-new-privs] [--] <cmd> [args...]
  *
- *   uds_path:       Path to the UDS listener socket created by the BEAM
+ *   uds_path:       Absolute path to the UDS listener socket created by the BEAM
  *   --kill-timeout:  SIGTERM->SIGKILL escalation timeout in ms (default 5000)
  *   --token-fd:     read the 32-char hex handshake token from fd 3 (the
  *                   BEAM port channel) and send it verbatim as the first
  *                   frame after connect so the BEAM can authenticate us
  *   --cwd:          Directory to run the child in (default: inherited)
  *   --replace-env:  Count followed by the environment names the child keeps
+ *   --no-new-privs: set PR_SET_NO_NEW_PRIVS in the child before exec (Linux;
+ *                   accepted and ignored elsewhere)
  *   cmd:            Command to execute
  *   args:           Arguments for the command
+ *
+ * Returns 0 on success, -1 after printing the reason.
  */
-int main(int argc, char *argv[]) {
+static int parse_args(int argc, char *argv[], struct options *opts) {
     if (argc < 3) {
         fprintf(stderr,
                 "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] "
                 "[--cgroup-path <rel>] [--cwd <dir>] [--replace-env <count> <names...>] "
-                "[--] <cmd> [args...]\n");
-        return 1;
+                "[--no-new-privs] [--] <cmd> [args...]\n");
+        return -1;
     }
 
-    const char *uds_path = argv[1];
-    const char *child_cwd = NULL;
+    memset(opts, 0, sizeof(*opts));
+    opts->uds_path = argv[1];
+    /* An empty path would connect to the Linux abstract socket namespace
+     * (sun_path[0] == '\0'), which has no directory permissions at all; a
+     * relative one would resolve against whatever cwd we inherited. */
+    if (opts->uds_path[0] != '/') {
+        fprintf(stderr, "error: uds_path must be an absolute path\n");
+        return -1;
+    }
     int cmd_idx = 2;
-    int token_from_fd = 0;
-    char token[TOKEN_HEX_LEN + 1] = {0};
 
-    /* Parse optional flags */
     while (cmd_idx < argc && argv[cmd_idx][0] == '-') {
         if (strcmp(argv[cmd_idx], "--kill-timeout") == 0 && cmd_idx + 1 < argc) {
             char *endptr;
             long val = strtol(argv[cmd_idx + 1], &endptr, 10);
             if (*endptr != '\0' || endptr == argv[cmd_idx + 1] || val <= 0 || val > 60000) {
                 fprintf(stderr, "error: --kill-timeout must be 1-60000 ms\n");
-                return 1;
+                return -1;
             }
             kill_timeout_ms = (int)val;
             cmd_idx += 2;
@@ -852,14 +1073,17 @@ int main(int argc, char *argv[]) {
              * NEVER argv: /proc/<pid>/cmdline is world-readable on Linux and
              * same-uid readable on macOS, so an argv token would be visible
              * to exactly the same-uid attacker it exists to stop. */
-            token_from_fd = 1;
+            opts->token_from_fd = 1;
+            cmd_idx += 1;
+        } else if (strcmp(argv[cmd_idx], "--no-new-privs") == 0) {
+            opts->no_new_privs = 1;
             cmd_idx += 1;
         } else if (strcmp(argv[cmd_idx], "--cwd") == 0 && cmd_idx + 1 < argc) {
             if (argv[cmd_idx + 1][0] == '\0') {
                 fprintf(stderr, "error: --cwd must not be empty\n");
-                return 1;
+                return -1;
             }
-            child_cwd = argv[cmd_idx + 1];
+            opts->child_cwd = argv[cmd_idx + 1];
             cmd_idx += 2;
         } else if (strcmp(argv[cmd_idx], "--replace-env") == 0 && cmd_idx + 1 < argc) {
             char *endptr;
@@ -868,17 +1092,19 @@ int main(int argc, char *argv[]) {
             if (*endptr != '\0' || endptr == argv[cmd_idx + 1] ||
                 count < 0 || count > available) {
                 fprintf(stderr, "error: invalid --replace-env count\n");
-                return 1;
+                return -1;
             }
             kept_environment_names = &argv[cmd_idx + 2];
             kept_environment_name_count = (size_t)count;
             cmd_idx += 2 + (int)count;
         } else if (strcmp(argv[cmd_idx], "--cgroup-path") == 0 && cmd_idx + 1 < argc) {
             const char *path = argv[cmd_idx + 1];
-            /* Reject path traversal: no ".." components, no leading "/" */
-            if (path[0] == '/' || strstr(path, "..") != NULL) {
-                fprintf(stderr, "error: invalid cgroup path (must be relative, no '..')\n");
-                return 1;
+            /* Reject path traversal: no ".." components, no leading "/".
+             * Reject an empty path too: cgroup_path[0] == '\0' means "no
+             * cgroup", so it would silently disable requested isolation. */
+            if (path[0] == '\0' || path[0] == '/' || strstr(path, "..") != NULL) {
+                fprintf(stderr, "error: invalid cgroup path (must be non-empty, relative, no '..')\n");
+                return -1;
             }
             /* Reject rather than silently truncate: a truncated path would
              * attach the child to (and later kill) a different cgroup than
@@ -886,7 +1112,7 @@ int main(int argc, char *argv[]) {
             if (strlen(path) >= CGROUP_PATH_MAX) {
                 fprintf(stderr, "error: cgroup path too long (max %d bytes)\n",
                         CGROUP_PATH_MAX - 1);
-                return 1;
+                return -1;
             }
             memcpy(cgroup_path, path, strlen(path) + 1);
             cmd_idx += 2;
@@ -904,111 +1130,157 @@ int main(int argc, char *argv[]) {
 
     if (cmd_idx >= argc) {
         fprintf(stderr, "error: no command specified\n");
-        return 1;
+        return -1;
     }
+    opts->cmd_args = &argv[cmd_idx];
+    return 0;
+}
 
-    /* FDs 3/4 are the BEAM port's :nouse_stdio channel to this shepherd.
-     * Mark them close-on-exec so the child cannot inherit a handle to the
-     * BEAM. (The UDS and pipe fds get their own CLOEXEC below.) */
-    set_cloexec(3);
-    set_cloexec(4);
+/* Make sure fds 0-2 are open (on /dev/null if they were closed), so nothing
+ * the shepherd opens — the UDS above all — can land on them and receive
+ * ERROR_LOG/perror text meant for stderr. Runs before anything else. */
+static void ensure_std_fds(void) {
+    for (int fd = 0; fd <= STDERR_FILENO; fd++) {
+        if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) continue;
+        /* Lower fds are open, so open() returns exactly fd. */
+        if (open("/dev/null", O_RDWR) != fd) _exit(1);
+    }
+}
 
-    /* Read the handshake token from the BEAM before touching the UDS. The
-     * port channel is private to the BEAM and this process. The BEAM unlinks
-     * the port for this write, so a spawner killed before writing need not
-     * close fd 3: bound the wait by the BEAM's own accept deadline instead of
-     * blocking forever. */
-    if (token_from_fd) {
-        size_t got = 0;
-        int64_t deadline = monotonic_ms();
-        if (deadline >= 0) deadline += TOKEN_READ_TIMEOUT_MS;
-        while (got < TOKEN_HEX_LEN) {
-            int wait_ms = TOKEN_READ_TIMEOUT_MS;
-            if (deadline >= 0) {
-                int64_t now = monotonic_ms();
-                wait_ms = (now < 0 || now >= deadline) ? 0 : (int)(deadline - now);
-            }
-            struct pollfd pfd = { .fd = 3, .events = POLLIN, .revents = 0 };
-            int ready = poll(&pfd, 1, wait_ms);
-            if (ready < 0) {
-                if (errno == EINTR) continue;
-                perror("token poll");
-                return 1;
-            }
-            if (ready == 0) {
-                fprintf(stderr, "error: timed out waiting for token\n");
-                return 1;
-            }
-            ssize_t n = read(3, token + got, TOKEN_HEX_LEN - got);
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                perror("token read");
-                return 1;
-            }
-            if (n == 0) {
-                fprintf(stderr, "error: BEAM closed before sending token\n");
-                return 1;
-            }
-            got += (size_t)n;
+/* Read the handshake token from the BEAM before touching the UDS. The port
+ * channel is private to the BEAM and this process. The BEAM unlinks the port
+ * for this write, so a spawner killed before writing need not close fd 3:
+ * bound the wait by the BEAM's own accept deadline instead of blocking
+ * forever. Returns 0 on success, -1 after printing the reason. */
+static int read_token(char *token) {
+    size_t got = 0;
+    int64_t deadline = monotonic_ms();
+    if (deadline >= 0) deadline += TOKEN_READ_TIMEOUT_MS;
+    while (got < TOKEN_HEX_LEN) {
+        if (term_signal != 0) {
+            fprintf(stderr, "error: terminated by signal %d\n", (int)term_signal);
+            return -1;
         }
+        int wait_ms = TOKEN_READ_TIMEOUT_MS;
+        if (deadline >= 0) {
+            int64_t now = monotonic_ms();
+            wait_ms = (now < 0 || now >= deadline) ? 0 : (int)(deadline - now);
+        }
+        struct pollfd pfd = { .fd = 3, .events = POLLIN, .revents = 0 };
+        int ready = poll(&pfd, 1, wait_ms);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            perror("token poll");
+            return -1;
+        }
+        if (ready == 0) {
+            fprintf(stderr, "error: timed out waiting for token\n");
+            return -1;
+        }
+        ssize_t n = read(3, token + got, TOKEN_HEX_LEN - got);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("token read");
+            return -1;
+        }
+        if (n == 0) {
+            fprintf(stderr, "error: BEAM closed before sending token\n");
+            return -1;
+        }
+        got += (size_t)n;
     }
+    return 0;
+}
 
-    char *cmd = argv[cmd_idx];
-    char **cmd_args = &argv[cmd_idx]; /* cmd + args, NULL-terminated by OS */
+/* Overwrite a secret; volatile so the stores cannot be elided. */
+static void wipe(char *buf, size_t len) {
+    volatile char *p = buf;
+    while (len-- > 0) *p++ = 0;
+}
 
-    /* Set up self-pipe for signal handling */
-    if (pipe(signal_pipe) != 0) {
+static int install_handler(int sig, void (*handler)(int), int flags) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handler;
+    sa.sa_flags = flags;
+    sigemptyset(&sa.sa_mask);
+    return sigaction(sig, &sa, NULL);
+}
+
+/* Self-pipe, SIGCHLD and termination handlers, SIGPIPE ignored. Returns 0
+ * or -1 after printing the reason. */
+static int install_signal_handlers(void) {
+    if (cloexec_pipe(signal_pipe) != 0) {
         perror("pipe");
-        return 1;
+        return -1;
     }
     set_nonblocking(signal_pipe[0]);
     set_nonblocking(signal_pipe[1]);
-    set_cloexec(signal_pipe[0]);
-    set_cloexec(signal_pipe[1]);
 
-    /* Install SIGCHLD handler */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = sigchld_handler;
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    if (sigaction(SIGCHLD, &sa, NULL) != 0) {
+    /* A launcher that blocked SIGCHLD would leave the event loop deaf to
+     * the child's exit. */
+    sigset_t chld;
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    (void)sigprocmask(SIG_UNBLOCK, &chld, NULL);
+
+    if (install_handler(SIGCHLD, sigchld_handler, SA_RESTART | SA_NOCLDSTOP) != 0) {
         perror("sigaction");
-        return 1;
+        return -1;
     }
 
     /* Ignore SIGPIPE: a write to a BEAM that has already gone away must fail
      * with EPIPE — every write loop here checks for a negative return — rather
      * than killing the shepherd outright and orphaning the child. */
-    struct sigaction sa_pipe;
-    memset(&sa_pipe, 0, sizeof(sa_pipe));
-    sa_pipe.sa_handler = SIG_IGN;
-    if (sigaction(SIGPIPE, &sa_pipe, NULL) != 0) {
+    if (install_handler(SIGPIPE, SIG_IGN, 0) != 0) {
         perror("sigaction(SIGPIPE)");
-        return 1;
+        return -1;
     }
 
-    /* Connect to BEAM's UDS listener */
+    /* Polite termination (systemd stop, pkill, a debugger's ^C) runs the
+     * same ladder and cgroup cleanup as BEAM death instead of the default
+     * action, which would leave both undone. SIGINT/SIGHUP/SIGQUIT that the
+     * launcher ignored (nohup, erl +Bi) stay ignored. */
+    static const int term_signals[] = {SIGTERM, SIGINT, SIGHUP, SIGQUIT};
+    for (size_t i = 0; i < sizeof(term_signals) / sizeof(term_signals[0]); i++) {
+        int sig = term_signals[i];
+        struct sigaction old;
+        if (sig != SIGTERM && sigaction(sig, NULL, &old) == 0 &&
+            old.sa_handler == SIG_IGN)
+            continue;
+        if (install_handler(sig, term_handler, SA_RESTART) != 0) {
+            perror("sigaction(term)");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Connect to the BEAM's UDS listener, make it CLOEXEC + non-blocking and
+ * send the token as the first frame. Returns the fd or -1. */
+static int connect_and_authenticate(const struct options *opts,
+                                    const char *token) {
     int uds_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (uds_fd < 0) {
         perror("socket");
-        return 1;
+        return -1;
     }
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    if (strlen(uds_path) >= sizeof(addr.sun_path)) {
+    if (strlen(opts->uds_path) >= sizeof(addr.sun_path)) {
         fprintf(stderr, "error: uds_path too long (max %zu bytes)\n",
                 sizeof(addr.sun_path) - 1);
         close(uds_fd);
-        return 1;
+        return -1;
     }
-    strncpy(addr.sun_path, uds_path, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, opts->uds_path, sizeof(addr.sun_path) - 1);
 
     if (connect(uds_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         perror("connect");
         close(uds_fd);
-        return 1;
+        return -1;
     }
 
     set_cloexec(uds_fd);
@@ -1018,388 +1290,426 @@ int main(int argc, char *argv[]) {
     if (set_nonblocking(uds_fd) != 0) {
         perror("fcntl(uds, O_NONBLOCK)");
         close(uds_fd);
-        return 1;
+        return -1;
     }
 
     /* Authenticate: the BEAM handed us a per-spawn random token over fd 3
      * and accepts FDs only from the peer that echoes it back as the very
      * first frame. Without this, any same-uid process that wins the accept
      * race would receive the child's pipe FDs via SCM_RIGHTS. */
-    if (token_from_fd) {
-        if (write_fully(uds_fd, (const uint8_t *)token, TOKEN_HEX_LEN,
-                        UDS_WRITE_TIMEOUT_MS) != 0) {
-            fprintf(stderr, "error: token write failed\n");
-            close(uds_fd);
-            return 1;
-        }
+    if (opts->token_from_fd &&
+        write_fully(uds_fd, (const uint8_t *)token, TOKEN_HEX_LEN,
+                    UDS_WRITE_TIMEOUT_MS) != 0) {
+        fprintf(stderr, "error: token write failed\n");
+        close(uds_fd);
+        return -1;
     }
+    return uds_fd;
+}
 
-    /* Keep chdir after the token write so the token remains the first frame.
-     * Keep it before fork so a failure can use MSG_ERROR. */
-    if (child_cwd != NULL && chdir(child_cwd) != 0) {
+/* chdir, environment filter and the execvp policy. Runs after the token
+ * write so the token remains the first frame, and before fork so a failure
+ * can use MSG_ERROR. Returns allow_execvp (0/1), or -1 after MSG_ERROR. */
+static int apply_launch_context(int uds_fd, const struct options *opts) {
+    if (opts->child_cwd != NULL && chdir(opts->child_cwd) != 0) {
         char msg[128];
         snprintf(msg, sizeof(msg), "chdir failed: %s", strerror(errno));
         send_error(uds_fd, msg);
-        close(uds_fd);
-        return 1;
+        return -1;
     }
 
     restrict_environment();
 
     /* A missing PATH normally enables an execvp default. Replacement mode must not. */
-    int allow_execvp = kept_environment_names == NULL ||
-                       strchr(cmd, '/') != NULL || getenv("PATH") != NULL;
+    return kept_environment_names == NULL ||
+           strchr(opts->cmd_args[0], '/') != NULL || getenv("PATH") != NULL;
+}
 
-    pid_t child_pid;
-    int shepherd_stdin_w = -1;
+/* ---- Spawn ---- */
 
-    if (pty_mode == MODE_PTY) {
-        /* === PTY mode: single bidirectional master FD === */
-        int master_fd, slave_fd;
-        if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) != 0) {
-            send_error(uds_fd, "openpty failed");
-            close(uds_fd);
-            return 1;
-        }
+/* Everything the post-fork child needs, prepared by the parent. */
+struct child_plan {
+    pid_t shepherd_pid;
+    int uds_fd;
+    int gate[2];         /* exec gate: child reads [0], parent writes 'G' to [1] */
+    int ready[2];        /* PTY only: child writes 'R' to [1] once it leads its session */
+    int parent_ends[3];  /* shepherd-side fds to close in the child (-1 = none) */
+    int stdio[3];        /* fds dup2'ed onto 0/1/2 */
+    int pty;             /* stdio[0] is a PTY slave: setsid + TIOCSCTTY */
+    int no_new_privs;
+    char **cmd_args;
+    int allow_execvp;
+};
 
-        /* cgroup/exec ordering gate (used by the shepherd side below).
-         * Created only when a cgroup was requested, so non-cgroup spawns
-         * are byte-for-byte unchanged. */
-        int sync_pipe[2] = {-1, -1};
-        if (cgroup_path[0] != '\0' && pipe(sync_pipe) != 0) {
-            send_error(uds_fd, "failed to create cgroup sync pipe");
-            close(master_fd);
-            close(slave_fd);
-            close(uds_fd);
-            return 1;
-        }
+/* Async-signal-safe gate wait. The child must not exec — or fork
+ * grandchildren — before the shepherd has placed it in its cgroup and
+ * handed its FDs to the BEAM (cgroup.procs migration moves only the
+ * written pid, and a command that ran before the hand-off failed would
+ * have side effects the caller is told never happened). EOF or a non-'G'
+ * byte means the shepherd gave up: die without exec. */
+static void child_wait_gate(int gate_fd) {
+    char go = 0;
+    ssize_t r;
+    do {
+        r = read(gate_fd, &go, 1);
+    } while (r < 0 && errno == EINTR);
+    close(gate_fd);
+    if (r != 1 || go != 'G') _exit(127);
+}
 
-        pid_t shepherd_pid = getpid();
-        child_pid = fork();
-        if (child_pid < 0) {
-            send_error(uds_fd, "fork failed");
-            close(master_fd);
-            close(slave_fd);
-            close(uds_fd);
-            return 1;
-        }
-
-        if (child_pid == 0) {
-            /* === Child process (PTY) === */
-            die_with_shepherd(shepherd_pid);
-            close(uds_fd);
-            close(signal_pipe[0]);
-            close(signal_pipe[1]);
-            close(master_fd);
-
-            /* Wait for the shepherd to place us in the requested cgroup
-             * before doing anything that can create more pids (execvp,
-             * and everything the exec'd program forks). cgroup.procs
-             * migration moves only the written pid, so a grandchild
-             * forked before migration would escape the cgroup's limits
-             * and its cgroup.kill teardown. Only async-signal-safe calls
-             * here (read/write/close/_exit). EOF or a non-'G' byte means
-             * the shepherd could not establish isolation: die without
-             * exec. */
-            if (sync_pipe[0] >= 0) {
-                close(sync_pipe[1]);
-                char go = 0;
-                ssize_t r;
-                do {
-                    r = read(sync_pipe[0], &go, 1);
-                } while (r < 0 && errno == EINTR);
-                close(sync_pipe[0]);
-                if (r != 1 || go != 'G') _exit(127);
-            }
-
-            /* Create new session (required before acquiring controlling tty) */
-            if (setsid() == (pid_t)-1) child_fail("setsid", NULL);
-            if (ioctl(slave_fd, TIOCSCTTY, 0) != 0) child_fail("TIOCSCTTY", NULL);
-
-            if (dup2(slave_fd, STDIN_FILENO)  != STDIN_FILENO ||
-                dup2(slave_fd, STDOUT_FILENO) != STDOUT_FILENO ||
-                dup2(slave_fd, STDERR_FILENO) != STDERR_FILENO) {
-                child_fail("dup2", NULL);
-            }
-            if (slave_fd > STDERR_FILENO) close(slave_fd);
-
-            /* SIG_IGN survives exec, so restore the default SIGPIPE
-             * disposition the child would have had under a shell. */
-            signal(SIGPIPE, SIG_DFL);
-
-            setpgid(0, 0);
-            exec_child(cmd, cmd_args, allow_execvp);
-        }
-
-        /* === Shepherd (PTY) === */
-        close(slave_fd);
-        pty_master_fd = master_fd;
-        set_cloexec(master_fd);
-
-        /* Move child to cgroup (Linux only, no-op elsewhere). The child
-         * is parked on the sync pipe until the outcome is known, so
-         * nothing can exec — or fork grandchildren — outside the cgroup.
-         * If the user requested a cgroup path and setup failed, isolation
-         * is not available — treat as fatal. */
-        if (cgroup_setup(child_pid) != 0) {
-            if (sync_pipe[0] >= 0) {
-                /* EOF on the gate: the child _exit(127)s without exec. */
-                close(sync_pipe[0]);
-                close(sync_pipe[1]);
-            }
-            send_error(uds_fd, cgroup_errmsg);
-            kill_child(child_pid);
-            close(master_fd);
-            close(uds_fd);
-            return 1;
-        }
-        if (sync_pipe[0] >= 0) {
-            close(sync_pipe[0]);
-            char go = 'G';
-            ssize_t w;
-            do {
-                w = write(sync_pipe[1], &go, 1);
-            } while (w < 0 && errno == EINTR);
-            close(sync_pipe[1]);
-            if (w != 1) {
-                /* The child cannot exec without the go byte; treat as a
-                 * failed spawn rather than leave it parked forever. */
-                send_error(uds_fd, "cgroup sync pipe write failed");
-                kill_child(child_pid);
-                close(master_fd);
-                close(uds_fd);
-                return 1;
-            }
-        }
-
-        /* Send single master FD to BEAM (used for both read and write) */
-        int fds_to_send[1] = {master_fd};
-        if (send_fds(uds_fd, fds_to_send, 1) != 0) {
-            send_error(uds_fd, "failed to send PTY FD");
-            kill_child(child_pid);
-            close(master_fd);
-            close(uds_fd);
-            return 1;
-        }
-
-        if (send_child_started(uds_fd, child_pid) != 0) {
-            kill_child(child_pid);
-            close(master_fd);
-            close(uds_fd);
-            return 1;
-        }
-
-        /* No stdin_w to keep — master FD is bidirectional */
-        shepherd_stdin_w = -1;
-
-    } else {
-        /* === Pipe mode (default) === */
-        int stdin_pipe[2] = {-1, -1};
-        int stdout_pipe[2] = {-1, -1};
-        int stderr_pipe[2] = {-1, -1};
-
-#ifdef __linux__
-        /* Use pipe2 with O_CLOEXEC to atomically set close-on-exec */
-        if (pipe2(stdin_pipe, O_CLOEXEC) != 0) {
-#else
-        if (pipe(stdin_pipe) != 0) {
-#endif
-            send_error(uds_fd, "failed to create pipes");
-            close(uds_fd);
-            return 1;
-        }
-#ifdef __linux__
-        if (pipe2(stdout_pipe, O_CLOEXEC) != 0) {
-#else
-        if (pipe(stdout_pipe) != 0) {
-#endif
-            send_error(uds_fd, "failed to create pipes");
-            close(stdin_pipe[0]); close(stdin_pipe[1]);
-            close(uds_fd);
-            return 1;
-        }
-#ifdef __linux__
-        if (pipe2(stderr_pipe, O_CLOEXEC) != 0) {
-#else
-        if (pipe(stderr_pipe) != 0) {
-#endif
-            send_error(uds_fd, "failed to create pipes");
-            close(stdin_pipe[0]); close(stdin_pipe[1]);
-            close(stdout_pipe[0]); close(stdout_pipe[1]);
-            close(uds_fd);
-            return 1;
-        }
-#ifndef __linux__
-        /* On macOS, set close-on-exec manually */
-        set_cloexec(stdin_pipe[0]);  set_cloexec(stdin_pipe[1]);
-        set_cloexec(stdout_pipe[0]); set_cloexec(stdout_pipe[1]);
-        set_cloexec(stderr_pipe[0]); set_cloexec(stderr_pipe[1]);
-#endif
-
-#ifdef __linux__
-        /* Grow the pipe buffers from the default 64 KiB. Each buffer-sized
-         * chunk costs the BEAM a full read -> EAGAIN -> enif_select ->
-         * message round trip, so bigger buffers cut round trips per MiB.
-         *
-         * Every page is charged to the uid's pipe-user-pages-soft budget
-         * (16384 pages by default) for the pipe's lifetime, and once that
-         * budget is spent the kernel caps EVERY new pipe the user creates at
-         * two pages (8 KiB), not just ours. So: stdout, the bulk path, gets
-         * 1 MiB (256 pages; read_batch can take up to 16 chunks per call);
-         * stdin and stderr get 256 KiB (64 pages each). 384 pages per spawn
-         * leaves room for ~42 concurrent commands, where 1 MiB on all three
-         * (768 pages) ran out at ~21. Measured on Linux against 1 MiB
-         * everywhere: 16 MiB through cat via run/2 within noise, stderr drain
-         * about 22% slower; stdout-only growth cost 35-56% on those rows
-         * (bench/LINUX_VERIFICATION.md). Best effort: the kernel caps sizes at
-         * /proc/sys/fs/pipe-max-size and may refuse growth, in which case the
-         * default stands. macOS has no equivalent knob. */
-        (void)fcntl(stdout_pipe[0], F_SETPIPE_SZ, 1 << 20);
-        (void)fcntl(stderr_pipe[0], F_SETPIPE_SZ, 1 << 18);
-        (void)fcntl(stdin_pipe[1], F_SETPIPE_SZ, 1 << 18);
-#endif
-
-        /* cgroup/exec ordering gate — see the PTY path for rationale. */
-        int sync_pipe[2] = {-1, -1};
-        if (cgroup_path[0] != '\0' && pipe(sync_pipe) != 0) {
-            send_error(uds_fd, "failed to create cgroup sync pipe");
-            close(stdin_pipe[0]);  close(stdin_pipe[1]);
-            close(stdout_pipe[0]); close(stdout_pipe[1]);
-            close(stderr_pipe[0]); close(stderr_pipe[1]);
-            close(uds_fd);
-            return 1;
-        }
-
-        pid_t shepherd_pid = getpid();
-        child_pid = fork();
-        if (child_pid < 0) {
-            send_error(uds_fd, "fork failed");
-            close(stdin_pipe[0]);  close(stdin_pipe[1]);
-            close(stdout_pipe[0]); close(stdout_pipe[1]);
-            close(stderr_pipe[0]); close(stderr_pipe[1]);
-            close(uds_fd);
-            return 1;
-        }
-
-        if (child_pid == 0) {
-            /* === Child process (pipe) === */
-            die_with_shepherd(shepherd_pid);
-            close(uds_fd);
-            close(signal_pipe[0]);
-            close(signal_pipe[1]);
-            close(stdin_pipe[1]);
-            close(stdout_pipe[0]);
-            close(stderr_pipe[0]);
-
-            /* Gate exec on cgroup placement — see the PTY child above.
-             * Only async-signal-safe calls (read/write/close/_exit). */
-            if (sync_pipe[0] >= 0) {
-                close(sync_pipe[1]);
-                char go = 0;
-                ssize_t r;
-                do {
-                    r = read(sync_pipe[0], &go, 1);
-                } while (r < 0 && errno == EINTR);
-                close(sync_pipe[0]);
-                if (r != 1 || go != 'G') _exit(127);
-            }
-
-            if (dup2(stdin_pipe[0],  STDIN_FILENO)  != STDIN_FILENO ||
-                dup2(stdout_pipe[1], STDOUT_FILENO) != STDOUT_FILENO ||
-                dup2(stderr_pipe[1], STDERR_FILENO) != STDERR_FILENO) {
-                child_fail("dup2", NULL);
-            }
-
-            close(stdin_pipe[0]);
-            close(stdout_pipe[1]);
-            close(stderr_pipe[1]);
-
-            /* SIG_IGN survives exec, so restore the default SIGPIPE
-             * disposition the child would have had under a shell. */
-            signal(SIGPIPE, SIG_DFL);
-
-            setpgid(0, 0);
-            exec_child(cmd, cmd_args, allow_execvp);
-        }
-
-        /* === Shepherd (pipe) === */
-        close(stdin_pipe[0]);
-        close(stdout_pipe[1]);
-        close(stderr_pipe[1]);
-
-        /* Move child to cgroup (Linux only, no-op elsewhere). The child
-         * is parked on the sync pipe until the outcome is known, so
-         * nothing can exec — or fork grandchildren — outside the cgroup.
-         * If the user requested a cgroup path and setup failed, isolation
-         * is not available — treat as fatal. */
-        if (cgroup_setup(child_pid) != 0) {
-            if (sync_pipe[0] >= 0) {
-                /* EOF on the gate: the child _exit(127)s without exec. */
-                close(sync_pipe[0]);
-                close(sync_pipe[1]);
-            }
-            send_error(uds_fd, cgroup_errmsg);
-            kill_child(child_pid);
-            close(stdin_pipe[1]);
-            close(stdout_pipe[0]);
-            close(stderr_pipe[0]);
-            close(uds_fd);
-            return 1;
-        }
-        if (sync_pipe[0] >= 0) {
-            close(sync_pipe[0]);
-            char go = 'G';
-            ssize_t w;
-            do {
-                w = write(sync_pipe[1], &go, 1);
-            } while (w < 0 && errno == EINTR);
-            close(sync_pipe[1]);
-            if (w != 1) {
-                /* The child cannot exec without the go byte; treat as a
-                 * failed spawn rather than leave it parked forever. */
-                send_error(uds_fd, "cgroup sync pipe write failed");
-                kill_child(child_pid);
-                close(stdin_pipe[1]);
-                close(stdout_pipe[0]);
-                close(stderr_pipe[0]);
-                close(uds_fd);
-                return 1;
-            }
-        }
-
-        int fds_to_send[3] = {stdin_pipe[1], stdout_pipe[0], stderr_pipe[0]};
-        if (send_fds(uds_fd, fds_to_send, 3) != 0) {
-            send_error(uds_fd, "failed to send FDs");
-            kill_child(child_pid);
-            close(stdin_pipe[1]);
-            close(stdout_pipe[0]);
-            close(stderr_pipe[0]);
-            close(uds_fd);
-            return 1;
-        }
-
-        if (send_child_started(uds_fd, child_pid) != 0) {
-            kill_child(child_pid);
-            close(stdin_pipe[1]);
-            close(stdout_pipe[0]);
-            close(stderr_pipe[0]);
-            close(uds_fd);
-            return 1;
-        }
-
-        shepherd_stdin_w = stdin_pipe[1];
-        close(stdout_pipe[0]);
-        close(stderr_pipe[0]);
+/* Become the leader of our own process group (pipe mode) or session (PTY
+ * mode), so kill(-pid) reaches us and every descendant that stays in it.
+ * PTY mode then tells the parent it may report the pid. */
+static void child_take_group(const struct child_plan *p) {
+    if (!p->pty) {
+        (void)setpgid(0, 0); /* the parent does the same; either may win */
+        return;
     }
+    /* setsid() makes us session and group leader (pgid == pid); it is
+     * required before acquiring the controlling tty. */
+    if (setsid() == (pid_t)-1) child_fail("setsid", NULL, NULL, errno, 127);
+    if (ioctl(p->stdio[0], TIOCSCTTY, 0) != 0)
+        child_fail("TIOCSCTTY", NULL, NULL, errno, 127);
+    char r = 'R';
+    ssize_t w;
+    do {
+        w = write(p->ready[1], &r, 1);
+    } while (w < 0 && errno == EINTR);
+    close(p->ready[1]);
+}
+
+/* Close every fd above stderr (Linux 5.9+; ENOSYS on older kernels is
+ * ignored). Everything the shepherd opens is CLOEXEC already; this also
+ * covers fds the shepherd's launcher leaked to it. macOS has no cheap
+ * equivalent (a close loop up to RLIMIT_NOFILE can cost ~100 ms). */
+static void child_close_extra_fds(void) {
+#if defined(__linux__) && defined(SYS_close_range)
+    (void)syscall(SYS_close_range, 3U, ~0U, 0U);
+#endif
+}
+
+/* Post-fork child path, shared by pipe and PTY mode. Only async-signal-safe
+ * calls until exec. Never returns. */
+__attribute__((noreturn))
+static void child_prepare(const struct child_plan *p) {
+    die_with_shepherd(p->shepherd_pid);
+    close(p->uds_fd);
+    close(signal_pipe[0]);
+    close(signal_pipe[1]);
+    close(p->gate[1]);
+    if (p->ready[0] >= 0) close(p->ready[0]);
+    for (int i = 0; i < 3; i++) {
+        if (p->parent_ends[i] >= 0) close(p->parent_ends[i]);
+    }
+
+    child_take_group(p);
+    child_reset_signals();
+    child_wait_gate(p->gate[0]);
+
+    if (dup2(p->stdio[0], STDIN_FILENO)  != STDIN_FILENO ||
+        dup2(p->stdio[1], STDOUT_FILENO) != STDOUT_FILENO ||
+        dup2(p->stdio[2], STDERR_FILENO) != STDERR_FILENO) {
+        child_fail("dup2", NULL, NULL, errno, 127);
+    }
+
+#ifdef __linux__
+    if (p->no_new_privs && prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+        child_fail("prctl(PR_SET_NO_NEW_PRIVS)", NULL, NULL, errno, 127);
+#endif
+
+    child_close_extra_fds();
+    for (int i = 0; i < 3; i++) {
+        /* PTY passes one slave fd for all three; closing it once is enough
+         * and EBADF on the repeats is harmless. */
+        if (p->stdio[i] > STDERR_FILENO) close(p->stdio[i]);
+    }
+
+    exec_child(p->cmd_args[0], p->cmd_args, p->allow_execvp);
+}
+
+/* Shepherd-side state of one spawn, for the shared failure path. */
+struct spawn_state {
+    int uds_fd;
+    pid_t child_pid;
+    int gate_w;   /* write end of the exec gate, -1 once released */
+    int started;  /* MSG_CHILD_STARTED was sent */
+};
+
+/*
+ * The single post-connect spawn failure path. Closing the gate makes a
+ * parked child _exit(127) without exec; SIGKILL covers a child that is not
+ * parked yet. Reap, remove the cgroup, then report: msg as MSG_ERROR (NULL
+ * = nothing to say), plus MSG_CHILD_EXITED with the reaped status if the
+ * BEAM was already told the child started. Process exit closes every other
+ * fd.
+ */
+__attribute__((noreturn))
+static void fail_spawn(const struct spawn_state *s, const char *msg) {
+    if (s->gate_w >= 0) close(s->gate_w);
+    int status = EXIT_STATUS_UNKNOWN;
+    if (s->child_pid > 0) {
+        signal_group(s->child_pid, SIGKILL);
+        status = reap_killed_child(s->child_pid);
+    }
+    cgroup_cleanup();
+    if (msg != NULL) send_error(s->uds_fd, msg);
+    if (s->started) send_child_exited(s->uds_fd, status);
+    exit(1);
+}
+
+/* Abort the spawn if a termination signal arrived meanwhile. */
+static void check_terminated(const struct spawn_state *s) {
+    if (term_signal == 0) return;
+    char msg[64];
+    snprintf(msg, sizeof(msg), "shepherd terminated by signal %d",
+             (int)term_signal);
+    fail_spawn(s, msg);
+}
+
+/* A pidfd for the child (Linux 5.3+), or -1. Opened while the child is
+ * parked and unreaped, so it can only ever refer to this process. */
+static int open_pidfd(pid_t pid) {
+#if defined(__linux__) && defined(SYS_pidfd_open)
+    long fd = syscall(SYS_pidfd_open, pid, 0);
+    return fd >= 0 ? (int)fd : -1;
+#else
+    (void)pid;
+    return -1;
+#endif
+}
+
+/* PTY mode: wait (bounded) for the child's 'R', i.e. for it to lead its own
+ * session, so MSG_CHILD_STARTED is never sent for a pid whose group does not
+ * exist yet. Returns 0 on 'R', -1 on EOF (the child died; it already wrote
+ * the reason to stderr), timeout or error. */
+static int wait_child_ready(int ready_fd) {
+    int64_t now = monotonic_ms();
+    int64_t deadline = (now < 0) ? -1 : now + CHILD_READY_TIMEOUT_MS;
+    int spent = 0;
+    for (;;) {
+        int wait_ms = remaining_ms(deadline, CHILD_READY_TIMEOUT_MS, &spent);
+        if (wait_ms <= 0) return -1;
+        struct pollfd pfd = {.fd = ready_fd, .events = POLLIN, .revents = 0};
+        int pret = poll(&pfd, 1, wait_ms);
+        if (pret < 0 && errno == EINTR) continue;
+        if (pret <= 0) return -1;
+        char r = 0;
+        ssize_t n;
+        do {
+            n = read(ready_fd, &r, 1);
+        } while (n < 0 && errno == EINTR);
+        return (n == 1 && r == 'R') ? 0 : -1;
+    }
+}
+
+/*
+ * Fork the child described by plan. On return the child leads its own
+ * process group (pipe: setpgid from both sides; PTY: confirmed via the
+ * ready pipe) and is parked on the exec gate. Returns the child's pidfd or
+ * -1.
+ */
+static int fork_child(struct spawn_state *s, struct child_plan *plan) {
+    check_terminated(s);
+
+    int gate[2], ready[2] = {-1, -1};
+    if (cloexec_pipe(gate) != 0) fail_spawn(s, "failed to create sync pipe");
+    if (plan->pty && cloexec_pipe(ready) != 0)
+        fail_spawn(s, "failed to create sync pipe");
+    memcpy(plan->gate, gate, sizeof(gate));
+    memcpy(plan->ready, ready, sizeof(ready));
+    plan->shepherd_pid = getpid();
+
+    /* Block every signal across fork(): the child must not run the
+     * shepherd's handlers (they write to the shared self-pipe) before
+     * child_reset_signals() restores the defaults. */
+    sigset_t all, old;
+    sigfillset(&all);
+    sigprocmask(SIG_BLOCK, &all, &old);
+    pid_t pid = fork();
+    if (pid == 0) child_prepare(plan);
+    int fork_errno = errno;
+    sigprocmask(SIG_SETMASK, &old, NULL);
+
+    close(gate[0]);
+    s->gate_w = gate[1];
+    if (ready[1] >= 0) close(ready[1]);
+    if (pid < 0) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "fork failed: %s", strerror(fork_errno));
+        fail_spawn(s, msg);
+    }
+    s->child_pid = pid;
+
+    int pidfd = open_pidfd(pid);
+
+    if (plan->pty) {
+        int rc = wait_child_ready(ready[0]);
+        close(ready[0]);
+        if (rc != 0) fail_spawn(s, "child failed to set up its terminal session");
+    } else {
+        /* Classic double setpgid: whichever side runs first creates the
+         * group. EACCES (child already exec'd) cannot happen while it is
+         * parked; ESRCH means it died, which the event loop reports. */
+        (void)setpgid(pid, pid);
+    }
+    return pidfd;
+}
+
+/*
+ * Hand the parked child over: cgroup placement, FDs (+ pidfd), then
+ * MSG_CHILD_STARTED, then the 'G' that lets it exec. A failure at any step
+ * kills the child before it ever ran the command.
+ */
+static void hand_off(struct spawn_state *s, int *fds, int nfds, int pidfd) {
+    if (cgroup_setup(s->child_pid) != 0) fail_spawn(s, cgroup_errmsg);
+
+    if (pidfd >= 0) fds[nfds++] = pidfd;
+    if (send_fds(s->uds_fd, fds, nfds) != 0) fail_spawn(s, "failed to send FDs");
+    if (pidfd >= 0) close(pidfd);
+
+    if (send_child_started(s->uds_fd, s->child_pid) != 0) fail_spawn(s, NULL);
+    s->started = 1;
+
+    check_terminated(s);
+    char go = 'G';
+    ssize_t w;
+    do {
+        w = write(s->gate_w, &go, 1);
+    } while (w < 0 && errno == EINTR);
+    if (w != 1) fail_spawn(s, "sync pipe write failed");
+    close(s->gate_w);
+    s->gate_w = -1;
+}
+
+/* PTY mode: a single bidirectional master FD. Returns the child pid; the
+ * shepherd keeps no stdin_w. */
+static pid_t spawn_pty(int uds_fd, const struct options *opts,
+                       int allow_execvp) {
+    struct spawn_state s = {uds_fd, 0, -1, 0};
+    int master_fd, slave_fd;
+    if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) != 0)
+        fail_spawn(&s, "openpty failed");
+    set_cloexec(master_fd);
+    set_cloexec(slave_fd);
+
+    struct child_plan plan = {
+        .uds_fd = uds_fd,
+        .parent_ends = {master_fd, -1, -1},
+        .stdio = {slave_fd, slave_fd, slave_fd},
+        .pty = 1,
+        .no_new_privs = opts->no_new_privs,
+        .cmd_args = opts->cmd_args,
+        .allow_execvp = allow_execvp,
+    };
+    int pidfd = fork_child(&s, &plan);
+
+    close(slave_fd);
+    pty_master_fd = master_fd;
+
+    /* The master FD is used by the BEAM for both read and write. */
+    int fds_to_send[2] = {master_fd, -1};
+    hand_off(&s, fds_to_send, 1, pidfd);
+    return s.child_pid;
+}
+
+/* Pipe mode (default). Returns the child pid and the shepherd's stdin
+ * write end in *stdin_w. */
+static pid_t spawn_pipe(int uds_fd, const struct options *opts,
+                        int allow_execvp, int *stdin_w) {
+    struct spawn_state s = {uds_fd, 0, -1, 0};
+    int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
+    if (cloexec_pipe(stdin_pipe) != 0 || cloexec_pipe(stdout_pipe) != 0 ||
+        cloexec_pipe(stderr_pipe) != 0)
+        fail_spawn(&s, "failed to create pipes");
+
+#ifdef __linux__
+    /* Grow the pipe buffers from the default 64 KiB. Each buffer-sized
+     * chunk costs the BEAM a full read -> EAGAIN -> enif_select ->
+     * message round trip, so bigger buffers cut round trips per MiB.
+     *
+     * Every page is charged to the uid's pipe-user-pages-soft budget
+     * (16384 pages by default) for the pipe's lifetime, and once that
+     * budget is spent the kernel caps EVERY new pipe the user creates at
+     * two pages (8 KiB), not just ours. So: stdout, the bulk path, gets
+     * 1 MiB (256 pages; read_batch can take up to 16 chunks per call);
+     * stdin and stderr get 256 KiB (64 pages each). 384 pages per spawn
+     * leaves room for ~42 concurrent commands, where 1 MiB on all three
+     * (768 pages) ran out at ~21. Measured on Linux against 1 MiB
+     * everywhere: 16 MiB through cat via run/2 within noise, stderr drain
+     * about 22% slower; stdout-only growth cost 35-56% on those rows
+     * (bench/LINUX_VERIFICATION.md). Best effort: the kernel caps sizes at
+     * /proc/sys/fs/pipe-max-size and may refuse growth, in which case the
+     * default stands. macOS has no equivalent knob. */
+    (void)fcntl(stdout_pipe[0], F_SETPIPE_SZ, 1 << 20);
+    (void)fcntl(stderr_pipe[0], F_SETPIPE_SZ, 1 << 18);
+    (void)fcntl(stdin_pipe[1], F_SETPIPE_SZ, 1 << 18);
+#endif
+
+    struct child_plan plan = {
+        .uds_fd = uds_fd,
+        .parent_ends = {stdin_pipe[1], stdout_pipe[0], stderr_pipe[0]},
+        .stdio = {stdin_pipe[0], stdout_pipe[1], stderr_pipe[1]},
+        .pty = 0,
+        .no_new_privs = opts->no_new_privs,
+        .cmd_args = opts->cmd_args,
+        .allow_execvp = allow_execvp,
+    };
+    int pidfd = fork_child(&s, &plan);
+
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+
+    int fds_to_send[4] = {stdin_pipe[1], stdout_pipe[0], stderr_pipe[0], -1};
+    hand_off(&s, fds_to_send, 3, pidfd);
+
+    close(stdout_pipe[0]);
+    close(stderr_pipe[0]);
+    *stdin_w = stdin_pipe[1];
+    return s.child_pid;
+}
+
+int main(int argc, char *argv[]) {
+    ensure_std_fds();
+#ifdef __linux__
+    /* Not dumpable: a same-uid child cannot ptrace us or read
+     * /proc/<shepherd>/{environ,mem}, and no core lands in the child's cwd.
+     * execve resets this for the child. */
+    (void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
+
+    struct options opts;
+    if (parse_args(argc, argv, &opts) != 0) return 1;
+
+    /* FDs 3/4 are the BEAM port's :nouse_stdio channel to this shepherd.
+     * Mark them close-on-exec so the child cannot inherit a handle to the
+     * BEAM. (The UDS and pipe fds get their own CLOEXEC.) */
+    set_cloexec(3);
+    set_cloexec(4);
+
+    if (install_signal_handlers() != 0) return 1;
+
+    char token[TOKEN_HEX_LEN + 1] = {0};
+    if (opts.token_from_fd && read_token(token) != 0) return 1;
+
+    int uds_fd = connect_and_authenticate(&opts, token);
+    wipe(token, sizeof(token));
+    if (uds_fd < 0) return 1;
+
+    int allow_execvp = apply_launch_context(uds_fd, &opts);
+    if (allow_execvp < 0) return 1;
+
+    int stdin_w = -1;
+    pid_t child_pid = (pty_mode == MODE_PTY)
+                          ? spawn_pty(uds_fd, &opts, allow_execvp)
+                          : spawn_pipe(uds_fd, &opts, allow_execvp, &stdin_w);
 
     /* Enter event loop. stdin_w is passed by pointer so a CMD_CLOSE_STDIN
      * handled inside the loop is visible here — otherwise the fd would be
      * closed a second time below, racing whatever recycled the number. */
-    int result = event_loop(uds_fd, child_pid, &shepherd_stdin_w);
+    int result = event_loop(uds_fd, child_pid, &stdin_w);
 
-    /* Cleanup */
-    if (shepherd_stdin_w >= 0) close(shepherd_stdin_w);
+    if (stdin_w >= 0) close(stdin_w);
     close(uds_fd);
-
     return result >= 0 ? 0 : 1;
 }

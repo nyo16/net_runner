@@ -173,6 +173,16 @@ alias NetRunner.Process, as: Proc
 # All three processes (sh + both sleeps) are killed
 ```
 
+The child always leads its own process group, and that group does not outlive
+it: when the child exits — on its own or through the SIGTERM→SIGKILL ladder —
+the shepherd SIGKILLs whatever is left in the group before reporting the exit.
+So `sh -c "worker & exit 0"` takes `worker` down with it. A background job
+that must outlive the command has to leave the group itself (`setsid worker &`).
+
+A command that cannot be executed exits `127` when it was not found and `126`
+when it was found but could not run (e.g. no execute permission); stderr names
+the failure, e.g. `execvp: my_tool: No such file or directory (errno 2)`.
+
 Supported signals: `:sigterm`, `:sigkill`, `:sigint`, `:sighup`, `:sigusr1`, `:sigusr2`, `:sigstop`, `:sigcont`, `:sigquit`, `:sigpipe`.
 
 ### Checking process state
@@ -424,7 +434,7 @@ Isolate child processes in a cgroup v2 hierarchy for resource control:
 )
 ```
 
-The shepherd creates the cgroup directory (and its `net_runner/` parent if missing), moves the child into it *before* `execvp`, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the leaf; the shared parent is left in place). Spawns fail closed with `{:error, {:shepherd_error, msg}}` when the parent or leaf cannot be created, the leaf already exists, the migration is refused, or `cgroup.kill` (Linux ≥ 5.14) is unavailable. No-op on macOS.
+The shepherd creates the cgroup directory (and its `net_runner/` parent if missing), moves the child into it *before* `execvp`, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the leaf — including any sub-cgroups — before the exit status is reported, so an immediate respawn on the same path succeeds; the shared parent is left in place). Spawns fail closed with `{:error, {:shepherd_error, msg}}` when the parent or leaf cannot be created, the leaf already exists, the migration is refused, or `cgroup.kill` (Linux ≥ 5.14) is unavailable. No-op on macOS.
 
 Requirements: cgroup v2, with `/sys/fs/cgroup` writable by the BEAM's user (root, or a delegated root), plus write access to the `cgroup.procs` of the nearest common ancestor of the BEAM's cgroup and the target (usually the root) so the child can be migrated. If an administrator pre-creates and delegates `/sys/fs/cgroup/net_runner` instead, only that subtree needs to be writable.
 
@@ -538,6 +548,7 @@ end, max_concurrency: 20)
 | `:kill_timeout` | integer | `5000` | SIGTERM→SIGKILL escalation timeout in ms |
 | `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only) under a `net_runner/` prefix, under 256 bytes; unprefixed paths are prefixed (deprecated) |
 | `:cwd` | string | `nil` | Child working directory. Defaults to the BEAM working directory. |
+| `:no_new_privs` | boolean | `false` | Set `PR_SET_NO_NEW_PRIVS` in the child before exec, so setuid/setgid binaries and file capabilities cannot raise its privileges (Linux only; accepted and ignored elsewhere). See [Security model](#security-model). |
 
 Unknown options raise `ArgumentError` (`Keyword.validate!/2`) instead of being
 silently ignored. `stream!/2` accepts the same options minus `:timeout`,
@@ -561,11 +572,15 @@ BEAM Process (NetRunner.Process GenServer)
     |     |
     |     v
     |   Shepherd Binary (stays alive for child's lifetime)
-    |     |-- fork() → child process (execvp)
-    |     |-- Passes pipe FDs to BEAM via UDS + SCM_RIGHTS
-    |     |-- poll() loop: watches UDS + signal pipe (SIGCHLD)
-    |     |-- BEAM dies (POLLHUP) → SIGTERM → SIGKILL child
-    |     |-- Child dies (SIGCHLD) → notify BEAM, exit
+    |     |-- fork() → child (own process group, clean signal state,
+    |     |            parked on an exec gate)
+    |     |-- Passes pipe FDs (+ a pidfd on Linux) to BEAM via UDS + SCM_RIGHTS,
+    |     |   reports the pid, then releases the gate → execvp
+    |     |-- poll() loop: watches UDS + signal pipe (SIGCHLD, SIGTERM/INT/HUP/QUIT)
+    |     |-- BEAM dies (POLLHUP) or shepherd is told to stop
+    |     |     → SIGTERM group → SIGKILL group → reap → cgroup cleanup
+    |     |-- Child dies (SIGCHLD) → SIGKILL leftover group members → reap
+    |     |     → cgroup cleanup → notify BEAM, exit
     |
     |-- NIF (enif_select on raw O_NONBLOCK FDs, normal schedulers)
     |     |-- Demand-driven backpressure via OS pipe buffers
@@ -577,10 +592,45 @@ NetRunner.Watcher (belt-and-suspenders with shepherd)
 
 **Layers of zombie prevention:**
 
-1. **Shepherd** — detects BEAM death via POLLHUP on UDS, kills child process group
-2. **Process GenServer** — detects shepherd death via its Port exit; if no exit status arrived, SIGKILLs the orphaned child's process group (on Linux the child also dies via `PR_SET_PDEATHSIG`)
+1. **Shepherd** — detects BEAM death via POLLHUP on UDS (after executing any commands still queued on it) or its own SIGTERM/SIGINT/SIGHUP/SIGQUIT, and always ends with a SIGKILL of the child's process group; also sweeps the group whenever the child exits on its own
+2. **Process GenServer** — detects shepherd death via its Port exit; if no exit status arrived, SIGKILLs the orphaned child's process group and, via the pidfd on Linux, the child itself (on Linux the child also dies via `PR_SET_PDEATHSIG`)
 3. **Watcher** — detects GenServer crash via `Process.monitor`, kills child via NIF
 4. **NIF owner monitor** — closes FDs when the owning process dies, child sees EOF/broken pipe
+
+## Security model
+
+NetRunner contains **crashing, buggy or careless** children. It does **not**
+contain an **adversarial child running under the BEAM's uid**: such a child can
+SIGSTOP/SIGKILL its shepherd, migrate out of its cgroup leaf, ptrace the
+shepherd (Yama permitting), or signal the BEAM. Untrusted code needs a separate
+uid or a user+cgroup namespace (outside NetRunner's scope).
+
+What *is* contained, for a child that is merely careless:
+
+- **No orphans.** Every exit path — normal exit, `kill/2`, timeout, owner or
+  BEAM death, shepherd SIGTERM — ends with a SIGKILL of the child's process
+  group; with `:cgroup_path`, `cgroup.kill` also reaches processes that left
+  the group.
+- **No signal-state leaks.** The child starts with every signal disposition at
+  its default and an empty signal mask, whatever the BEAM's launcher ignored
+  or blocked.
+- **No early exec.** The command is exec'd only after the shepherd has handed
+  the BEAM its pipes and pid; a spawn that fails inside the shepherd (cgroup
+  setup, fd hand-off) never runs the command. A failure on the BEAM side after
+  the hand-off (for example the caller dying) is handled by normal teardown.
+- **No pid-reuse kills on Linux.** Direct signals go through a pidfd, which
+  names the process rather than a recyclable pid number.
+- **Shepherd not inspectable (Linux).** The shepherd is non-dumpable, so a
+  same-uid child cannot read its memory or environment through `/proc` or
+  attach to it without `CAP_SYS_PTRACE`.
+- **Opt-in `no_new_privs`.** `no_new_privs: true` stops the child and
+  everything it execs from gaining privileges through setuid/setgid binaries
+  or file capabilities. Linux only: on macOS the option is accepted but has
+  no effect, so it is not a security boundary there.
+
+```elixir
+NetRunner.run(["./untrusted_build_step"], no_new_privs: true, cgroup_path: "net_runner/build")
+```
 
 ## Performance
 
