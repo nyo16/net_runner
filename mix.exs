@@ -1,7 +1,7 @@
 defmodule NetRunner.MixProject do
   use Mix.Project
 
-  @version "1.5.0"
+  @version "1.6.0"
   @source_url "https://github.com/nyo16/net_runner"
 
   def project do
