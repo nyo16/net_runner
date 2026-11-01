@@ -228,6 +228,26 @@ defmodule NetRunnerTest do
       # Shepherd + watcher reap asynchronously.
       eventually(fn -> count_sleep_processes(marker) == 0 end, 3_000)
     end
+
+    # Issue #28: run/2's own timeout path hard-coded a 5 s SIGTERM grace, so a
+    # TERM-ignoring child always returned at timeout + 5 s whatever
+    # :kill_timeout said.
+    test "a TERM-ignoring child is SIGKILLed after :kill_timeout, not a fixed 5 s" do
+      marker = sleep_marker()
+
+      {us, result} =
+        :timer.tc(fn ->
+          NetRunner.run(["sh", "-c", "trap '' TERM; exec sleep #{marker}"],
+            timeout: 300,
+            kill_timeout: 200
+          )
+        end)
+
+      assert result == {:error, :timeout}
+      # timeout + kill_timeout = 0.5 s; the old fixed grace made it >= 5.3 s.
+      assert us < 3_000_000, "run/2 returned after #{div(us, 1000)} ms"
+      eventually(fn -> count_sleep_processes(marker) == 0 end, 3_000)
+    end
   end
 
   defp count_sleep_processes(marker) do

@@ -65,8 +65,8 @@ defmodule NetRunner do
       cheap. Eager lists always coalesce; a plain binary is a single write.
     * `:timeout` - maximum wall-clock time in milliseconds. Sends SIGTERM then SIGKILL
       on timeout. Returns `{:error, :timeout}` instead of `{output, exit_status}`.
-      A child that ignores SIGTERM delays the return by up to the 5s escalation
-      grace on top of `:timeout`.
+      A child that ignores SIGTERM is SIGKILLed after `:kill_timeout` (default
+      5 000 ms), so the worst-case return is `timeout + kill_timeout`.
     * `:max_output_size` - maximum bytes to collect from stdout. Kills the process
       and returns `{:error, {:max_output_exceeded, partial_output}}` if exceeded.
     * `:cwd` - working directory for the child. Defaults to the BEAM working
@@ -131,6 +131,9 @@ defmodule NetRunner do
       cmd = NetRunner.Command.new("echo", ["hello"], timeout: 5_000)
       {output, 0} = NetRunner.run(cmd)
   """
+  # Same default as NetRunner.Process.Exec (the shepherd's escalation).
+  @default_kill_timeout_ms 5_000
+
   @run_opts [
     :input,
     :input_buffer,
@@ -201,7 +204,10 @@ defmodule NetRunner do
       input_buffer: input_buffer,
       max_output_size: max_output_size,
       output: output,
-      capture_stderr?: capture_stderr?
+      capture_stderr?: capture_stderr?,
+      # The SIGTERM grace on run/2's own timeout/error path; same option and
+      # default as the shepherd's escalation (issue #28).
+      kill_timeout: Keyword.get(opts, :kill_timeout, @default_kill_timeout_ms)
     }
 
     case Proc.start(cmd, args, process_opts) do
@@ -224,7 +230,7 @@ defmodule NetRunner do
 
     result =
       (Task.yield(task, timeout || :infinity) || Task.shutdown(task))
-      |> handle_run_result(pid)
+      |> handle_run_result(pid, io.kill_timeout)
 
     # run/2 never hands the pid to the caller, so nothing else can ever stop
     # this server. Without it, each call leaks the Process GenServer, its
@@ -233,29 +239,29 @@ defmodule NetRunner do
     result
   end
 
-  defp handle_run_result({:ok, {output, exit_status}}, _pid)
+  defp handle_run_result({:ok, {output, exit_status}}, _pid, _kill_timeout)
        when (is_binary(output) or is_list(output)) and is_integer(exit_status) do
     {output, exit_status}
   end
 
-  defp handle_run_result({:ok, {output, exit_status, stderr}}, _pid)
+  defp handle_run_result({:ok, {output, exit_status, stderr}}, _pid, _kill_timeout)
        when (is_binary(output) or is_list(output)) and is_integer(exit_status) and
               is_binary(stderr) do
     {output, exit_status, stderr}
   end
 
-  defp handle_run_result({:ok, {:error, _} = error}, pid) do
-    kill_and_cleanup(pid)
+  defp handle_run_result({:ok, {:error, _} = error}, pid, kill_timeout) do
+    kill_and_cleanup(pid, kill_timeout)
     error
   end
 
-  defp handle_run_result(nil, pid) do
-    kill_and_cleanup(pid)
+  defp handle_run_result(nil, pid, kill_timeout) do
+    kill_and_cleanup(pid, kill_timeout)
     {:error, :timeout}
   end
 
-  defp handle_run_result({:exit, reason}, pid) do
-    kill_and_cleanup(pid)
+  defp handle_run_result({:exit, reason}, pid, kill_timeout) do
+    kill_and_cleanup(pid, kill_timeout)
     {:error, {:task_crashed, reason}}
   end
 
@@ -405,9 +411,11 @@ defmodule NetRunner do
     end
   end
 
-  defp kill_and_cleanup(pid) do
-    # Grace values preserved from the pre-unification implementation.
-    Proc.shutdown(pid, 5_000, 0)
+  defp kill_and_cleanup(pid, kill_timeout) do
+    # SIGTERM, wait the caller's :kill_timeout, then SIGKILL (the shepherd
+    # SIGKILLs the whole group). No wait after the SIGKILL: Proc.stop/1
+    # follows and the shepherd reaps.
+    Proc.shutdown(pid, kill_timeout, 0)
     :ok
   end
 end

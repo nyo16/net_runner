@@ -52,6 +52,13 @@ Fixed, H2).
 
 ### Fixed
 
+- **`run/2` honours `:kill_timeout` on its own timeout path (#28).** When
+  `:timeout` expired, `run/2` SIGTERMed the child and waited a hard-coded
+  5 s before SIGKILL, so a TERM-ignoring child always returned at
+  `timeout + 5 s` regardless of `:kill_timeout`. The grace is now the
+  caller's `:kill_timeout` (default 5 000 ms, unchanged); the documented
+  worst-case return is `timeout + kill_timeout`. The same grace applies when
+  `run/2` aborts on `:max_output_size` or a crashed reader.
 - **S-01 / H1: teardown always SIGKILLs the process group.** The SIGKILL
   step ran only if the group leader outlived `kill_timeout`; when the leader
   died on SIGTERM, TERM-ignoring members survived as orphans. The ladder now
