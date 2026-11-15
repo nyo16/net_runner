@@ -230,6 +230,15 @@ defmodule NetRunner.ProcessTest do
       # 128 + SIGKILL(9) = 137
       assert status == 137
     end
+
+    test "an atom that cannot name a signal is an error, not a crash" do
+      {:ok, pid} = Proc.start("sleep", ["100"])
+      on_exit(fn -> Proc.stop(pid) end)
+
+      assert {:error, :unknown_signal} = Proc.kill(pid, :"#{String.duplicate("x", 40)}")
+      assert Process.alive?(pid)
+      assert Proc.alive?(pid)
+    end
   end
 
   describe "binary data" do

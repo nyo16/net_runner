@@ -25,6 +25,14 @@ defmodule NetRunnerTest do
       {output, 0} = NetRunner.run(["sh", "-c", "printf hello; printf world"])
       assert output == "helloworld"
     end
+
+    test "a command that finishes inside :timeout is not cut short" do
+      assert {"fast\n", 0} = NetRunner.run(~w(echo fast), timeout: 5_000)
+    end
+
+    test "output under :max_output_size is returned whole" do
+      assert {"hello\n", 0} = NetRunner.run(~w(echo hello), max_output_size: 1_000)
+    end
   end
 
   describe "stream!/2" do
@@ -226,7 +234,7 @@ defmodule NetRunnerTest do
       end
 
       # Shepherd + watcher reap asynchronously.
-      eventually(fn -> count_sleep_processes(marker) == 0 end, 3_000)
+      eventually(fn -> pgrep_count(marker) == 0 end, 3_000)
     end
 
     # Issue #28: run/2's own timeout path hard-coded a 5 s SIGTERM grace, so a
@@ -246,14 +254,7 @@ defmodule NetRunnerTest do
       assert result == {:error, :timeout}
       # timeout + kill_timeout = 0.5 s; the old fixed grace made it >= 5.3 s.
       assert us < 3_000_000, "run/2 returned after #{div(us, 1000)} ms"
-      eventually(fn -> count_sleep_processes(marker) == 0 end, 3_000)
-    end
-  end
-
-  defp count_sleep_processes(marker) do
-    case System.cmd("pgrep", ["-f", "sleep #{marker}"], stderr_to_stdout: true) do
-      {out, 0} -> out |> String.split("\n", trim: true) |> length()
-      _ -> 0
+      eventually(fn -> pgrep_count(marker) == 0 end, 3_000)
     end
   end
 end

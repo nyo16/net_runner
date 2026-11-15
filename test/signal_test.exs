@@ -25,6 +25,11 @@ defmodule NetRunner.SignalTest do
       assert {:error, :unknown_signal} = Signal.resolve(:siggibberish)
     end
 
+    test "rejects atoms that cannot name a signal (too long, non-Latin-1)" do
+      assert {:error, :unknown_signal} = Signal.resolve(:"#{String.duplicate("x", 40)}")
+      assert {:error, :unknown_signal} = Signal.resolve(:"sig✓")
+    end
+
     test "rejects non-atom, non-integer values" do
       assert {:error, :unknown_signal} = Signal.resolve("sigterm")
       assert {:error, :unknown_signal} = Signal.resolve(nil)

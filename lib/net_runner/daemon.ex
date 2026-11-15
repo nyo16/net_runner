@@ -13,7 +13,9 @@ defmodule NetRunner.Daemon do
   engages — a `restart: :permanent` Daemon is restarted, a `:temporary` one is
   not. The Daemon also traps exits, so a supervisor shutdown runs
   `terminate/2` and the child receives the SIGTERM→SIGKILL escalation instead
-  of being orphaned to the shepherd's POLLHUP path.
+  of being orphaned to the shepherd's POLLHUP path. The SIGTERM grace is
+  `process_opts[:kill_timeout]` when given (default 3 000 ms), and
+  `child_spec/1` sizes the supervisor's `shutdown:` budget to match.
 
   ## Usage
 
@@ -38,12 +40,14 @@ defmodule NetRunner.Daemon do
 
   @type on_output :: :discard | :log | (binary() -> any())
 
-  # terminate/2 must finish inside the supervisor's shutdown budget, which is the
-  # `use GenServer` default of 5_000 ms above — past that the Daemon is
-  # brutal-killed and the SIGKILL escalation never runs. Keep
-  # @sigterm_grace_ms + @sigkill_grace_ms comfortably under that 5_000 ms.
+  # SIGTERM grace for terminate/2, replaced by `process_opts[:kill_timeout]`
+  # when the caller sets it, then a SIGKILL grace. terminate/2 must finish
+  # inside the supervisor's shutdown budget or the Daemon is brutal-killed and
+  # the SIGKILL escalation never runs, so child_spec/1 derives `shutdown:`
+  # from the effective grace instead of relying on the 5_000 ms default.
   @sigterm_grace_ms 3_000
   @sigkill_grace_ms 1_000
+  @shutdown_margin_ms 1_000
 
   @daemon_opts [:cmd, :args, :on_output, :process_opts]
 
@@ -52,6 +56,10 @@ defmodule NetRunner.Daemon do
   `:on_output` (see `t:on_output/0`), `:process_opts` (forwarded to
   `NetRunner.Process.start_link/3`; `:stderr` is forced to `:disabled`), and
   `:name`. Malformed options raise `ArgumentError` in the caller.
+
+  On shutdown the child gets SIGTERM, then SIGKILL after
+  `process_opts[:kill_timeout]` ms (default 3 000), then up to 1 000 ms to
+  exit. See `child_spec/1` for the matching supervisor `shutdown:` budget.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -63,6 +71,29 @@ defmodule NetRunner.Daemon do
     daemon_opts = Keyword.validate!(daemon_opts, @daemon_opts)
     daemon_opts |> process_opts() |> Proc.validate_opts!()
     GenServer.start_link(__MODULE__, daemon_opts, gen_opts)
+  end
+
+  @doc """
+  Child spec whose `shutdown:` covers the whole termination ladder: the
+  SIGTERM grace (`process_opts[:kill_timeout]`, default 3 000 ms), the
+  1 000 ms SIGKILL grace and a 1 000 ms margin. With the defaults this is
+  the usual 5 000 ms. An explicit `shutdown:` in a supervisor's child spec
+  override still wins.
+  """
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
+  def child_spec(opts) do
+    opts
+    |> super()
+    |> Map.put(:shutdown, sigterm_grace(opts) + @sigkill_grace_ms + @shutdown_margin_ms)
+  end
+
+  # A non-integer :kill_timeout is rejected by start_link/1; child_spec/1 must
+  # not crash on it first with an ArithmeticError.
+  defp sigterm_grace(opts) do
+    case opts |> Keyword.get(:process_opts, []) |> Keyword.get(:kill_timeout) do
+      ms when is_integer(ms) -> ms
+      _ -> @sigterm_grace_ms
+    end
   end
 
   # Force stderr: :disabled so the underlying Process does NOT start its own
@@ -131,6 +162,7 @@ defmodule NetRunner.Daemon do
            proc: proc,
            os_pid: os_pid,
            on_output: on_output,
+           sigterm_grace: sigterm_grace(opts),
            drain_ref: drain_ref,
            stderr_drain_ref: stderr_drain_ref,
            forwarder: forwarder,
@@ -222,7 +254,7 @@ defmodule NetRunner.Daemon do
     # Graceful shutdown with escalation, owned by Proc.shutdown/3. Safe on an
     # already-exited child (kill returns {:error, :not_running}) and on an
     # already-dead server (all calls trap :exit).
-    Proc.shutdown(state.proc, @sigterm_grace_ms, @sigkill_grace_ms)
+    Proc.shutdown(state.proc, state.sigterm_grace, @sigkill_grace_ms)
 
     # Explicitly stop the Proc GenServer. The link alone does not cover a
     # :normal Daemon exit (GenServer.stop(daemon)): a non-trapping linked

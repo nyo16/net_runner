@@ -138,4 +138,66 @@ defmodule NetRunner.TestHelpers do
     ExUnit.Callbacks.on_exit(fn -> File.rm_rf(dir) end)
     dir
   end
+
+  @doc """
+  Number of live `sleep <marker>` processes (see `sleep_marker/0`).
+
+  Anchored to the exact argv: the wrapping `sh -c` (and a forked subshell,
+  until it execs) carries the marker in its own cmdline, so an unanchored
+  `pgrep -f` counts the shell as "the sleep is up" before it exists.
+  """
+  def pgrep_count(marker) do
+    case System.cmd("pgrep", ["-f", "^sleep #{marker}$"], stderr_to_stdout: true) do
+      {out, 0} -> out |> String.split("\n", trim: true) |> length()
+      _ -> 0
+    end
+  end
+
+  @doc """
+  Reports a positive-path test that could not run (no cgroup delegation,
+  missing helper binary, ...). On the CI leg that delegates
+  `/sys/fs/cgroup/net_runner` (`NR_CGROUP_DELEGATED=1`) it is a hard failure,
+  so the positive path cannot silently stop executing; elsewhere it is a
+  logged, expected downgrade.
+  """
+  def degraded(message) do
+    if System.get_env("NR_CGROUP_DELEGATED") == "1" do
+      ExUnit.Assertions.flunk("positive path did not run on a delegated CI leg: " <> message)
+    else
+      degraded_note(message)
+    end
+  end
+
+  @doc "Logs a `[degraded]` note without ever failing the test."
+  def degraded_note(message) do
+    require Logger
+    Logger.warning("[degraded] " <> message)
+  end
+
+  @doc """
+  A connected pair of local stream sockets, `{server, client}`, closed on
+  test exit. Stands in for the BEAM <-> shepherd UDS in parser and handshake
+  tests.
+  """
+  def uds_pair do
+    path = Path.join(System.tmp_dir!(), "nr_test_#{System.unique_integer([:positive])}.sock")
+
+    {:ok, listener} = :socket.open(:local, :stream)
+    :ok = :socket.bind(listener, %{family: :local, path: path})
+    :ok = :socket.listen(listener)
+
+    {:ok, client} = :socket.open(:local, :stream)
+    :ok = :socket.connect(client, %{family: :local, path: path})
+    {:ok, server} = :socket.accept(listener, 5_000)
+
+    :socket.close(listener)
+    File.rm(path)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      :socket.close(client)
+      :socket.close(server)
+    end)
+
+    {server, client}
+  end
 end

@@ -175,14 +175,15 @@ defmodule NetRunner.LeakTest do
 
   # Teardown is asynchronous (shepherd reap, Watcher stop), so poll rather
   # than sample once.
-  defp settled_process_count(baseline, attempts \\ 100) do
-    now = length(Process.list())
-
-    cond do
-      now <= baseline -> true
-      attempts == 0 -> flunk("leaked #{now - baseline} processes")
-      true -> Process.sleep(20) && settled_process_count(baseline, attempts - 1)
-    end
+  defp settled_process_count(baseline) do
+    eventually(
+      fn ->
+        now = length(Process.list())
+        assert now <= baseline, "leaked #{now - baseline} processes"
+        true
+      end,
+      2_000
+    )
   end
 
   # The baseline must not be sampled mid-teardown of the warm-up processes:

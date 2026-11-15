@@ -776,17 +776,33 @@ static int encode_wait_status(int status) {
 }
 
 /* Signal the child's process group, falling back to the child itself when
- * the group does not exist (yet). */
+ * the group does not exist (yet). Used for caller-requested CMD_KILL, which
+ * means "this signal to the group". */
 static void signal_group(pid_t child_pid, int sig) {
     if (kill(-child_pid, sig) != 0) (void)kill(child_pid, sig);
 }
 
+/* Teardown signal: the group AND the leader, both unconditionally. A leader
+ * that moved itself into another group (setpgid(0, other)) is not reached
+ * by kill(-pid) while its original group still has members, and
+ * signal_group's fallback only fires on an empty group. child_pid is our
+ * unreaped child, so the direct kill cannot hit a recycled pid. */
+static void signal_group_and_leader(pid_t child_pid, int sig) {
+    (void)kill(-child_pid, sig);
+    (void)kill(child_pid, sig);
+}
+
 /* Reap child_pid after it was sent SIGKILL. Bounded — a child wedged in
  * uninterruptible kernel sleep (D-state) never exits, and we must not hang
- * the shepherd on it; the kernel completes the SIGKILL later, so that case
- * reports 128 + SIGKILL. */
+ * the shepherd on it. A leader still alive after the first wait gets a
+ * direct SIGKILL (it is unreaped, so its pid is pinned) and a second wait:
+ * 137 is only ever reported for a leader with a SIGKILL pending, which the
+ * kernel completes even out of D-state. */
 static int reap_killed_child(pid_t child_pid) {
-    (void)wait_for_exit(child_pid, REAP_TIMEOUT_MS);
+    if (!wait_for_exit(child_pid, REAP_TIMEOUT_MS)) {
+        (void)kill(child_pid, SIGKILL);
+        (void)wait_for_exit(child_pid, REAP_TIMEOUT_MS);
+    }
     int status;
     pid_t r;
     do {
@@ -797,17 +813,18 @@ static int reap_killed_child(pid_t child_pid) {
 }
 
 /*
- * Teardown ladder: SIGTERM the group, wait up to kill_timeout for the leader
- * to exit (without reaping), then ALWAYS SIGKILL the group — members that
- * ignore SIGTERM must not outlive a leader that obeyed it — reap, and clean
+ * Teardown ladder: SIGTERM the group and the leader, wait up to kill_timeout
+ * for the leader to exit (without reaping), then ALWAYS SIGKILL both —
+ * members that ignore SIGTERM must not outlive a leader that obeyed it, and
+ * a leader that left its group must not outlive the group — reap, and clean
  * up the cgroup. Returns the leader's status for MSG_CHILD_EXITED.
  */
 static int kill_child(pid_t child_pid) {
     int status = EXIT_STATUS_UNKNOWN;
     if (child_pid > 0) {
-        signal_group(child_pid, SIGTERM);
+        signal_group_and_leader(child_pid, SIGTERM);
         (void)wait_for_exit(child_pid, kill_timeout_ms);
-        signal_group(child_pid, SIGKILL);
+        signal_group_and_leader(child_pid, SIGKILL);
         status = reap_killed_child(child_pid);
     }
     cgroup_cleanup();
@@ -1448,7 +1465,7 @@ static void fail_spawn(const struct spawn_state *s, const char *msg) {
     if (s->gate_w >= 0) close(s->gate_w);
     int status = EXIT_STATUS_UNKNOWN;
     if (s->child_pid > 0) {
-        signal_group(s->child_pid, SIGKILL);
+        signal_group_and_leader(s->child_pid, SIGKILL);
         status = reap_killed_child(s->child_pid);
     }
     cgroup_cleanup();

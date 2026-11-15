@@ -25,8 +25,12 @@ defmodule NetRunner.Process.Protocol do
 
   # --- BEAM -> shepherd command encoders ---
 
-  @doc "Encodes CMD_KILL for a resolved signal number (one byte on the wire)."
-  def kill(sig_num) when is_integer(sig_num) and sig_num in 1..255 do
+  @doc """
+  Encodes CMD_KILL for a resolved signal number (one byte on the wire).
+  Limited to 1..31, the range the shepherd honours (`handle_command`), so an
+  out-of-range signal fails here instead of being silently dropped there.
+  """
+  def kill(sig_num) when is_integer(sig_num) and sig_num in 1..31 do
     <<@cmd_kill, sig_num::8>>
   end
 

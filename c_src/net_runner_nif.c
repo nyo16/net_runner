@@ -733,16 +733,25 @@ static ERL_NIF_TERM nif_is_os_pid_alive(ErlNifEnv *env, int argc,
 /*
  * nif_signal_number(signal_atom) -> {:ok, number} | {:error, :unknown_signal}
  *
- * Converts a signal atom to its platform-specific number.
+ * Converts a signal atom to its platform-specific number. An atom that does
+ * not fit the buffer (>= 32 bytes) or is not Latin-1 cannot name a signal:
+ * it is an unknown signal, not a badarg — a raise here would crash the
+ * Process GenServer (and with it the child) on a caller's typo. badarg is
+ * kept for non-atoms only.
  */
 static ERL_NIF_TERM nif_signal_number(ErlNifEnv *env, int argc,
                                       const ERL_NIF_TERM argv[]) {
     ASSERT_ARGC(env, argc, 1);
 
+    if (!enif_is_atom(env, argv[0])) {
+        return enif_make_badarg(env);
+    }
+
     char atom_buf[32];
     if (!enif_get_atom(env, argv[0], atom_buf, sizeof(atom_buf),
                        ERL_NIF_LATIN1)) {
-        return enif_make_badarg(env);
+        return enif_make_tuple2(env, atom_error,
+                                MAKE_ATOM(env, "unknown_signal"));
     }
 
     int sig = -1;

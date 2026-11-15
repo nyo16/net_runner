@@ -289,7 +289,7 @@ defmodule NetRunner.Process do
     GenServer.call(process, :alive?)
   end
 
-  @doc "Get accumulated stats. See `NetRunner.Process.Stats.t/0`."
+  @doc "Get accumulated stats. See `t:NetRunner.Process.Stats.t/0`."
   @spec stats(GenServer.server()) :: Stats.t()
   def stats(process) do
     GenServer.call(process, :stats)
@@ -643,10 +643,8 @@ defmodule NetRunner.Process do
 
   defp on_owner_down(state) do
     if state.os_pid do
-      case Signal.resolve(:sigkill) do
-        {:ok, sig_num} -> signal_child(state, sig_num)
-        _ -> :ok
-      end
+      {:ok, sigkill} = Signal.resolve(:sigkill)
+      _ = signal_child(state, sigkill)
     end
 
     {:stop, :normal, state}
@@ -660,12 +658,14 @@ defmodule NetRunner.Process do
   #
   # Once the shepherd Port is dead the pid IS recyclable: an orphaned child
   # is reaped by PID 1 the moment it exits. The Port's exit message settles
-  # the process (finish_orphaned/2), but a kill/2 queued ahead of that message
-  # still lands here. On Linux the shepherd hands over a pidfd, which names
-  # the process itself rather than a pid number, so the direct path is
-  # race-free there. Without one (macOS, pre-5.3 kernels) the direct path
-  # probes first, which narrows the exposure to the microseconds between
-  # kill(pid, 0) and kill(pid, sig); it cannot close it.
+  # the process (finish_orphaned/2, which never kills by number), but a
+  # kill/2 queued ahead of that message still lands here. On Linux the
+  # shepherd hands over a pidfd, which names the process itself rather than
+  # a pid number, so the direct path is race-free there unless the kernel
+  # refuses pidfd_send_signal. Without a pidfd (macOS, pre-5.3 kernels) or
+  # after such a refusal the direct path probes first, which narrows the
+  # exposure to the microseconds between kill(pid, 0) and kill(pid, sig); it
+  # cannot close it.
   defp signal_child(state, sig_num) do
     if shepherd_alive?(state) do
       case send_shepherd_command(state, Protocol.kill(sig_num)) do
@@ -1259,9 +1259,20 @@ defmodule NetRunner.Process do
     finish_exit(state, 137)
   end
 
+  # Never reaches direct_kill/2: its non-ESRCH fallback is probe_and_kill/2,
+  # a kill by number on exactly the recyclable-pid path this function exists
+  # for. The pidfd result is ignored — ESRCH means the leader is already gone.
   defp kill_orphan(state, sigkill) do
     _ = Nif.nif_kill_group(state.os_pid, sigkill)
-    if state.pidfd != nil, do: _ = direct_kill(state, sigkill)
+
+    case state.pidfd do
+      %Pipe{resource: resource} when is_reference(resource) ->
+        _ = Nif.nif_pidfd_send_signal(resource, sigkill)
+
+      _ ->
+        :ok
+    end
+
     :ok
   end
 

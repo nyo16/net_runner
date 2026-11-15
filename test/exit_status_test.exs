@@ -1,6 +1,8 @@
 defmodule NetRunner.ExitStatusTest do
   use ExUnit.Case, async: true
 
+  import NetRunner.TestHelpers
+
   alias NetRunner.Process, as: Proc
   alias NetRunner.Process.Protocol
 
@@ -169,28 +171,6 @@ defmodule NetRunner.ExitStatusTest do
       :ok = :socket.send(shepherd_side, rest)
 
       assert {:ok, ^msg} = Protocol.recv_shepherd_error(beam_side, head, 1_000)
-    end
-
-    defp uds_pair do
-      path = Path.join(System.tmp_dir!(), "nr_test_#{System.unique_integer([:positive])}.sock")
-
-      {:ok, listener} = :socket.open(:local, :stream)
-      :ok = :socket.bind(listener, %{family: :local, path: path})
-      :ok = :socket.listen(listener)
-
-      {:ok, client} = :socket.open(:local, :stream)
-      :ok = :socket.connect(client, %{family: :local, path: path})
-      {:ok, server} = :socket.accept(listener, 5_000)
-
-      :socket.close(listener)
-      File.rm(path)
-
-      on_exit(fn ->
-        :socket.close(client)
-        :socket.close(server)
-      end)
-
-      {server, client}
     end
   end
 end

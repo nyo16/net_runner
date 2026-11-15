@@ -184,6 +184,38 @@ defmodule NetRunner.DaemonTest do
       end
     end
 
+    test "a supervisor shutdown honours process_opts[:kill_timeout]" do
+      # Sized from the grace so the supervisor never brutal-kills the Daemon
+      # mid-ladder: 30 s SIGTERM grace + 1 s SIGKILL grace + 1 s margin.
+      assert %{shutdown: 32_000} =
+               Daemon.child_spec(cmd: "x", process_opts: [kill_timeout: 30_000])
+
+      assert %{shutdown: 5_000} = Daemon.child_spec(cmd: "x")
+
+      ready = Path.join(System.tmp_dir!(), "nr_daemon_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm(ready) end)
+
+      {:ok, sup} =
+        Supervisor.start_link(
+          [
+            {Daemon,
+             cmd: "sh",
+             args: ["-c", "trap '' TERM; : > #{ready}; while :; do sleep 0.2; done"],
+             process_opts: [kill_timeout: 300]}
+          ],
+          strategy: :one_for_one
+        )
+
+      [{Daemon, daemon, :worker, _}] = Supervisor.which_children(sup)
+      os_pid = Daemon.os_pid(daemon)
+      eventually(fn -> File.exists?(ready) end)
+
+      {us, :ok} = :timer.tc(fn -> Supervisor.stop(sup) end)
+
+      assert us < 1_500_000, "supervisor shutdown took #{div(us, 1000)}ms"
+      eventually(fn -> not os_pid_alive?(os_pid) end)
+    end
+
     # Proc.write/2 is an :infinity GenServer.call. Performed inside the
     # Daemon's own handle_call it wedged every other control call for as long
     # as the child refused to drain stdin — including the Proc.alive?/1 in

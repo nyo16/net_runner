@@ -67,7 +67,7 @@ defmodule NetRunner.IOPipeliningTest do
                  timeout: 300
                )
 
-      eventually(fn -> count_matching("sleep #{marker}") == 0 end, 3_000)
+      eventually(fn -> pgrep_count(marker) == 0 end, 3_000)
     end
 
     test "times out even while the writer is still blocked on a full stdin pipe" do
@@ -78,7 +78,7 @@ defmodule NetRunner.IOPipeliningTest do
       assert {:error, :timeout} =
                NetRunner.run(["sh", "-c", "sleep #{marker}"], input: payload, timeout: 300)
 
-      eventually(fn -> count_matching("sleep #{marker}") == 0 end, 3_000)
+      eventually(fn -> pgrep_count(marker) == 0 end, 3_000)
     end
   end
 
@@ -238,12 +238,5 @@ defmodule NetRunner.IOPipeliningTest do
     {:ok, pid} = Proc.start(cmd, args, opts)
     on_exit(fn -> Proc.stop(pid) end)
     pid
-  end
-
-  defp count_matching(pattern) do
-    case System.cmd("pgrep", ["-f", pattern], stderr_to_stdout: true) do
-      {out, 0} -> out |> String.split("\n", trim: true) |> length()
-      _ -> 0
-    end
   end
 end

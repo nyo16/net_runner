@@ -86,19 +86,6 @@ defmodule NetRunner.CgroupTest do
       end
     end
 
-    # A cgroup positive path that silently stops executing would leave a green
-    # build with zero cgroup coverage. CI sets NR_CGROUP_DELEGATED=1 on the leg
-    # that delegates /sys/fs/cgroup/net_runner, so there the degraded branch is
-    # a hard failure; elsewhere it is a logged, expected downgrade.
-    defp degraded(message) do
-      if System.get_env("NR_CGROUP_DELEGATED") == "1" do
-        flunk("cgroup positive path did not run on a delegated CI leg: " <> message)
-      else
-        require Logger
-        Logger.warning("[degraded] " <> message)
-      end
-    end
-
     test "cgroup_path nil (default) works normally" do
       {:ok, pid} = Proc.start("echo", ["no cgroup"])
       {:ok, data} = Proc.read(pid)

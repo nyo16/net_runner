@@ -11,10 +11,11 @@ defmodule NetRunner.Process.ProtocolTest do
     test "CMD_KILL is opcode 0x01 followed by one signal byte" do
       assert Protocol.kill(15) == <<0x01, 15>>
       assert Protocol.kill(9) == <<0x01, 9>>
-      assert Protocol.kill(255) == <<0x01, 255>>
+      assert Protocol.kill(31) == <<0x01, 31>>
     end
 
-    test "CMD_KILL refuses signals that would not survive the 8-bit field" do
+    test "CMD_KILL refuses signals outside the shepherd's 1..31 range" do
+      assert_raise FunctionClauseError, fn -> Protocol.kill(32) end
       assert_raise FunctionClauseError, fn -> Protocol.kill(256) end
       assert_raise FunctionClauseError, fn -> Protocol.kill(0) end
       assert_raise FunctionClauseError, fn -> Protocol.kill(-1) end
