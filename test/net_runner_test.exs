@@ -162,21 +162,6 @@ defmodule NetRunnerTest do
       assert_raise ArgumentError, fn -> NetRunner.stream!(~w(cat), input_buffer: -1) end
       assert_raise ArgumentError, fn -> NetRunner.stream!(~w(cat), input_buffer: :big) end
     end
-
-    test "prepare/1 batches to ≤1 MiB flat binaries and is idempotent" do
-      list = List.duplicate(:binary.copy(<<9>>, 100_000), 30)
-
-      batches = NetRunner.InputWriter.prepare(list)
-
-      assert Enum.all?(batches, &is_binary/1)
-      # Soft limit: a batch may include the element that crosses 1 MiB.
-      assert Enum.all?(batches, &(byte_size(&1) <= 1_048_576 + 100_000))
-      assert IO.iodata_to_binary(batches) == IO.iodata_to_binary(list)
-
-      # Re-entry (run/2: prepare in run_impl, list_batches again in start/3)
-      # must be a true no-op — same binaries, no re-copy.
-      assert NetRunner.InputWriter.prepare(batches) == batches
-    end
   end
 
   describe "output: :iodata" do

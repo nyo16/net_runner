@@ -45,6 +45,13 @@ defmodule NetRunner.InputWriter do
   iodata writes of up to that many bytes, trading stdin latency for
   throughput. Eager lists always coalesce: they are fully realised, so the
   granularity is unobservable.
+
+  Call it in the process that should own the writer (it is a linked
+  `Task.async`) and as early as possible: the task's closure copies `input`
+  into the writer's heap. A binary or the coalesced batches of an eager
+  list cost almost nothing to copy; a lazy enumerable copies its whole
+  captured environment (the list behind a `Stream.map/2`, say), so it should
+  cross exactly one process boundary on its way here.
   """
   @spec start(pid(), binary() | Enumerable.t() | nil, non_neg_integer()) :: Task.t() | nil
   def start(pid, input, buffer \\ 0)
@@ -88,20 +95,6 @@ defmodule NetRunner.InputWriter do
       Proc.close_stdin(pid)
     end)
   end
-
-  @doc """
-  Pre-coalesces an eager list input into flat batch binaries; every other
-  input shape passes through untouched.
-
-  `run/2` calls this in the *caller's* process before spawning its I/O task:
-  every `Task.async` closure that captures a raw list copies the whole list
-  structure into the task heap, and the input crosses two task boundaries on
-  the run path. Already-coalesced input re-entering `start/3` is a cheap
-  no-op-shaped pass (one batch per oversized element).
-  """
-  @spec prepare(term()) :: term()
-  def prepare(list) when is_list(list), do: list_batches(list, @list_coalesce_bytes)
-  def prepare(other), do: other
 
   @doc """
   Validates an `:input_buffer` option value, raising `ArgumentError` on a
@@ -169,9 +162,8 @@ defmodule NetRunner.InputWriter do
 
   # A single-element batch that is already a binary passes through untouched:
   # `:erlang.iolist_to_binary/1` fast-paths a bare binary but memcpy's a
-  # single-binary LIST, and this is what makes re-entering `list_batches/2`
-  # with already-prepared input (run/2 calls prepare/1, then start/3's list
-  # clause coalesces again) a true no-op instead of a full second copy.
+  # single-binary LIST, so a list of large binaries (each its own batch) is
+  # never copied.
   defp flush_batch([bin]) when is_binary(bin), do: bin
   defp flush_batch(batch), do: IO.iodata_to_binary(batch)
 

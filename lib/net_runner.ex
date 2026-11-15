@@ -167,9 +167,7 @@ defmodule NetRunner do
 
   defp run_impl(cmd, args, opts) do
     opts = Keyword.validate!(opts, @run_opts)
-    # Lists coalesce here, in the caller, before the input is captured by any
-    # task closure (see InputWriter.prepare/1).
-    input = InputWriter.prepare(Keyword.get(opts, :input, nil))
+    input = Keyword.get(opts, :input, nil)
     input_buffer = InputWriter.validate_buffer!(Keyword.get(opts, :input_buffer, 0))
     timeout = Keyword.get(opts, :timeout, nil)
     max_output_size = Keyword.get(opts, :max_output_size, nil)
@@ -241,11 +239,30 @@ defmodule NetRunner do
   end
 
   defp run_with_pid(pid, timeout, io) do
+    # The writer runs concurrently with the reader. Writing to completion
+    # first deadlocks any filter command once the input exceeds
+    # stdin_buffer + stdout_buffer (~128 KiB on macOS): the child fills its
+    # stdout pipe, blocks in write(2), and therefore stops draining stdin,
+    # while we are blocked filling stdin.
+    #
+    # It starts HERE, in the caller, not inside run_io: a closure copies
+    # everything it captures into the process it spawns, so a lazy :input
+    # (and the terms it captures, e.g. the list behind a Stream.map/2) used to
+    # be copied twice — into the run_io task and again into the writer task
+    # it started. Now it crosses one boundary, and run_io's closure carries
+    # no input at all. Task.async links the writer to the caller exactly as
+    # the run_io task already was, so a writer crash propagates the same way.
+    writer = InputWriter.start(pid, io.input, io.input_buffer)
+    io = %{io | input: nil}
     task = Task.async(fn -> run_io(pid, io) end)
 
     result =
       (Task.yield(task, timeout || :infinity) || Task.shutdown(task))
       |> handle_run_result(pid, io.kill_timeout)
+
+    # Reaped by its owner. :done only after a natural end of output; on a
+    # timeout or error the child is being killed and nothing is left to write.
+    InputWriter.reap(writer, if(match?({:error, _}, result), do: :halted, else: :done))
 
     # run/2 never hands the pid to the caller, so nothing else can ever stop
     # this server. Without it, each call leaks the Process GenServer, its
@@ -404,17 +421,8 @@ defmodule NetRunner do
   defp chunks_size(chunks), do: Enum.reduce(chunks, 0, &(byte_size(&1) + &2))
 
   defp run_io(pid, io) do
-    # The writer must run concurrently with the reader. Writing to completion
-    # first deadlocks any filter command once the input exceeds
-    # stdin_buffer + stdout_buffer (~128 KiB on macOS): the child fills its
-    # stdout pipe, blocks in write(2), and therefore stops draining stdin,
-    # while we are blocked filling stdin. Neither side can move and the
-    # default :timeout of nil means there is no escape.
-    writer = InputWriter.start(pid, io.input, io.input_buffer)
-
     case read_all_with_limits(pid, io.max_output_size, io.output) do
       {:ok, output} ->
-        InputWriter.reap(writer, :done)
         {:ok, exit_status} = Proc.await_exit(pid)
 
         if io.capture_stderr? do
@@ -426,7 +434,6 @@ defmodule NetRunner do
         end
 
       {:error, _} = error ->
-        InputWriter.reap(writer, :halted)
         error
     end
   end
