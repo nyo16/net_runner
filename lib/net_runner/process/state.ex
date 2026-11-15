@@ -43,6 +43,9 @@ defmodule NetRunner.Process.State do
     # yields so a retry pass over N parked writes queues one resume message,
     # not N.
     continue_writes_scheduled?: false,
+    # The validated :cgroup_path, or nil. Only consulted when the shepherd
+    # dies without reporting: the BEAM then removes the leaf itself.
+    cgroup_path: nil,
     status: :running,
     stats: %Stats{}
   ]
@@ -68,6 +71,7 @@ defmodule NetRunner.Process.State do
           stderr_tail_bytes: non_neg_integer(),
           uds_carry: binary(),
           protocol_error?: boolean(),
+          cgroup_path: String.t() | nil,
           continue_writes_scheduled?: boolean(),
           status: status(),
           stats: Stats.t()

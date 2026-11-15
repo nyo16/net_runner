@@ -340,6 +340,7 @@ defmodule NetRunner.Process.Exec do
       args: args,
       stderr_mode: stderr_mode,
       stderr_tail_bytes: Keyword.get(opts, :stderr_tail_bytes, 8_192),
+      cgroup_path: Keyword.get(opts, :cgroup_path),
       uds_carry: carry,
       status: :running
     }
@@ -381,12 +382,32 @@ defmodule NetRunner.Process.Exec do
     validate_cwd!(Keyword.get(opts, :cwd, nil))
     validate_no_new_privs!(Keyword.get(opts, :no_new_privs, false))
     environment = normalize_env!(Keyword.get(opts, :env, nil))
+    require_linux_for_isolation!(opts)
     warn_if_prefixed(requested_cgroup_path, Keyword.get(opts, :cgroup_path, nil))
 
     case environment do
       nil -> Keyword.delete(opts, :env)
       environment -> Keyword.put(opts, :env, environment)
     end
+  end
+
+  # Isolation the caller explicitly asked for must not silently degrade:
+  # cgroups and PR_SET_NO_NEW_PRIVS exist only on Linux, and an unconfined
+  # child is worse than a failed spawn (the shepherd's own policy for a
+  # cgroup it cannot set up). Runs after every shape check, so a malformed
+  # value reports the same error on every platform.
+  defp require_linux_for_isolation!(opts) do
+    if :os.type() != {:unix, :linux} do
+      if Keyword.get(opts, :cgroup_path) do
+        raise ArgumentError, ":cgroup_path requires Linux (cgroup v2); got #{inspect(:os.type())}"
+      end
+
+      if Keyword.get(opts, :no_new_privs, false) do
+        raise ArgumentError, "no_new_privs: true requires Linux; got #{inspect(:os.type())}"
+      end
+    end
+
+    :ok
   end
 
   # 1.3.x accepted any relative :cgroup_path; 1.4.0 started requiring the

@@ -22,7 +22,7 @@ defmodule NetRunner.Process do
   use GenServer
 
   alias NetRunner.Nif
-  alias NetRunner.Process.{Exec, Operations, Pipe, Protocol, Stats}
+  alias NetRunner.Process.{Cgroup, Exec, Operations, Pipe, Protocol, Stats}
   alias NetRunner.Signal
 
   # Exactly the size of nif_read's stack buffer, and one macOS pipe buffer
@@ -1264,6 +1264,11 @@ defmodule NetRunner.Process do
         "#{shepherd_status}) without reporting the child's exit; killed the " <>
         "orphaned process group and reporting 137"
     )
+
+    # The dead shepherd can no longer cgroup.kill and remove its leaf; left in
+    # place it would make every later spawn on this path fail. Bounded
+    # (~1 s) and only on this rare path.
+    if state.cgroup_path, do: Cgroup.remove_orphaned_leaf(state.cgroup_path)
 
     finish_exit(state, 137)
   end

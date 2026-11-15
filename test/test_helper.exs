@@ -1,6 +1,8 @@
+# :linux_only needs Linux (cgroups, /proc, pidfd); :non_linux pins the
+# off-Linux contract (isolation options are rejected there).
 exclude =
   case :os.type() do
-    {:unix, :linux} -> []
+    {:unix, :linux} -> [:non_linux]
     _ -> [:linux_only]
   end
 

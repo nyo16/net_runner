@@ -285,6 +285,22 @@ The chosen variant doubles the headroom, keeps `run/2` with large input within
 noise and stdout `read_batch` at up to 16 chunks, and costs about 22% on bulk
 stderr drains.
 
+## cgroup exit latency (PERF-9, measured 2026-11-15)
+
+`NetRunner.run(["sh", "-c", "sleep 60 & exit 0"], cgroup_path: …)`, measured in a
+Docker `elixir:1.18` container (OrbStack, kernel 7.2, `--privileged`, cgroup v2,
+`--cpus=4`, `MIX_ENV=prod`) as 100 sequential calls per run, 3 runs. "Slow" means
+≥ 50 ms. The no-cgroup control is the same command without `cgroup_path:`.
+
+| shepherd `cgroup_cleanup` retry | p50 | p90 | mean | slow / 100 | no-cgroup mean |
+|---|---|---|---|---|---|
+| fixed 100 ms sleep (≤ 1.6.0) | 1.0–1.2 ms | 1.6–2.2 ms | 6.3–10.4 ms | 5–9 | 0.9 ms |
+| backoff 1, 2, 4 … 512 ms | 1.4–1.9 ms | 2.0–6.2 ms | 1.6–3.1 ms | 0 | 1.2–3.6 ms |
+
+The win is in the tail: about one exit in fourteen used to wait a full 100 ms
+sleep. The "after" runs shared the host with other builds, which is why their
+no-cgroup control is noisier too.
+
 ---
 
 ## When you are done

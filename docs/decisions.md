@@ -317,6 +317,16 @@ exits on its own gets the sweep immediately, with no grace period.
   deliberate: the leader is already gone, and a grace period would hold the
   exit status hostage to whatever it left behind.
 
+**Addendum (2026-11, PERF-9)**: running `cgroup_cleanup` before the exit
+frame put its `rmdir` retry loop on the exit path. A fixed 100 ms sleep
+between attempts delayed the frame by 100 ms whenever the first `rmdir` raced
+the processes `cgroup.kill` had just killed (`sh -c 'sleep 60 & exit 0'`). The
+retries now back off exponentially (1, 2, 4 … 512 ms, the same ~1 s cap), and
+the ordering above is unchanged. Linux Docker, 3 runs × 100 exits under
+`cgroup_path:`: before, 5–9 per 100 took ≥ 50 ms (mean 6.3–10.4 ms); after,
+0 per 100 (mean 1.6–3.1 ms, against 1.2–3.6 ms without a cgroup). Details in
+`bench/LINUX_VERIFICATION.md`.
+
 ## ADR-15: Unconditional Exec Gate; Hand Off Before Exec
 
 **Context**: The sync-pipe gate existed only for cgroup spawns, and even then

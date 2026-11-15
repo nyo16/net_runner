@@ -434,7 +434,11 @@ Isolate child processes in a cgroup v2 hierarchy for resource control:
 )
 ```
 
-The shepherd creates the cgroup directory (and its `net_runner/` parent if missing), moves the child into it *before* `execvp`, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the leaf — including any sub-cgroups — before the exit status is reported, so an immediate respawn on the same path succeeds; the shared parent is left in place). Spawns fail closed with `{:error, {:shepherd_error, msg}}` when the parent or leaf cannot be created, the leaf already exists, the migration is refused, or `cgroup.kill` (Linux ≥ 5.14) is unavailable. No-op on macOS.
+The shepherd creates the cgroup directory (and its `net_runner/` parent if missing), moves the child into it *before* `execvp`, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the leaf — including any sub-cgroups — before the exit status is reported, so an immediate respawn on the same path succeeds; the shared parent is left in place). Spawns fail closed with `{:error, {:shepherd_error, msg}}` when the parent or leaf cannot be created, the leaf already exists, the migration is refused, `cgroup.kill` (Linux ≥ 5.14) is unavailable, or an existing parent component of the path holds live processes. If the shepherd itself is killed (SIGKILL, OOM), the BEAM kills and removes the leaf, so the path stays reusable.
+
+`cgroup_path` values must not nest: `net_runner/a/b` while a spawn is live in `net_runner/a` is refused, because `a`'s teardown `cgroup.kill` is recursive and would kill the nested child.
+
+Linux only: off Linux, `:cgroup_path` raises `ArgumentError` rather than running the child unconfined.
 
 Requirements: cgroup v2, with `/sys/fs/cgroup` writable by the BEAM's user (root, or a delegated root), plus write access to the `cgroup.procs` of the nearest common ancestor of the BEAM's cgroup and the target (usually the root) so the child can be migrated. If an administrator pre-creates and delegates `/sys/fs/cgroup/net_runner` instead, only that subtree needs to be writable.
 
@@ -546,9 +550,9 @@ end, max_concurrency: 20)
 | `:env` | map \| list of pairs \| `{:replace, map \| list}` | `nil` | Child environment changes. A binary sets a variable. `nil` removes it. `{:replace, environment}` removes all unselected variables. The child resolves its executable against the modified `PATH`; `env:` must come from trusted input (see [Environment](#environment)). |
 | `:pty` | boolean | `false` | Use pseudo-terminal |
 | `:kill_timeout` | integer | `5000` | SIGTERM→SIGKILL escalation timeout in ms |
-| `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only) under a `net_runner/` prefix, under 256 bytes; unprefixed paths are prefixed (deprecated) |
+| `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only; raises elsewhere) under a `net_runner/` prefix, not nested under another live spawn's path, under 256 bytes; unprefixed paths are prefixed (deprecated) |
 | `:cwd` | string | `nil` | Child working directory. Defaults to the BEAM working directory. |
-| `:no_new_privs` | boolean | `false` | Set `PR_SET_NO_NEW_PRIVS` in the child before exec, so setuid/setgid binaries and file capabilities cannot raise its privileges (Linux only; accepted and ignored elsewhere). See [Security model](#security-model). |
+| `:no_new_privs` | boolean | `false` | Set `PR_SET_NO_NEW_PRIVS` in the child before exec, so setuid/setgid binaries and file capabilities cannot raise its privileges (Linux only; `true` raises `ArgumentError` elsewhere). See [Security model](#security-model). |
 
 Unknown options raise `ArgumentError` (`Keyword.validate!/2`) instead of being
 silently ignored. `stream!/2` accepts the same options minus `:timeout`,
@@ -625,8 +629,8 @@ What *is* contained, for a child that is merely careless:
   attach to it without `CAP_SYS_PTRACE`.
 - **Opt-in `no_new_privs`.** `no_new_privs: true` stops the child and
   everything it execs from gaining privileges through setuid/setgid binaries
-  or file capabilities. Linux only: on macOS the option is accepted but has
-  no effect, so it is not a security boundary there.
+  or file capabilities. Linux only: elsewhere `no_new_privs: true` raises
+  `ArgumentError`, so code that relies on it cannot silently run without it.
 
 ```elixir
 NetRunner.run(["./untrusted_build_step"], no_new_privs: true, cgroup_path: "net_runner/build")

@@ -520,6 +520,24 @@ static int cgroup_owned = 0;
 
 #define CGROUP_ROOT "/sys/fs/cgroup/"
 
+/* 1 if the cgroup directory dir holds processes of its own, 0 if not, -1 if
+ * its cgroup.procs cannot be read. */
+static int cgroup_has_procs(const char *dir) {
+    char procs[576];
+    int n = snprintf(procs, sizeof(procs), "%s/cgroup.procs", dir);
+    if (n < 0 || (size_t)n >= sizeof(procs)) return -1;
+    int fd = open(procs, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    char c;
+    ssize_t r;
+    do {
+        r = read(fd, &c, 1);
+    } while (r < 0 && errno == EINTR);
+    close(fd);
+    if (r < 0) return -1;
+    return r > 0;
+}
+
 /* Create every ancestor of the leaf (the shared net_runner/ parent and any
  * intermediate components) on demand. EEXIST is success: concurrent spawns
  * into sibling leaves race on the same mkdir, and an ancestor created by an
@@ -528,7 +546,11 @@ static int cgroup_owned = 0;
  * not weaken the ownership guard, which stays on the leaf. 0755 so a
  * delegated user other than the creator can still traverse it. Failure gets
  * its own message so "no permission for cgroups at all" (EACCES on a
- * non-delegated root) is distinguishable from a leaf collision. */
+ * non-delegated root) is distinguishable from a leaf collision.
+ *
+ * An existing ancestor that holds processes is refused: it is another
+ * spawn's live leaf (a nested cgroup_path), whose teardown cgroup.kill is
+ * recursive and would SIGKILL our child and remove our leaf. */
 static int cgroup_create_ancestors(char *full_path) {
     char *rel = full_path + strlen(CGROUP_ROOT);
     for (char *p = strchr(rel, '/'); p != NULL && p[1] != '\0';
@@ -536,14 +558,24 @@ static int cgroup_create_ancestors(char *full_path) {
         *p = '\0';
         int rc = mkdir(full_path, 0755);
         int err = errno;
+        int populated = (rc != 0 && err == EEXIST) ? cgroup_has_procs(full_path) : 0;
         *p = '/';
+        int rel_len = (int)(p - rel);
         if (rc != 0 && err != EEXIST) {
-            int rel_len = (int)(p - rel);
             ERROR_LOG("mkdir(%.*s) failed: %s", (int)(p - full_path), full_path,
                       strerror(err));
             snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
                      "cgroup_setup: cannot create parent cgroup %.*s: %s",
                      rel_len > 160 ? 160 : rel_len, rel, strerror(err));
+            return -1;
+        }
+        if (populated != 0) {
+            snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+                     populated > 0
+                         ? "cgroup_setup: parent cgroup %.*s has live processes "
+                           "(nested cgroup_path)"
+                         : "cgroup_setup: cannot read parent cgroup %.*s",
+                     rel_len > 160 ? 160 : rel_len, rel);
             return -1;
         }
     }
@@ -704,10 +736,13 @@ static void cgroup_cleanup(void) {
                   strerror(errno));
     }
 
-    /* Poll for removal rather than a fixed sleep — the kernel needs a
-     * moment to reap the killed processes. Bail after ~1s (10 * 100ms). */
+    /* Poll for removal: the kernel needs a moment to reap the killed
+     * processes, usually well under a millisecond. Exponential backoff (1, 2,
+     * 4 ... 512 ms) keeps the common case fast — a fixed 100 ms sleep
+     * delayed MSG_CHILD_EXITED by 100 ms whenever the first rmdir raced the
+     * kill — and gives up after the same ~1 s total as before. */
     int err = 0;
-    for (int i = 0; i < 10; i++) {
+    for (useconds_t delay_us = 1000; delay_us <= 512000; delay_us *= 2) {
         if (cgroup_rmdir_tree(full_path, sizeof(full_path)) == 0 ||
             errno == ENOENT) {
             cgroup_owned = 0;
@@ -715,14 +750,30 @@ static void cgroup_cleanup(void) {
         }
         err = errno;
         if (err != EBUSY && err != ENOTEMPTY) break; /* real error */
-        usleep(100000);
+        usleep(delay_us);
+    }
+    if (err == EBUSY || err == ENOTEMPTY) {
+        /* Last attempt after the final sleep. */
+        if (cgroup_rmdir_tree(full_path, sizeof(full_path)) == 0 ||
+            errno == ENOENT) {
+            cgroup_owned = 0;
+            return;
+        }
+        err = errno;
     }
     ERROR_LOG("cgroup_cleanup: %s not removed: %s", full_path, strerror(err));
 }
 #else
+/* Fail closed: a cgroup the caller explicitly asked for cannot be set up
+ * here, and silently running the child unconfined is worse than failing the
+ * spawn (the BEAM already rejects :cgroup_path off Linux; this is the
+ * backstop for a shepherd launched some other way). */
 static int cgroup_setup(pid_t child_pid) {
     (void)child_pid;
-    return 0;
+    if (cgroup_path[0] == '\0') return 0;
+    snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+             "cgroup_setup: cgroups are only supported on Linux");
+    return -1;
 }
 static void cgroup_cleanup(void) {}
 #endif

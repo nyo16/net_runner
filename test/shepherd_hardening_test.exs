@@ -306,11 +306,6 @@ defmodule NetRunner.ShepherdHardeningTest do
       assert status_field(without, "NoNewPrivs") == beam
     end
 
-    test "is accepted on every platform" do
-      assert {"hi\n", 0} = NetRunner.run(["echo", "hi"], no_new_privs: true)
-      assert {"hi\n", 0} = NetRunner.run(["echo", "hi"], no_new_privs: false)
-    end
-
     test "rejects non-booleans at every entry point" do
       for bad <- ["yes", 1, nil] do
         assert_raise ArgumentError, ~r/:no_new_privs must be a boolean/, fn ->

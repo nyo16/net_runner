@@ -103,6 +103,8 @@ defmodule NetRunner.CgroupTest do
       end
     end
 
+    # cgroup_path raises off Linux (S-05), so the prefixing path is Linux-only.
+    @tag :linux_only
     test "places an unprefixed path under net_runner/ with a one-time deprecation warning" do
       # 1.3.x accepted unprefixed paths; 1.4.0 raised on them inside a minor
       # release (issue #24). Until 2.0 they are prefixed instead. This is the
