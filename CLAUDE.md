@@ -15,7 +15,7 @@ mix format --check-formatted            # Check formatting (CI)
 mix compile --warnings-as-errors        # Compile with strict warnings
 mix credo --strict        # Lint with credo
 mix dialyzer              # Static type analysis
-make clean && make all    # Rebuild C code only
+make clean && make all    # Rebuild C code only, into _build/$MIX_ENV/lib/net_runner/priv (MIX_ENV defaults to dev)
 ```
 
 ## Architecture
@@ -73,12 +73,12 @@ Shepherd→BEAM: `MSG_CHILD_STARTED(pid)`, `MSG_CHILD_EXITED(status)`, `MSG_ERRO
 
 - C99, compiled with `-Wall -Wextra -Wformat-security -Wvla -Wshadow`; `-Werror` is opt-in via `WERROR=1` (CI sets it)
 - Platform detection in Makefile: `-D_GNU_SOURCE` (Linux) or `-D_DARWIN_C_SOURCE` (macOS)
-- Two build artifacts: `priv/shepherd` (executable) and `priv/net_runner_nif.so` (shared lib)
+- Two build artifacts in `$MIX_APP_PATH/priv` (`_build/<env>/lib/net_runner/priv`, what `:code.priv_dir(:net_runner)` resolves to): `shepherd` (executable) and `net_runner_nif.so` (shared lib). There is no top-level `priv/`
 - NIF functions run on normal schedulers (no dirty flags, ADR-6); every syscall they reach is bounded
 
 ## Conventions
 
-- Elixir ~> 1.17; CI matrix: Elixir/OTP 1.17.3/27.2, 1.18.3/27.2, 1.20.2/28.3.3, 1.20.2/29.0 on ubuntu x86, 1.20.2/29.0 on ubuntu arm, 1.18.4/28.3.3 on macOS
+- Elixir ≥ 1.17, OTP ≥ 27; CI matrix: Elixir/OTP 1.17.3/27.2, 1.18.3/27.2, 1.19.7/28.3.3, 1.20.2/28.3.3, 1.20.2/29.0 (plus a `--cover` leg) on ubuntu x86, 1.20.2/29.0 on ubuntu arm and macOS, plus Alpine (musl, OTP 27) and ASan/UBSan legs
 - All public API functions have `@doc` and `@spec`
 - Tests are async where possible (`async: true`)
 - Credo strict mode enforced: max cyclomatic complexity 9, max nesting depth 2
