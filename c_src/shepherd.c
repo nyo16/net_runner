@@ -298,8 +298,26 @@ static int remaining_ms(int64_t deadline, int budget_ms, int *spent) {
 #define UDS_WRITE_TIMEOUT_MS 5000
 
 /* Upper bound on waiting for the handshake token on fd 3; matches the BEAM's
- * accept deadline, after which the spawn is abandoned anyway. */
+ * accept deadline, after which the spawn is abandoned anyway. Tests shorten
+ * it with the hidden --token-timeout flag. */
 #define TOKEN_READ_TIMEOUT_MS 10000
+static int token_timeout_ms = TOKEN_READ_TIMEOUT_MS;
+
+/* 1 if the connected UDS peer runs as our effective uid, 0 otherwise
+ * (including when the credentials cannot be read: fail closed). */
+static int peer_is_same_uid(int fd) {
+#ifdef __linux__
+    struct ucred cred;
+    socklen_t len = sizeof(cred);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) return 0;
+    return cred.uid == geteuid();
+#else
+    uid_t uid;
+    gid_t gid;
+    if (getpeereid(fd, &uid, &gid) != 0) return 0;
+    return uid == geteuid();
+#endif
+}
 
 /*
  * Absolute deadline for one bounded POLLOUT wait, initialised lazily so a
@@ -970,17 +988,35 @@ static int teardown(int uds_fd, pid_t child_pid, int report) {
     return -1;
 }
 
+/* Drain the BEAM port channel (fd 3). The BEAM writes only the token there,
+ * so anything after it is discarded; EOF or an error means the port was
+ * closed (BEAM death, or Port.close without the UDS going down). Returns 1
+ * while the channel is open, 0 once it is gone. */
+static int port_channel_open(int port_fd) {
+    char buf[64];
+    for (;;) {
+        ssize_t n = read(port_fd, buf, sizeof(buf));
+        if (n > 0) return 1;
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 1;
+        return 0;
+    }
+}
+
 /*
  * Main event loop using poll().
  *
  * Watches:
  *   - UDS socket for BEAM commands and hangup (BEAM death)
  *   - Signal pipe for SIGCHLD (child death) and termination signals
+ *   - The BEAM port channel (port_fd, fd 3; -1 = not watched): hangup means
+ *     the port was closed, which tears down like a UDS hangup
  *
  * Returns 0 after a normal child exit, -1 after a teardown.
  */
-static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
-    struct pollfd fds[2];
+static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w, int port_fd) {
+    struct pollfd fds[3];
+    nfds_t nfds = port_fd >= 0 ? 3 : 2;
     struct command_buffer cb;
     cb.used = 0;
 
@@ -988,9 +1024,12 @@ static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
     fds[0].events = POLLIN;
     fds[1].fd = signal_pipe[0];
     fds[1].events = POLLIN;
+    fds[2].fd = port_fd;
+    fds[2].events = POLLIN;
+    fds[2].revents = 0;
 
     for (;;) {
-        int ret = poll(fds, 2, -1);
+        int ret = poll(fds, nfds, -1);
         if (ret < 0) {
             if (errno == EINTR) continue;
             ERROR_LOG("poll failed: %s", strerror(errno));
@@ -1020,6 +1059,13 @@ static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
                 return teardown(uds_fd, child_pid, 1);
             }
         }
+
+        if (nfds == 3 && (fds[2].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+            if ((fds[2].revents & POLLNVAL) || !port_channel_open(port_fd)) {
+                DEBUG_LOG("BEAM port closed, killing child %d", child_pid);
+                return teardown(uds_fd, child_pid, 1);
+            }
+        }
     }
 }
 
@@ -1034,6 +1080,15 @@ struct options {
     int no_new_privs;
     char **cmd_args; /* cmd + args, NULL-terminated by the OS */
 };
+
+/* Parse a 1..60000 ms argument into *out. Returns 0, or -1 if invalid. */
+static int parse_ms(const char *arg, int *out) {
+    char *endptr;
+    long val = strtol(arg, &endptr, 10);
+    if (*endptr != '\0' || endptr == arg || val <= 0 || val > 60000) return -1;
+    *out = (int)val;
+    return 0;
+}
 
 /*
  * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] [--cgroup-path <rel>] [--cwd <dir>] [--replace-env <count> <names...>] [--no-new-privs] [--] <cmd> [args...]
@@ -1074,13 +1129,19 @@ static int parse_args(int argc, char *argv[], struct options *opts) {
 
     while (cmd_idx < argc && argv[cmd_idx][0] == '-') {
         if (strcmp(argv[cmd_idx], "--kill-timeout") == 0 && cmd_idx + 1 < argc) {
-            char *endptr;
-            long val = strtol(argv[cmd_idx + 1], &endptr, 10);
-            if (*endptr != '\0' || endptr == argv[cmd_idx + 1] || val <= 0 || val > 60000) {
+            if (parse_ms(argv[cmd_idx + 1], &kill_timeout_ms) != 0) {
                 fprintf(stderr, "error: --kill-timeout must be 1-60000 ms\n");
                 return -1;
             }
-            kill_timeout_ms = (int)val;
+            cmd_idx += 2;
+        } else if (strcmp(argv[cmd_idx], "--token-timeout") == 0 &&
+                   cmd_idx + 1 < argc) {
+            /* Undocumented: tests shorten the token wait instead of
+             * sitting out the 10 s default. */
+            if (parse_ms(argv[cmd_idx + 1], &token_timeout_ms) != 0) {
+                fprintf(stderr, "error: --token-timeout must be 1-60000 ms\n");
+                return -1;
+            }
             cmd_idx += 2;
         } else if (strcmp(argv[cmd_idx], "--pty") == 0) {
             pty_mode = MODE_PTY;
@@ -1172,13 +1233,13 @@ static void ensure_std_fds(void) {
 static int read_token(char *token) {
     size_t got = 0;
     int64_t deadline = monotonic_ms();
-    if (deadline >= 0) deadline += TOKEN_READ_TIMEOUT_MS;
+    if (deadline >= 0) deadline += token_timeout_ms;
     while (got < TOKEN_HEX_LEN) {
         if (term_signal != 0) {
             fprintf(stderr, "error: terminated by signal %d\n", (int)term_signal);
             return -1;
         }
-        int wait_ms = TOKEN_READ_TIMEOUT_MS;
+        int wait_ms = token_timeout_ms;
         if (deadline >= 0) {
             int64_t now = monotonic_ms();
             wait_ms = (now < 0 || now >= deadline) ? 0 : (int)(deadline - now);
@@ -1301,6 +1362,17 @@ static int connect_and_authenticate(const struct options *opts,
     }
 
     set_cloexec(uds_fd);
+
+    /* Authenticate the listener before handing it the token: the socket's
+     * owner must be our own effective uid. The 0700 base directory already
+     * keeps other uids out; this catches a misconfigured or swapped TMPDIR
+     * where it would not. No MSG_ERROR: the peer is not the BEAM, and the
+     * BEAM learns of the failure from the port's exit status. */
+    if (!peer_is_same_uid(uds_fd)) {
+        fprintf(stderr, "error: UDS listener is not owned by our uid\n");
+        close(uds_fd);
+        return -1;
+    }
 
     /* Writes to the UDS are non-blocking + bounded (see write_fully). The
      * event-loop reads already tolerate EAGAIN. */
@@ -1724,7 +1796,8 @@ int main(int argc, char *argv[]) {
     /* Enter event loop. stdin_w is passed by pointer so a CMD_CLOSE_STDIN
      * handled inside the loop is visible here — otherwise the fd would be
      * closed a second time below, racing whatever recycled the number. */
-    int result = event_loop(uds_fd, child_pid, &stdin_w);
+    int result = event_loop(uds_fd, child_pid, &stdin_w,
+                            opts.token_from_fd ? 3 : -1);
 
     if (stdin_w >= 0) close(stdin_w);
     close(uds_fd);

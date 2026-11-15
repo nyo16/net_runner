@@ -7,6 +7,8 @@ defmodule NetRunner.Process.Exec do
   alias NetRunner.Process.{Pipe, Protocol, State}
 
   @accept_timeout 10_000
+  # Per-connection bound on the token read; see verify_token/3.
+  @token_recv_timeout_ms 250
   @uds_base_dir_key {__MODULE__, :uds_base_dir}
   # Upper bound on the retained stderr tail. Above this the "bounded
   # diagnostic tail" turns into an unbounded-ish per-process buffer.
@@ -72,8 +74,10 @@ defmodule NetRunner.Process.Exec do
 
   # Accepts connections until one authenticates or the deadline expires. The
   # listener stays open across failed attempts: a rogue same-uid connect must
-  # cost only that connection, not the whole spawn — the real shepherd's
-  # queued connect is still served on the next accept. On final failure the
+  # cost only that connection, not the whole spawn — each connection gets at
+  # most @token_recv_timeout_ms to present the token (verify_token/3), and the
+  # real shepherd's queued connect is still served on the next accept. On
+  # final failure the
   # shepherd port is closed (the listener is closed by spawn_process's error
   # path via cleanup_listener never running — close it here too).
   defp accept_authenticated(listen_socket, shepherd_port, shepherd_monitor, token, deadline) do
@@ -186,7 +190,9 @@ defmodule NetRunner.Process.Exec do
   # frame. Where the platform exposes peer credentials we additionally assert
   # the peer uid. Closes the connection on failure; the caller keeps
   # listening.
-  defp authenticate_shepherd(conn_socket, token, deadline) do
+  @doc false
+  # Public only for the handshake tests (over a local socket pair).
+  def authenticate_shepherd(conn_socket, token, deadline) do
     with :ok <- verify_peer_uid(conn_socket),
          :ok <- verify_token(conn_socket, token, deadline) do
       :ok
@@ -198,11 +204,15 @@ defmodule NetRunner.Process.Exec do
   end
 
   defp verify_token(conn_socket, token, deadline) do
-    # Bounded by the overall accept deadline: a peer that connects and then
-    # stalls must not extend the spawn beyond @accept_timeout.
+    # Bounded twice: by the overall accept deadline, so a stalling peer cannot
+    # extend the spawn beyond @accept_timeout, and per connection, so a
+    # same-uid peer that connects and stays silent costs the real shepherd
+    # (queued behind it) @token_recv_timeout_ms, not the whole deadline. The
+    # shepherd writes the token right after connect, so it is normally
+    # already buffered when this recv runs.
     remaining = max(deadline - System.monotonic_time(:millisecond), 1)
 
-    case :socket.recv(conn_socket, byte_size(token), [], remaining) do
+    case :socket.recv(conn_socket, byte_size(token), [], min(remaining, @token_recv_timeout_ms)) do
       {:ok, ^token} -> :ok
       {:ok, _other} -> {:error, :shepherd_auth_failed}
       {:error, reason} -> {:error, {:shepherd_auth_failed, reason}}
@@ -824,6 +834,16 @@ defmodule NetRunner.Process.Exec do
     end
   end
 
+  # Linux can mark received fds close-on-exec atomically (MSG_CMSG_CLOEXEC),
+  # so a concurrent fork (os:cmd, another port) never inherits them between
+  # recvmsg and nif_create_fd. Elsewhere nif_create_fd sets FD_CLOEXEC.
+  defp recvmsg_flags do
+    case :os.type() do
+      {:unix, :linux} -> [:cmsg_cloexec]
+      _ -> []
+    end
+  end
+
   @doc """
   Receives file descriptors via SCM_RIGHTS.
 
@@ -836,7 +856,7 @@ defmodule NetRunner.Process.Exec do
   Returns `{:ok, fds, iov_rest}`.
   """
   def receive_fds(socket, pty_mode \\ false) do
-    case :socket.recvmsg(socket, 0, 0, [], @accept_timeout) do
+    case :socket.recvmsg(socket, 0, 0, recvmsg_flags(), @accept_timeout) do
       {:ok, %{ctrl: ctrl, iov: iov}} ->
         fds = extract_fds_from_ctrl(ctrl)
         iov_data = IO.iodata_to_binary(iov)

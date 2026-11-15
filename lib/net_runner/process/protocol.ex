@@ -72,7 +72,9 @@ defmodule NetRunner.Process.Protocol do
   def parse_uds_message(_partial), do: :incomplete
 
   @doc """
-  Extracts MSG_CHILD_STARTED from `iov_rest`, or reads it from the socket.
+  Extracts MSG_CHILD_STARTED from `buffer` (the bytes that followed the
+  SCM_RIGHTS filler), reading more from the socket while the frame is
+  incomplete.
 
   Returns `{:ok, os_pid, carry}`, where `carry` is whatever followed the
   MSG_CHILD_STARTED frame. The UDS is a byte stream, so the shepherd's three
@@ -81,46 +83,39 @@ defmodule NetRunner.Process.Protocol do
   before the BEAM reads therefore delivers its exit status *inside* this
   buffer; discarding the tail loses it permanently, and the caller gets a
   synthetic 137 once the shepherd exits instead of the real status.
+
+  The same stream can also split a frame: a partial prefix in `buffer` is
+  kept and completed, never discarded in favour of 5 fresh bytes (which
+  would misread the frame's tail as an opcode).
   """
-  def extract_child_started(socket, iov_rest, timeout) do
-    case iov_rest do
+  def extract_child_started(socket, buffer, timeout) do
+    case buffer do
       <<@msg_child_started, pid::big-unsigned-32, rest::binary>> ->
         {:ok, pid, rest}
 
-      <<@msg_error, len::big-unsigned-16, msg::binary-size(len), _::binary>> ->
-        {:error, {:shepherd_error, msg}}
+      <<@msg_error, _::binary>> ->
+        complete_shepherd_error(socket, buffer, timeout)
 
       <<@msg_child_exited, status::big-unsigned-32, _::binary>> ->
         {:error, {:child_exited_immediately, status}}
 
-      _ ->
-        # MSG_CHILD_STARTED wasn't in the iov_rest, read from socket
-        read_child_started_from_socket(socket, timeout)
+      <<byte, _::binary>> when byte not in [@msg_child_started, @msg_child_exited] ->
+        {:error, {:unexpected_message, buffer}}
+
+      _incomplete ->
+        case :socket.recv(socket, 0, [], timeout) do
+          {:ok, more} -> extract_child_started(socket, buffer <> more, timeout)
+          {:error, reason} -> {:error, {:recv_failed, reason}}
+        end
     end
   end
 
-  defp read_child_started_from_socket(socket, timeout) do
-    case :socket.recv(socket, 5, [], timeout) do
-      {:ok, <<@msg_child_started, pid::big-unsigned-32>>} ->
-        {:ok, pid, <<>>}
-
-      {:ok, <<@msg_error, _::binary>> = partial} ->
-        # An MSG_ERROR frame is [0x82][len:2][msg:len] — 5 bytes covers the
-        # header plus at most the first 2 message bytes. Read the rest so the
-        # shepherd's diagnostic is delivered whole, not garbled.
-        case recv_shepherd_error(socket, partial, timeout) do
-          {:ok, msg} -> {:error, {:shepherd_error, msg}}
-          :no_error -> {:error, {:unexpected_message, partial}}
-        end
-
-      {:ok, <<@msg_child_exited, status::big-unsigned-32>>} ->
-        {:error, {:child_exited_immediately, status}}
-
-      {:ok, other} ->
-        {:error, {:unexpected_message, other}}
-
-      {:error, reason} ->
-        {:error, {:recv_failed, reason}}
+  # A complete frame is returned without touching the socket; a split one is
+  # completed so the shepherd's diagnostic is delivered whole, not garbled.
+  defp complete_shepherd_error(socket, buffer, timeout) do
+    case recv_shepherd_error(socket, buffer, timeout) do
+      {:ok, msg} -> {:error, {:shepherd_error, msg}}
+      :no_error -> {:error, {:unexpected_message, buffer}}
     end
   end
 

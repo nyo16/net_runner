@@ -1207,6 +1207,9 @@ defmodule NetRunner.Process do
   end
 
   # Parses buffered bytes only — never reads the socket, so it cannot block.
+  # Sticky after an unknown opcode: discard everything, never resynchronise.
+  defp drain_uds_carry(%{protocol_error?: true} = state), do: %{state | uds_carry: <<>>}
+
   defp drain_uds_carry(state) do
     case Protocol.parse_uds_message(state.uds_carry) do
       {:ok, msg, rest} ->
@@ -1215,9 +1218,15 @@ defmodule NetRunner.Process do
       :incomplete ->
         state
 
-      {:error, _reason} ->
-        # Unknown opcode: drop the buffer rather than re-parsing it forever.
-        %{state | uds_carry: <<>>}
+      {:error, {:unknown_message, byte}} ->
+        require Logger
+
+        Logger.warning(
+          "[NetRunner] unknown shepherd frame opcode 0x#{Integer.to_string(byte, 16)}; " <>
+            "ignoring all further shepherd frames for #{inspect(state.cmd)}"
+        )
+
+        %{state | uds_carry: <<>>, protocol_error?: true}
     end
   end
 

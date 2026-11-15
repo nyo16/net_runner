@@ -33,6 +33,12 @@ defmodule NetRunner.Process.State do
     # a frame boundary is not a read boundary. Anything not yet parsed lives
     # here until the next read completes it.
     uds_carry: <<>>,
+    # Set on the first unknown opcode from the shepherd. Sticky, like the
+    # shepherd's own handling of unknown commands: resynchronising could parse
+    # payload bytes of an unknown frame as MSG_CHILD_EXITED. Everything after
+    # it is discarded; the shepherd Port exit (finish_orphaned/2) settles the
+    # process.
+    protocol_error?: false,
     # True while a :continue_writes self-send is in flight; dedupes budget
     # yields so a retry pass over N parked writes queues one resume message,
     # not N.
@@ -61,6 +67,7 @@ defmodule NetRunner.Process.State do
           stderr_tail: binary(),
           stderr_tail_bytes: non_neg_integer(),
           uds_carry: binary(),
+          protocol_error?: boolean(),
           continue_writes_scheduled?: boolean(),
           status: status(),
           stats: Stats.t()

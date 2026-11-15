@@ -59,6 +59,33 @@ defmodule NetRunner.PtyTest do
       assert {:ok, 0} = Proc.await_exit(pid, 10_000)
     end
 
+    # T-17: CMD_SET_WINSIZE split across two UDS writes must be reassembled
+    # by the shepherd's carry buffer, not dropped or misparsed.
+    test "a CMD_SET_WINSIZE frame split across reads still resizes" do
+      script = ~S"""
+      i=0
+      while [ "$(stty size)" != "40 120" ]; do
+        i=$((i + 1))
+        [ "$i" -gt 100 ] && { echo "WINSIZE_UNCHANGED: $(stty size)"; exit 1; }
+        sleep 0.05
+      done
+      echo RESIZED
+      """
+
+      {:ok, pid} = Proc.start("sh", ["-c", script], pty: true)
+      %{uds_socket: socket} = :sys.get_state(pid)
+
+      :ok = :socket.send(socket, <<0x03, 0>>)
+      # Separate reads on the shepherd side: it polls, reads the 2-byte
+      # prefix and must carry it until the rest arrives.
+      Process.sleep(50)
+      :ok = :socket.send(socket, <<40, 0, 120>>)
+
+      output = read_until_eof(pid, "")
+      assert output =~ ~r/^RESIZED/m, "child never saw 40x120: #{inspect(output)}"
+      assert {:ok, 0} = Proc.await_exit(pid, 10_000)
+    end
+
     test "kill PTY process" do
       {:ok, pid} = Proc.start("sleep", ["100"], pty: true)
       :ok = Proc.kill(pid, :sigkill)

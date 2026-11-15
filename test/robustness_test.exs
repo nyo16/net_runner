@@ -94,6 +94,47 @@ defmodule NetRunner.RobustnessTest do
     end
   end
 
+  describe "shepherd command framing (T-17)" do
+    # An unknown opcode makes the shepherd ignore ALL further command bytes
+    # (sticky). 0x01 0x09 after it is the payload of a hypothetical newer
+    # frame and must not run as CMD_KILL SIGKILL; neither may a later,
+    # well-formed CMD_KILL.
+    test "bytes after an unknown opcode are never executed as commands" do
+      {:ok, pid} = Proc.start("sleep", ["100"])
+      on_exit(fn -> Proc.stop(pid) end)
+      os_pid = Proc.os_pid(pid)
+      %{uds_socket: socket} = :sys.get_state(pid)
+
+      :ok = :socket.send(socket, <<0x42, 0x01, 0x09>>)
+      assert :ok = Proc.kill(pid, :sigterm)
+
+      # Negative check: a misparse would have signalled within microseconds.
+      Process.sleep(200)
+      assert os_pid_alive?(os_pid)
+
+      # BEAM-side teardown (UDS hangup) still works.
+      Proc.stop(pid)
+      eventually(fn -> not os_pid_alive?(os_pid) end, 7_000)
+    end
+  end
+
+  describe "shepherd watches its port channel (S-15/F-08)" do
+    # Closing only the Port (fd 3/4) used to leave the shepherd running: it
+    # watched the UDS alone. Port EOF now runs the same teardown ladder.
+    test "closing the shepherd Port tears the child down" do
+      {:ok, pid} = Proc.start("sleep", ["100"], kill_timeout: 200)
+      on_exit(fn -> Proc.stop(pid) end)
+      os_pid = Proc.os_pid(pid)
+      %{shepherd_port: port} = :sys.get_state(pid)
+
+      Port.close(port)
+
+      # The UDS is still up, so the real status arrives: sleep dies on SIGTERM.
+      assert {:ok, 143} = Proc.await_exit(pid, 5_000)
+      eventually(fn -> not os_pid_alive?(os_pid) end)
+    end
+  end
+
   describe "teardown reaches a leader that left its process group (S-13)" do
     # The leader joins a sibling's group while a TERM-ignoring `sleep` keeps
     # the original group populated. kill(-pid) then succeeds without reaching

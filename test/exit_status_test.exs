@@ -172,5 +172,59 @@ defmodule NetRunner.ExitStatusTest do
 
       assert {:ok, ^msg} = Protocol.recv_shepherd_error(beam_side, head, 1_000)
     end
+
+    test "extract_child_started handles every handshake shape" do
+      cases = [
+        # {name, buffer already read, bytes sent afterwards (nil = close), expected}
+        {"split MSG_CHILD_STARTED (A-15)", <<0x80, 0, 0>>, <<0, 42>>, {:ok, 42, <<>>}},
+        {"MSG_CHILD_STARTED read from the socket", <<>>, <<0x80, 0, 0, 0, 7, 0x81>>,
+         {:ok, 7, <<0x81>>}},
+        {"child exited immediately", <<>>, <<0x81, 0, 0, 0, 3>>,
+         {:error, {:child_exited_immediately, 3}}},
+        {"split MSG_ERROR", <<0x82, 0, 5, "he">>, "llo", {:error, {:shepherd_error, "hello"}}},
+        {"MSG_ERROR whose remainder never arrives", <<0x82, 0, 5, "he">>, nil,
+         {:error, {:unexpected_message, <<0x82, 0, 5, "he">>}}},
+        {"unknown opcode", <<>>, <<0x7F, 0, 0, 0, 0>>,
+         {:error, {:unexpected_message, <<0x7F, 0, 0, 0, 0>>}}},
+        {"peer closed before any frame", <<>>, nil, {:error, {:recv_failed, :closed}}}
+      ]
+
+      for {name, buffer, sent, expected} <- cases do
+        {beam_side, shepherd_side} = uds_pair()
+
+        case sent do
+          nil -> :socket.close(shepherd_side)
+          bytes -> :ok = :socket.send(shepherd_side, bytes)
+        end
+
+        assert Protocol.extract_child_started(beam_side, buffer, 1_000) == expected, name
+      end
+    end
+  end
+
+  describe "unknown shepherd frame opcode (N-4)" do
+    import ExUnit.CaptureLog
+
+    # Sticky, like the shepherd's own command parser: after an unknown
+    # opcode nothing is parsed again, so payload bytes of a frame from a
+    # newer protocol can never be misread as MSG_CHILD_EXITED.
+    test "every later frame is ignored, even a valid MSG_CHILD_EXITED" do
+      {:ok, pid} = Proc.start("sleep", ["100"])
+      on_exit(fn -> Proc.stop(pid) end)
+      %{uds_socket: socket} = :sys.get_state(pid)
+
+      inject = fn bytes ->
+        :sys.replace_state(pid, &%{&1 | uds_carry: &1.uds_carry <> bytes})
+        send(pid, {:"$socket", socket, :select, make_ref()})
+        :sys.get_state(pid)
+      end
+
+      log = capture_log(fn -> assert %{protocol_error?: true} = inject.(<<0x7F>>) end)
+      assert log =~ "unknown shepherd frame opcode 0x7F"
+
+      # A separate, later read: still ignored.
+      assert %{status: :running, uds_carry: <<>>} = inject.(<<0x81, 0::big-32>>)
+      assert Proc.alive?(pid)
+    end
   end
 end
