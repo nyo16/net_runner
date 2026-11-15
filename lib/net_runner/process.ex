@@ -40,7 +40,11 @@ defmodule NetRunner.Process do
   # `receive`. @default_read_size each, so ~1 MiB per pass and one extra
   # message per MiB. Without a bound, consume_stderr/1 recurses inside
   # handle_info for as long as the pipe keeps producing and every concurrent
-  # handle_call waits behind it.
+  # handle_call waits behind it. Also the read_batch/3 default.
+  #
+  # This and @write_budget are defaults for the undocumented
+  # :stderr_drain_chunks / :write_budget start options, which exist so tests
+  # can force the yield paths with a budget of 1. Neither is benchmark-pinned.
   @stderr_drain_chunks 16
 
   # Successful write(2) calls a single stdin write may issue before yielding
@@ -59,6 +63,7 @@ defmodule NetRunner.Process do
   # Every option a spawned process understands. Unknown keys raise up front
   # (Keyword.validate!) instead of being silently ignored — a misspelt
   # :stderr_tail_byte or a run/2-level :timeout must not pass unnoticed.
+  # :write_budget and :stderr_drain_chunks are test hooks (see above).
   @process_opts [
     :name,
     :owner,
@@ -69,7 +74,9 @@ defmodule NetRunner.Process do
     :kill_timeout,
     :cwd,
     :env,
-    :no_new_privs
+    :no_new_privs,
+    :write_budget,
+    :stderr_drain_chunks
   ]
 
   @doc """
@@ -353,7 +360,13 @@ defmodule NetRunner.Process do
             _ -> nil
           end
 
-        state = %{state | stats: Stats.new(), owner_ref: owner_ref}
+        state = %{
+          state
+          | stats: Stats.new(),
+            owner_ref: owner_ref,
+            write_budget: Keyword.get(opts, :write_budget, @write_budget),
+            stderr_drain_chunks: Keyword.get(opts, :stderr_drain_chunks, @stderr_drain_chunks)
+        }
 
         # Register with watcher for belt-and-suspenders cleanup. Keep the pid:
         # once the exit status is delivered the Watcher is told to stand down,
@@ -747,7 +760,8 @@ defmodule NetRunner.Process do
     {:reply, :ok, commit_write(state, written, calls)}
   end
 
-  defp write_loop(data, from, state, written, calls) when calls >= @write_budget do
+  defp write_loop(data, from, %{write_budget: budget} = state, written, calls)
+       when calls >= budget do
     # Budget exhausted: a fast-draining child would otherwise keep this loop
     # occupying the GenServer for the whole payload. Park the caller with the
     # remaining bytes and resume from the mailbox, letting queued calls
@@ -961,7 +975,7 @@ defmodule NetRunner.Process do
       {state, _budget} =
         state.operations
         |> Operations.pending_by_type(:write)
-        |> Enum.reduce({state, @write_budget}, &retry_pending_write/2)
+        |> Enum.reduce({state, state.write_budget}, &retry_pending_write/2)
 
       state
     end
@@ -1093,7 +1107,7 @@ defmodule NetRunner.Process do
   end
 
   defp consume_stderr(state) do
-    consume_stderr(state, @stderr_drain_chunks, state.stderr_tail, 0)
+    consume_stderr(state, state.stderr_drain_chunks, state.stderr_tail, 0)
   end
 
   # Budget exhausted: yield to `receive` so concurrent handle_call work is not

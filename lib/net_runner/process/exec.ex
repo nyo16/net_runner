@@ -381,6 +381,8 @@ defmodule NetRunner.Process.Exec do
     validate_kill_timeout!(Keyword.get(opts, :kill_timeout, @default_kill_timeout_ms))
     validate_cwd!(Keyword.get(opts, :cwd, nil))
     validate_no_new_privs!(Keyword.get(opts, :no_new_privs, false))
+    validate_budget!(:write_budget, Keyword.get(opts, :write_budget))
+    validate_budget!(:stderr_drain_chunks, Keyword.get(opts, :stderr_drain_chunks))
     environment = normalize_env!(Keyword.get(opts, :env, nil))
     require_linux_for_isolation!(opts)
     warn_if_prefixed(requested_cgroup_path, Keyword.get(opts, :cgroup_path, nil))
@@ -602,6 +604,15 @@ defmodule NetRunner.Process.Exec do
 
   defp validate_no_new_privs!(value) do
     raise ArgumentError, ":no_new_privs must be a boolean, got: #{inspect(value)}"
+  end
+
+  # Test hooks (:write_budget, :stderr_drain_chunks): a budget below 1 would
+  # never make progress.
+  defp validate_budget!(_key, nil), do: :ok
+  defp validate_budget!(_key, n) when is_integer(n) and n >= 1, do: :ok
+
+  defp validate_budget!(key, value) do
+    raise ArgumentError, "#{inspect(key)} must be a positive integer, got: #{inspect(value)}"
   end
 
   defp validate_cwd!(nil), do: :ok

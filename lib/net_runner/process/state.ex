@@ -46,6 +46,9 @@ defmodule NetRunner.Process.State do
     # The validated :cgroup_path, or nil. Only consulted when the shepherd
     # dies without reporting: the BEAM then removes the leaf itself.
     cgroup_path: nil,
+    # Yield budgets (see NetRunner.Process); overridable for tests only.
+    write_budget: 16,
+    stderr_drain_chunks: 16,
     status: :running,
     stats: %Stats{}
   ]
@@ -72,6 +75,8 @@ defmodule NetRunner.Process.State do
           uds_carry: binary(),
           protocol_error?: boolean(),
           cgroup_path: String.t() | nil,
+          write_budget: pos_integer(),
+          stderr_drain_chunks: pos_integer(),
           continue_writes_scheduled?: boolean(),
           status: status(),
           stats: Stats.t()
