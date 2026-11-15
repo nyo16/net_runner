@@ -48,6 +48,7 @@ defmodule NetRunner.Stream do
     :cwd,
     :env,
     :no_new_privs,
+    :pipe_size,
     :owner,
     :name
   ]

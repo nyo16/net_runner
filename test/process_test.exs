@@ -240,13 +240,36 @@ defmodule NetRunner.ProcessTest do
     # one 384-page budget per spawn keeps ~42 concurrent spawns under the
     # default pipe-user-pages-soft. 1032 is F_GETPIPE_SZ.
     @tag :linux_only
-    test "the child sees the shepherd-grown pipe sizes on fds 0, 1 and 2" do
+    test "pipe_size: :grown (default) grows fds 0/1/2; :default keeps the kernel size" do
       script = ~S|print join(" ", map { fcntl($_, 1032, 0) + 0 } \*STDIN, \*STDOUT, \*STDERR)|
 
       if System.find_executable("perl") do
         assert {"262144 1048576 262144", 0} = NetRunner.run(["perl", "-e", script])
+
+        assert {"65536 65536 65536", 0} =
+                 NetRunner.run(["perl", "-e", script], pipe_size: :default)
+
+        # The Daemon defaults to :default.
+        Process.flag(:trap_exit, true)
+        parent = self()
+
+        {:ok, daemon} =
+          NetRunner.Daemon.start_link(
+            cmd: "perl",
+            args: ["-e", script],
+            on_output: &send(parent, {:sizes, &1})
+          )
+
+        assert_receive {:sizes, "65536 65536 65536"}, 5_000
+        assert_receive {:EXIT, ^daemon, {:shutdown, {:exit_status, 0}}}, 5_000
       else
         degraded_note("pipe size test skipped: perl not found")
+      end
+    end
+
+    test "an invalid :pipe_size raises" do
+      assert_raise ArgumentError, ~r/:pipe_size must be :grown or :default/, fn ->
+        NetRunner.run(["true"], pipe_size: :huge)
       end
     end
   end

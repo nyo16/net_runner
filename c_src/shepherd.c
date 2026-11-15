@@ -1129,6 +1129,7 @@ struct options {
     const char *child_cwd;
     int token_from_fd;
     int no_new_privs;
+    int default_pipe_size;
     char **cmd_args; /* cmd + args, NULL-terminated by the OS */
 };
 
@@ -1142,7 +1143,7 @@ static int parse_ms(const char *arg, int *out) {
 }
 
 /*
- * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] [--cgroup-path <rel>] [--cwd <dir>] [--replace-env <count> <names...>] [--no-new-privs] [--] <cmd> [args...]
+ * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] [--cgroup-path <rel>] [--cwd <dir>] [--replace-env <count> <names...>] [--no-new-privs] [--default-pipe-size] [--] <cmd> [args...]
  *
  *   uds_path:       Absolute path to the UDS listener socket created by the BEAM
  *   --kill-timeout:  SIGTERM->SIGKILL escalation timeout in ms (default 5000)
@@ -1153,6 +1154,8 @@ static int parse_ms(const char *arg, int *out) {
  *   --replace-env:  Count followed by the environment names the child keeps
  *   --no-new-privs: set PR_SET_NO_NEW_PRIVS in the child before exec (Linux;
  *                   accepted and ignored elsewhere)
+ *   --default-pipe-size: keep the kernel's default pipe sizes instead of
+ *                   growing stdin/stdout/stderr (Linux; no-op elsewhere)
  *   cmd:            Command to execute
  *   args:           Arguments for the command
  *
@@ -1163,7 +1166,7 @@ static int parse_args(int argc, char *argv[], struct options *opts) {
         fprintf(stderr,
                 "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] "
                 "[--cgroup-path <rel>] [--cwd <dir>] [--replace-env <count> <names...>] "
-                "[--no-new-privs] [--] <cmd> [args...]\n");
+                "[--no-new-privs] [--default-pipe-size] [--] <cmd> [args...]\n");
         return -1;
     }
 
@@ -1206,6 +1209,9 @@ static int parse_args(int argc, char *argv[], struct options *opts) {
             cmd_idx += 1;
         } else if (strcmp(argv[cmd_idx], "--no-new-privs") == 0) {
             opts->no_new_privs = 1;
+            cmd_idx += 1;
+        } else if (strcmp(argv[cmd_idx], "--default-pipe-size") == 0) {
+            opts->default_pipe_size = 1;
             cmd_idx += 1;
         } else if (strcmp(argv[cmd_idx], "--cwd") == 0 && cmd_idx + 1 < argc) {
             if (argv[cmd_idx + 1][0] == '\0') {
@@ -1779,10 +1785,15 @@ static pid_t spawn_pipe(int uds_fd, const struct options *opts,
      * about 22% slower; stdout-only growth cost 35-56% on those rows
      * (bench/LINUX_VERIFICATION.md). Best effort: the kernel caps sizes at
      * /proc/sys/fs/pipe-max-size and may refuse growth, in which case the
-     * default stands. macOS has no equivalent knob. */
-    (void)fcntl(stdout_pipe[0], F_SETPIPE_SZ, 1 << 20);
-    (void)fcntl(stderr_pipe[0], F_SETPIPE_SZ, 1 << 18);
-    (void)fcntl(stdin_pipe[1], F_SETPIPE_SZ, 1 << 18);
+     * default stands. macOS has no equivalent knob. --default-pipe-size
+     * (pipe_size: :default, the Daemon default) skips growth entirely for
+     * long-lived low-volume children that would otherwise hold 384 pages
+     * of the uid's budget for their whole lifetime. */
+    if (!opts->default_pipe_size) {
+        (void)fcntl(stdout_pipe[0], F_SETPIPE_SZ, 1 << 20);
+        (void)fcntl(stderr_pipe[0], F_SETPIPE_SZ, 1 << 18);
+        (void)fcntl(stdin_pipe[1], F_SETPIPE_SZ, 1 << 18);
+    }
 #endif
 
     struct child_plan plan = {

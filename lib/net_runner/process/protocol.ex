@@ -176,7 +176,8 @@ defmodule NetRunner.Process.Protocol do
         flag_if(Keyword.get(opts, :pty, false), ["--pty"]) ++
         value_flag("--cgroup-path", Keyword.get(opts, :cgroup_path)) ++
         value_flag("--cwd", Keyword.get(opts, :cwd)) ++
-        flag_if(Keyword.get(opts, :no_new_privs, false), ["--no-new-privs"])
+        flag_if(Keyword.get(opts, :no_new_privs, false), ["--no-new-privs"]) ++
+        flag_if(Keyword.get(opts, :pipe_size, :grown) == :default, ["--default-pipe-size"])
 
     {environment_flags, port_environment} = environment_options(Keyword.get(opts, :env, nil))
 

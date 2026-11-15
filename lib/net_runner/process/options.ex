@@ -23,6 +23,7 @@ defmodule NetRunner.Process.Options do
     :cwd,
     :env,
     :no_new_privs,
+    :pipe_size,
     :write_budget,
     :stderr_drain_chunks
   ]
@@ -81,6 +82,7 @@ defmodule NetRunner.Process.Options do
     validate_kill_timeout!(Keyword.get(opts, :kill_timeout, @default_kill_timeout_ms))
     validate_cwd!(Keyword.get(opts, :cwd, nil))
     validate_no_new_privs!(Keyword.get(opts, :no_new_privs, false))
+    validate_pipe_size!(Keyword.get(opts, :pipe_size, :grown))
     validate_budget!(:write_budget, Keyword.get(opts, :write_budget))
     validate_budget!(:stderr_drain_chunks, Keyword.get(opts, :stderr_drain_chunks))
     environment = normalize_env!(Keyword.get(opts, :env, nil))
@@ -110,6 +112,15 @@ defmodule NetRunner.Process.Options do
     end
 
     :ok
+  end
+
+  # :grown (default) lets the shepherd grow the Linux pipes (stdout 1 MiB,
+  # stdin/stderr 256 KiB: 384 pages of the uid's pipe budget for the pipes'
+  # lifetime); :default keeps the kernel's 64 KiB. No effect off Linux.
+  defp validate_pipe_size!(mode) when mode in [:grown, :default], do: :ok
+
+  defp validate_pipe_size!(mode) do
+    raise ArgumentError, ":pipe_size must be :grown or :default, got: #{inspect(mode)}"
   end
 
   # 1.3.x accepted any relative :cgroup_path; 1.4.0 started requiring the

@@ -116,6 +116,26 @@ When the Elixir consumer stops reading:
 3. Child naturally slows down or stops producing
 4. No memory growth on the BEAM side
 
+### Opting out per spawn: `pipe_size:`
+
+`pipe_size: :default` keeps the kernel's 64 KiB pipes and charges nothing
+beyond them; `:grown` (the default for `run/2`, `stream/2` and
+`NetRunner.Process`) is the growth described above. `NetRunner.Daemon`
+defaults to `:default`: a Daemon holds its pipes for its whole lifetime, and a
+few dozen grown daemons would keep the whole uid on 8 KiB pipes. The option
+has no effect off Linux.
+
+The cost is throughput. Linux Docker (`elixir:1.18`, OrbStack kernel 7.2,
+`MIX_ENV=prod`), medians of 5 samples, 3 runs, 2026-11-15:
+
+| Row | `:grown` (MB/s) | `:default` (MB/s) |
+|---|---|---|
+| 64 MiB `dd` via `stream!/2` | 4249–5087 | 1555–1629 |
+| 16 MiB through `cat` via `run/2` | 1670–2296 | 992–1047 |
+| 16 MiB stderr drain | 2429–2701 | 1313–1381 |
+
+A Daemon that streams bulk data should pass `process_opts: [pipe_size: :grown]`.
+
 ## Comparison with Alternatives
 
 | Approach | Backpressure | Memory Safety |

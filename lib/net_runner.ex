@@ -95,8 +95,14 @@ defmodule NetRunner do
     * `:no_new_privs` - when `true`, the child calls
       `prctl(PR_SET_NO_NEW_PRIVS, 1)` before exec, so neither it nor anything
       it executes can gain privileges through setuid/setgid binaries or file
-      capabilities. Linux only; accepted and ignored elsewhere. Default
-      `false`. Must be a boolean.
+      capabilities. Linux only; `true` raises `ArgumentError` elsewhere.
+      Default `false`. Must be a boolean.
+    * `:pipe_size` - `:grown` (default) lets the shepherd grow the Linux
+      pipes (stdout 1 MiB, stdin/stderr 256 KiB) for throughput; `:default`
+      keeps the kernel's 64 KiB. Grown pipes are charged to the user's
+      `pipe-user-pages-soft` budget for as long as they live, so long-lived,
+      low-volume children should use `:default` (`NetRunner.Daemon` does).
+      No effect off Linux.
 
   Also accepted and passed through to the underlying process: `:pty`,
   `:cgroup_path`, `:kill_timeout`.
@@ -145,7 +151,8 @@ defmodule NetRunner do
     :cgroup_path,
     :kill_timeout,
     :env,
-    :no_new_privs
+    :no_new_privs,
+    :pipe_size
   ]
 
   @spec run(NetRunner.Command.t() | [String.t()], keyword()) ::
@@ -317,7 +324,7 @@ defmodule NetRunner do
     * `:stderr_tail_bytes` - cap on the retained stderr tail, as in `run/2`
     * `:pty`, `:cgroup_path`, `:kill_timeout` - passed through to the
       underlying `NetRunner.Process`, as in `run/2`
-    * `:cwd`, `:env`, `:no_new_privs` - as in `run/2`
+    * `:cwd`, `:env`, `:no_new_privs`, `:pipe_size` - as in `run/2`
     * `:name`, `:owner` - passed to `NetRunner.Process.start_link/3`; the
       stream re-registers the consumer as owner once iteration starts
 

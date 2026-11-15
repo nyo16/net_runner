@@ -57,7 +57,9 @@ defmodule NetRunner.Daemon do
   Starts a supervised daemon. Options: `:cmd` (required binary), `:args`,
   `:on_output` (see `t:on_output/0`; `nil` means `:discard`), `:process_opts`
   (forwarded to `NetRunner.Process.start_link/3`; `:stderr` is forced to
-  `:disabled`), and `:name`. A missing `:cmd`, an invalid `:on_output` or
+  `:disabled`, and `:pipe_size` defaults to `:default` rather than `:grown`
+  because a Daemon holds its pipes for its whole lifetime), and `:name`. A
+  missing `:cmd`, an invalid `:on_output` or
   any other malformed option raises `ArgumentError` in the caller.
 
   On shutdown the child gets SIGTERM, then SIGKILL after
@@ -124,10 +126,16 @@ defmodule NetRunner.Daemon do
   # internal stderr consumer. The Daemon's own drain task is then the sole
   # reader of the stderr pipe, so on_output receives the full stream in
   # order rather than racing the internal consumer for chunks.
+  #
+  # pipe_size defaults to :default: a Daemon holds its pipes for its whole
+  # lifetime, and grown Linux pipes would keep 384 pages of the uid's
+  # pipe-user-pages-soft budget for that long (PERF-1). Callers that stream
+  # bulk data through a Daemon can pass pipe_size: :grown.
   defp process_opts(daemon_opts) do
     daemon_opts
     |> Keyword.get(:process_opts, [])
     |> Keyword.put(:stderr, :disabled)
+    |> Keyword.put_new(:pipe_size, :default)
   end
 
   @doc "OS pid of the child, answered from Daemon state (no hop into the Process)."
