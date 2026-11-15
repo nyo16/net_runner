@@ -390,11 +390,14 @@ defmodule NetRunner do
         new_collected = collected + chunks_size(chunks)
 
         if max_size && new_collected > max_size do
-          # Flatten once and cut at the limit; identical bytes to truncating
-          # the overflowing chunk in place, on a path that is already an error.
+          # Flatten exactly the first max_size bytes: `acc` holds `collected`
+          # (≤ max_size) of them, the rest come from this batch. Flattening a
+          # list always builds a fresh binary, so the partial pins nothing; a
+          # binary_part of the whole flattened buffer kept up to max_size plus
+          # one read alive for as long as the caller held the error (PERF-5).
           # The partial is always a binary, whatever the :output mode.
-          partial = IO.iodata_to_binary([acc | chunks])
-          {:error, {:max_output_exceeded, binary_part(partial, 0, max_size)}}
+          partial = IO.iodata_to_binary([acc | take_bytes(chunks, max_size - collected)])
+          {:error, {:max_output_exceeded, partial}}
         else
           # Nested iodata — no Enum.reverse, no per-batch list rebuild; the
           # single flatten (if :binary mode asks for one) happens at :eof.
@@ -419,6 +422,12 @@ defmodule NetRunner do
   defp finalize_output(acc, :iodata), do: acc
 
   defp chunks_size(chunks), do: Enum.reduce(chunks, 0, &(byte_size(&1) + &2))
+
+  # The first `n` bytes of `chunks` as iodata (n < their total).
+  defp take_bytes([chunk | rest], n) when byte_size(chunk) < n,
+    do: [chunk | take_bytes(rest, n - byte_size(chunk))]
+
+  defp take_bytes([chunk | _rest], n), do: [binary_part(chunk, 0, n)]
 
   defp run_io(pid, io) do
     case read_all_with_limits(pid, io.max_output_size, io.output) do

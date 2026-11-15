@@ -33,6 +33,16 @@ defmodule NetRunnerTest do
     test "output under :max_output_size is returned whole" do
       assert {"hello\n", 0} = NetRunner.run(~w(echo hello), max_output_size: 1_000)
     end
+
+    test "a truncated partial pins only its own bytes (PERF-5)" do
+      for max <- [1, 1_000, 100_000] do
+        assert {:error, {:max_output_exceeded, partial}} =
+                 NetRunner.run(["yes"], max_output_size: max)
+
+        assert byte_size(partial) == max
+        assert :binary.referenced_byte_size(partial) == max
+      end
+    end
   end
 
   describe "stream!/2" do
