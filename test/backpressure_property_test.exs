@@ -4,7 +4,8 @@ defmodule NetRunner.BackpressurePropertyTest do
 
   alias NetRunner.Process, as: Proc
 
-  # Pipe capacity is 64 KiB (macOS) / 1 MiB (Linux, grown by the shepherd).
+  # Pipe capacity is 64 KiB (macOS) / stdin 256 KiB, stdout 1 MiB (Linux,
+  # grown by the shepherd).
   # Chunk sizes range from empty up to ~3x the 64 KiB capacity so runs cross
   # every interesting boundary: sub-chunk, exactly-full pipe, and multi-pass
   # writes that must park and resume without duplicating or dropping bytes.

@@ -8,14 +8,13 @@ exclude =
 
 ExUnit.start(exclude: exclude)
 
-# Clean up any stale UDS sockets left behind by previous test runs that
-# crashed before cleanup_listener could remove them.
-defmodule NetRunner.TestCleanup do
-  def purge_stale_sockets do
-    pattern = Path.join(System.tmp_dir!(), "net_runner_*.sock")
-    pattern |> Path.wildcard() |> Enum.each(&File.rm/1)
+# Spawn sockets live in one private net_runner_<random>/ directory per VM
+# (Exec.uds_base_dir); each socket file is removed by its spawn. Remove this
+# VM's directory after the suite so test runs do not accumulate empty
+# directories in the temp dir.
+ExUnit.after_suite(fn _ ->
+  case :persistent_term.get({NetRunner.Process.Exec, :uds_base_dir}, nil) do
+    {dir, _uid} -> File.rm_rf(dir)
+    nil -> :ok
   end
-end
-
-NetRunner.TestCleanup.purge_stale_sockets()
-ExUnit.after_suite(fn _ -> NetRunner.TestCleanup.purge_stale_sockets() end)
+end)

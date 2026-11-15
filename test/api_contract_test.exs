@@ -39,6 +39,22 @@ defmodule NetRunner.ApiContractTest do
     end
   end
 
+  describe "Stream teardown honours :kill_timeout (N-2)" do
+    # The child closes stdout at once (the stream reaches EOF immediately) but
+    # ignores SIGTERM and keeps running, so teardown takes exactly the EOF
+    # grace before SIGKILL: the default is 1_000 ms, :kill_timeout replaces it.
+    test "the EOF grace is the caller's :kill_timeout" do
+      script = "exec 1>&-; trap '' TERM; while :; do sleep 0.05; done"
+
+      {us, []} =
+        :timer.tc(fn ->
+          ["sh", "-c", script] |> NetRunner.stream!(kill_timeout: 100) |> Enum.to_list()
+        end)
+
+      assert us < 800_000, "stream teardown took #{div(us, 1000)} ms; :kill_timeout ignored"
+    end
+  end
+
   describe "PTY contracts (A-4)" do
     test "set_window_size/3 on a pipe-mode process is an error, not a silent :ok" do
       {:ok, pid} = Proc.start("sleep", ["100"])

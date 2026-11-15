@@ -259,9 +259,10 @@ defmodule NetRunner.DaemonTest do
     # terminate/2, which then burned the supervisor's 5_000 ms shutdown budget
     # before the SIGTERM/SIGKILL escalation could run.
     test "control calls stay responsive while the child refuses to read stdin" do
-      # `sleep` never reads stdin, so 4 MiB overflows any pipe buffer
-      # (including the shepherd's 256 KiB F_SETPIPE_SZ stdin on Linux) and the
-      # write parks in the Process GenServer for the whole test.
+      # `sleep` never reads stdin, so 4 MiB overflows any pipe buffer (a
+      # Daemon keeps the kernel's 64 KiB by default; even grown, Linux stdin
+      # is 256 KiB) and the write parks in the Process GenServer for the whole
+      # test.
       {:ok, daemon} = Daemon.start_link(cmd: "sleep", args: ["100"])
       {:ok, quiet} = Daemon.start_link(cmd: "sleep", args: ["100"])
       writer = Task.async(fn -> Daemon.write(daemon, :binary.copy(<<0>>, 4_194_304)) end)

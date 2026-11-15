@@ -15,14 +15,44 @@ defmodule NetRunner.Process.Cgroup do
   # Same schedule as the shepherd's cgroup_cleanup: 1, 2, 4 ... 512 ms, ~1 s.
   @max_delay_ms 512
 
+  @typedoc "A leaf this spawn created: its path and the inode it had then."
+  @type leaf :: {String.t(), non_neg_integer()}
+
   @doc """
-  Kills everything left in the leaf at `path` (relative to the cgroup v2
-  root) and removes it, sub-cgroups first. Logs and returns
-  `{:error, reason}` when the leaf cannot be removed within ~1 s.
+  Records the identity of the leaf at `path`, right after a successful spawn
+  (the shepherd created it before MSG_CHILD_STARTED). `nil` when there is no
+  cgroup or it cannot be stat'ed, in which case no cleanup is ever attempted.
   """
-  @spec remove_orphaned_leaf(String.t()) :: :ok | {:error, File.posix()}
-  def remove_orphaned_leaf(path) do
-    leaf = @root <> path
+  @spec identify(String.t() | nil) :: leaf() | nil
+  def identify(nil), do: nil
+
+  def identify(path) do
+    case File.stat(@root <> path) do
+      {:ok, %File.Stat{inode: inode}} -> {path, inode}
+      {:error, _} -> nil
+    end
+  end
+
+  @doc """
+  Kills everything left in `leaf` and removes it, sub-cgroups first. Does
+  nothing when the path now names a different cgroup than the one recorded
+  by `identify/1`: a shepherd that died after removing its own leaf leaves
+  the path free for another spawn, whose processes must not be killed. Logs
+  and returns `{:error, reason}` when the leaf cannot be removed within ~1 s.
+  """
+  @spec remove_orphaned_leaf(leaf()) :: :ok | :not_ours | {:error, File.posix()}
+  def remove_orphaned_leaf({path, inode}) do
+    full = @root <> path
+
+    case File.stat(full) do
+      {:ok, %File.Stat{inode: ^inode}} -> kill_and_remove(path, full)
+      {:ok, _other} -> :not_ours
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp kill_and_remove(path, leaf) do
     # Recursive: also reaches descendants that left the child's process
     # group (setsid daemonisers), which the BEAM's group kill cannot.
     _ = File.write(Path.join(leaf, "cgroup.kill"), "1")

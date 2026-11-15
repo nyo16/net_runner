@@ -7,7 +7,7 @@ defmodule NetRunner.Process.Exec do
   # shepherd argv grammar) in NetRunner.Process.Protocol.
 
   alias NetRunner.Nif
-  alias NetRunner.Process.{Pipe, Protocol, State}
+  alias NetRunner.Process.{Cgroup, Pipe, Protocol, State}
 
   @accept_timeout 10_000
   # Per-connection bound on the token read; see verify_token/3.
@@ -331,7 +331,7 @@ defmodule NetRunner.Process.Exec do
       pty_mode: pty_mode,
       stderr_mode: stderr_mode,
       stderr_tail_bytes: Keyword.get(opts, :stderr_tail_bytes, 8_192),
-      cgroup_path: Keyword.get(opts, :cgroup_path),
+      cgroup: Cgroup.identify(Keyword.get(opts, :cgroup_path)),
       uds_carry: carry,
       status: :running
     }

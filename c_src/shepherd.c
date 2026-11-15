@@ -4,7 +4,8 @@
  * Lifecycle:
  *   1. BEAM opens this binary via Port.open with :nouse_stdio
  *   2. Shepherd reads the handshake token from fd 3, connects to the BEAM's
- *      UDS listener (path passed as argv[1]) and echoes the token
+ *      UDS listener (path passed as argv[1]), checks that the listener runs
+ *      as its own uid (SO_PEERCRED / getpeereid) and echoes the token
  *   3. Shepherd forks the child. The child takes its own process group (pipe
  *      mode) or session (PTY mode), resets its signal state and parks on the
  *      exec gate
@@ -15,10 +16,12 @@
  *   5. Enters a poll() loop watching:
  *      - UDS for commands from BEAM (KILL, CLOSE_STDIN, SET_WINSIZE)
  *      - Signal pipe for SIGCHLD (child death) and termination signals
+ *      - The port channel (fd 3): EOF/HUP means the Port was closed
  *   6. On child death: sweep the child's process group, reap, clean up the
  *      cgroup, send MSG_CHILD_EXITED, exit
- *   7. On BEAM death (UDS hangup) or a termination signal: SIGTERM the
- *      group, wait up to kill_timeout, SIGKILL the group, reap, clean up
+ *   7. On BEAM death (UDS hangup or port-channel EOF) or a termination
+ *      signal: SIGTERM the group and leader, wait up to kill_timeout, SIGKILL
+ *      both, reap, clean up
  *
  * The shepherd NEVER calls execvp on itself - it stays alive as a watchdog.
  */
@@ -863,15 +866,13 @@ static void signal_group_and_leader(pid_t child_pid, int sig) {
 
 /* Reap child_pid after it was sent SIGKILL. Bounded — a child wedged in
  * uninterruptible kernel sleep (D-state) never exits, and we must not hang
- * the shepherd on it. A leader still alive after the first wait gets a
- * direct SIGKILL (it is unreaped, so its pid is pinned) and a second wait:
- * 137 is only ever reported for a leader with a SIGKILL pending, which the
- * kernel completes even out of D-state. */
+ * the shepherd on it. Every caller has either signalled the leader itself
+ * (signal_group_and_leader) or observed its exit, so 128 + SIGKILL is only
+ * ever reported for a leader with a SIGKILL pending, which the kernel
+ * completes once it leaves D-state. A second SIGKILL and wait would only
+ * stretch a wedged teardown. */
 static int reap_killed_child(pid_t child_pid) {
-    if (!wait_for_exit(child_pid, REAP_TIMEOUT_MS)) {
-        (void)kill(child_pid, SIGKILL);
-        (void)wait_for_exit(child_pid, REAP_TIMEOUT_MS);
-    }
+    (void)wait_for_exit(child_pid, REAP_TIMEOUT_MS);
     int status;
     pid_t r;
     do {

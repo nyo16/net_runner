@@ -61,6 +61,10 @@ defmodule NetRunner.Process do
   # the drain budget above, which merely shares the number.
   @read_batch_chunks 16
 
+  # Stderr-tail reads smaller than this merge into the previous queue entry
+  # (see push_tail_chunk/2), bounding per-entry overhead for tiny writes.
+  @stderr_tail_coalesce_bytes 4_096
+
   # Graceful stop budget for stop/1. terminate/2 only closes FDs and a Port,
   # so this is a backstop against a wedged server, not an expected wait.
   @stop_timeout_ms 5_000
@@ -71,13 +75,16 @@ defmodule NetRunner.Process do
   Starts the process GenServer linked to the caller.
 
   Malformed options — unknown keys or invalid values for `:stderr`,
-  `:stderr_tail_bytes`, `:cgroup_path`, `:kill_timeout`, `:cwd`, `:env` or
-  `:no_new_privs` — are programmer errors and raise `ArgumentError` here, in
-  the caller, matching every other NetRunner entry point. `{:error, reason}`
-  is reserved for runtime spawn failures (invalid command bytes, shepherd
-  handshake errors, ...).
+  `:stderr_tail_bytes`, `:cgroup_path`, `:kill_timeout`, `:cwd`, `:env`,
+  `:no_new_privs` or `:pipe_size` — are programmer errors and raise
+  `ArgumentError` here, in the caller, matching every other NetRunner entry
+  point. So do `:cgroup_path` and `no_new_privs: true` off Linux, where the
+  isolation they ask for does not exist. `{:error, reason}` is reserved for
+  runtime spawn failures (invalid command bytes, shepherd handshake errors,
+  ...).
 
-  `:cwd`, `:env` and `:no_new_privs` behave as described in `NetRunner.run/2`.
+  `:cwd`, `:env`, `:no_new_privs` and `:pipe_size` behave as described in
+  `NetRunner.run/2`.
   """
   @spec start_link(String.t(), [String.t()], keyword()) :: GenServer.on_start()
   def start_link(cmd, args \\ [], opts \\ []) do
@@ -618,7 +625,8 @@ defmodule NetRunner.Process do
   #
   # Once the shepherd Port is dead the pid IS recyclable: an orphaned child
   # is reaped by PID 1 the moment it exits. The Port's exit message settles
-  # the process (finish_orphaned/2, which never kills by number), but a
+  # the process (finish_orphaned/2, which signals the process group and the
+  # leader's pidfd but never the leader by pid number), but a
   # kill/2 queued ahead of that message still lands here. On Linux the
   # shepherd hands over a pidfd, which names the process itself rather than
   # a pid number, so the direct path is race-free there unless the kernel
@@ -1045,11 +1053,28 @@ defmodule NetRunner.Process do
   end
 
   defp append_stderr_tail({queue, size}, cap, data) do
-    trim_stderr_tail(:queue.in(data, queue), size + byte_size(data), cap)
+    trim_stderr_tail(push_tail_chunk(queue, data), size + byte_size(data), cap)
   end
 
-  # Each chunk here is smaller than `cap`, so a sliced front chunk pins at
-  # most `cap` bytes of its parent: retention stays below 2 × cap.
+  # An unbuffered child writing a line at a time hands us tiny reads; one
+  # queue cell each would cost ~40 bytes of overhead per few bytes kept, many
+  # times the cap. Small chunks merge into the rear entry (a fresh binary, so
+  # it pins nothing) until it reaches @stderr_tail_coalesce_bytes.
+  defp push_tail_chunk(queue, data) when byte_size(data) < @stderr_tail_coalesce_bytes do
+    case :queue.out_r(queue) do
+      {{:value, rear}, rest}
+      when byte_size(rear) + byte_size(data) <= @stderr_tail_coalesce_bytes ->
+        :queue.in(<<rear::binary, data::binary>>, rest)
+
+      _ ->
+        :queue.in(data, queue)
+    end
+  end
+
+  defp push_tail_chunk(queue, data), do: :queue.in(data, queue)
+
+  # Each chunk here is smaller than `cap` (merged entries are trimmed back
+  # under it), so a sliced front chunk pins well under 2 × cap.
   defp trim_stderr_tail(queue, size, cap) when size <= cap, do: {queue, size}
 
   defp trim_stderr_tail(queue, size, cap) do
@@ -1236,7 +1261,7 @@ defmodule NetRunner.Process do
     # The dead shepherd can no longer cgroup.kill and remove its leaf; left in
     # place it would make every later spawn on this path fail. Bounded
     # (~1 s) and only on this rare path.
-    if state.cgroup_path, do: Cgroup.remove_orphaned_leaf(state.cgroup_path)
+    if state.cgroup, do: Cgroup.remove_orphaned_leaf(state.cgroup)
 
     finish_exit(state, 137)
   end

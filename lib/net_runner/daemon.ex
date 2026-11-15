@@ -157,10 +157,15 @@ defmodule NetRunner.Daemon do
 
   Writes are serialised by the forwarder: sequential writes from one caller
   stay ordered, and concurrent writers no longer interleave mid-payload.
+
+  iodata is flattened here, in the caller: a list would otherwise be copied
+  whole into the Daemon and again into the forwarder before
+  `NetRunner.Process.write/2` flattened it, while a binary crosses both
+  boundaries for free.
   """
   @spec write(GenServer.server(), iodata()) :: :ok | {:error, term()}
   def write(daemon, data) when is_binary(data) or is_list(data) do
-    GenServer.call(daemon, {:write, data}, :infinity)
+    GenServer.call(daemon, {:write, IO.iodata_to_binary(data)}, :infinity)
   end
 
   @impl true

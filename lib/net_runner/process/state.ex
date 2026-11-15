@@ -44,14 +44,16 @@ defmodule NetRunner.Process.State do
     # yields so a retry pass over N parked writes queues one resume message,
     # not N.
     continue_writes_scheduled?: false,
-    # The validated :cgroup_path, or nil. Only consulted when the shepherd
-    # dies without reporting: the BEAM then removes the leaf itself.
-    cgroup_path: nil,
+    # {path, inode} of the cgroup leaf this spawn created, or nil. Only
+    # consulted when the shepherd dies without reporting: the BEAM then
+    # removes the leaf itself, if it is still the same one.
+    cgroup: nil,
     # pty: true. Gates set_window_size/3 (pipe mode has no terminal).
     pty_mode: false,
-    # Yield budgets (see NetRunner.Process); overridable for tests only.
-    write_budget: 16,
-    stderr_drain_chunks: 16,
+    # Yield budgets, always set by Process.init/1 (defaults live there;
+    # overridable for tests only).
+    write_budget: nil,
+    stderr_drain_chunks: nil,
     status: :running,
     # Set by Process.init/1 (Stats.new/0). No struct default: it was dead and
     # the only reason for a compile-time edge to Stats.
@@ -79,10 +81,10 @@ defmodule NetRunner.Process.State do
           stderr_tail_bytes: non_neg_integer(),
           uds_carry: binary(),
           protocol_error?: boolean(),
-          cgroup_path: String.t() | nil,
+          cgroup: NetRunner.Process.Cgroup.leaf() | nil,
           pty_mode: boolean(),
-          write_budget: pos_integer(),
-          stderr_drain_chunks: pos_integer(),
+          write_budget: pos_integer() | nil,
+          stderr_drain_chunks: pos_integer() | nil,
           continue_writes_scheduled?: boolean(),
           status: status(),
           stats: Stats.t() | nil

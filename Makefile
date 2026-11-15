@@ -59,7 +59,9 @@ HARDEN_FLAGS := $(strip -fstack-protector-strong \
 
 # Level 3 needs glibc >= 2.34 or a recent Apple libc; the headers reject or
 # warn about levels they do not know, so probe with a libc header included.
-FORTIFY_LEVEL := $(if $(shell printf '\#include <string.h>\n' | $(CC) -Werror -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -E -x c - >/dev/null 2>&1 && echo y),3,2)
+# -include, not a piped "#include" line: GNU make >= 4.3 passes a backslash
+# in '\#' through to printf, so the header was never actually read.
+FORTIFY_LEVEL := $(if $(shell printf 'int x;\n' | $(CC) -Werror -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -include string.h -E -x c - >/dev/null 2>&1 && echo y),3,2)
 
 ifeq ($(SANITIZE),1)
 	# _FORTIFY_SOURCE is incompatible with ASan (ASan already intercepts

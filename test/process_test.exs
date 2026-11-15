@@ -143,7 +143,7 @@ defmodule NetRunner.ProcessTest do
       results = Task.await_many(tasks, 15_000)
 
       assert results == [:ok, :ok, :ok, :ok]
-      assert_received {:trace, ^pid, :receive, :continue_writes}
+      assert_receive {:trace, ^pid, :receive, :continue_writes}
       assert Proc.stats(pid).bytes_in == 4 * 1_048_576
       assert :ok = Proc.close_stdin(pid)
       assert {:ok, 0} = Proc.await_exit(pid)
