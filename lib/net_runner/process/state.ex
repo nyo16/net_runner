@@ -25,8 +25,9 @@ defmodule NetRunner.Process.State do
     stderr_mode: :consume,
     # Bounded tail of consumed stderr: only the most-recent
     # `stderr_tail_bytes` bytes are retained (the rest is drained and
-    # dropped). Stats still count every byte. Held as a single binary.
-    stderr_tail: <<>>,
+    # dropped). Stats still count every byte. Held as {chunk queue, total
+    # bytes} so an append is O(chunk), and materialised only when read.
+    stderr_tail: {:queue.new(), 0},
     stderr_tail_bytes: 8_192,
     # Unconsumed bytes read from the shepherd's UDS. The socket is a byte
     # stream, so a read can deliver half a frame or several frames at once —
@@ -74,7 +75,7 @@ defmodule NetRunner.Process.State do
           operations: Operations.t(),
           awaiting_exit: [GenServer.from()],
           stderr_mode: :consume | :disabled,
-          stderr_tail: binary(),
+          stderr_tail: {:queue.queue(binary()), non_neg_integer()},
           stderr_tail_bytes: non_neg_integer(),
           uds_carry: binary(),
           protocol_error?: boolean(),

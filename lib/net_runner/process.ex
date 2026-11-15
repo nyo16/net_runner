@@ -467,7 +467,7 @@ defmodule NetRunner.Process do
   end
 
   def handle_call(:stderr_tail, _from, state) do
-    {:reply, state.stderr_tail, state}
+    {:reply, stderr_tail_binary(state.stderr_tail), state}
   end
 
   def handle_call({:set_window_size, _rows, _cols}, _from, %{pty_mode: false} = state) do
@@ -1028,34 +1028,43 @@ defmodule NetRunner.Process do
   # `cap` bytes. A cap of 0 retains nothing (drain-and-drop); the pipe is
   # still drained so the child never blocks. All bytes are still counted in
   # stats — only retention is bounded.
-  defp append_stderr_tail(_tail, 0, _data), do: <<>>
+  #
+  # The tail is a queue of chunks plus their total size, trimmed at the front
+  # in whole chunks and at most one binary_part, so an append costs O(chunk)
+  # whatever the cap. The old flat binary was rebuilt at `cap` bytes on every
+  # chunk once full: O(cap) per 64 KiB read, which made a 1 MiB tail drain
+  # ~35% slower than the default 8 KiB one (PERF-3).
+  defp append_stderr_tail(tail, 0, _data), do: tail
 
-  defp append_stderr_tail(tail, cap, data) do
+  defp append_stderr_tail(_tail, cap, data) when byte_size(data) >= cap do
+    # The chunk alone fills the cap. The :binary.copy/1 is load-bearing:
+    # binary_part/3 on a refc binary returns a sub-binary that would pin the
+    # whole (up to 64 KiB) read buffer for a much smaller cap.
     size = byte_size(data)
+    {:queue.from_list([:binary.copy(binary_part(data, size - cap, cap))]), cap}
+  end
 
-    cond do
-      size >= cap ->
-        # The chunk alone already fills the cap, so concatenating the old tail
-        # would copy bytes the following slice immediately discards. The
-        # :binary.copy/1 is load-bearing: binary_part/3 on a refc binary
-        # returns a sub-binary that pins its ~64 KiB parent for the life of
-        # the process.
-        :binary.copy(binary_part(data, size - cap, cap))
+  defp append_stderr_tail({queue, size}, cap, data) do
+    trim_stderr_tail(:queue.in(data, queue), size + byte_size(data), cap)
+  end
 
-      byte_size(tail) + size <= cap ->
-        # Only reachable during the first `cap` bytes of the process's life.
-        tail <> data
+  # Each chunk here is smaller than `cap`, so a sliced front chunk pins at
+  # most `cap` bytes of its parent: retention stays below 2 × cap.
+  defp trim_stderr_tail(queue, size, cap) when size <= cap, do: {queue, size}
 
-      true ->
-        # Steady state once the tail is full. Build the result at exactly
-        # `cap` in one pass: `tail <> data` followed by a slice would copy
-        # cap + size and then cap again, ~2*cap + size bytes and a transient
-        # ~72 KiB refc binary per chunk. Bitstring construction always
-        # produces a fresh binary, so it pins nothing and needs no copy.
-        keep = cap - size
-        <<binary_part(tail, byte_size(tail) - keep, keep)::binary, data::binary>>
+  defp trim_stderr_tail(queue, size, cap) do
+    {{:value, front}, rest} = :queue.out(queue)
+    excess = size - cap
+    front_size = byte_size(front)
+
+    if front_size <= excess do
+      trim_stderr_tail(rest, size - front_size, cap)
+    else
+      {:queue.in_r(binary_part(front, excess, front_size - excess), rest), cap}
     end
   end
+
+  defp stderr_tail_binary({queue, _size}), do: IO.iodata_to_binary(:queue.to_list(queue))
 
   defp consume_stderr(state) do
     consume_stderr(state, state.stderr_drain_chunks, state.stderr_tail, 0)
