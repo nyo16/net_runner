@@ -26,23 +26,25 @@ NetRunner is a safe OS process execution library for Elixir with NIF-based backp
 
 **Elixir Layer** (`lib/`) — GenServer-based process management, stream API, daemon mode.
 
-**NIF Layer** (`c_src/net_runner_nif.c`) — Wraps FDs in NIF resources with `enif_select` for async I/O on dirty IO schedulers. On EAGAIN, registers with BEAM's epoll/kqueue; the GenServer parks callers in an operations queue and retries when `{:select, _, _, :ready_input/:ready_output}` arrives.
+**NIF Layer** (`c_src/net_runner_nif.c`) — Wraps FDs in NIF resources with `enif_select` for async I/O. All NIFs run on normal schedulers (flags 0; every syscall is bounded non-blocking — ADR-6). On EAGAIN, registers with BEAM's epoll/kqueue; the GenServer parks callers in an operations queue and retries when `{:select, _, _, :ready_input/:ready_output}` arrives.
 
 **Shepherd Layer** (`c_src/shepherd.c`) — Persistent C binary spawned per command via `Port.open`. Forks the child, passes pipe FDs to BEAM via SCM_RIGHTS over a UDS socket, then enters a `poll()` loop. Detects BEAM death via POLLHUP and escalates SIGTERM→SIGKILL on the child's process group.
 
-### Zero Zombie Prevention (3 layers)
+### Zero Zombie Prevention (4 mechanisms)
 
-1. **Shepherd** — detects BEAM death (POLLHUP on UDS), kills child process group
-2. **Watcher GenServer** — monitors Process GenServer, kills OS process on DOWN
-3. **NIF owner monitor** — `io_resource_down` closes FDs when the owning process dies (the destructor only runs for resources with no live `enif_select`)
+1. **Shepherd** — `PR_SET_PDEATHSIG` (Linux) plus BEAM-death detection (POLLHUP on UDS), then a SIGTERM→SIGKILL ladder on the child's process group
+2. **`Process` orphan kill** — `kill_orphan/2` on GenServer termination: shepherd/group SIGKILL plus a pidfd signal to the leader where a pidfd exists; never kills by pid number
+3. **Watcher GenServer** — monitors the Process GenServer; on DOWN sends a single SIGTERM probe by pid number (ADR-16 residual); escalation is the shepherd's job
+4. **NIF owner monitor** — `io_resource_down` closes FDs when the owning process dies (the destructor only runs for resources with no live `enif_select`)
 
 ### Spawn Sequence
 
-1. BEAM creates UDS listener at random temp path
-2. `Port.open` launches shepherd with UDS path as argv[1]
-3. Shepherd connects, forks child, sends pipe FDs via SCM_RIGHTS
-4. Shepherd sends `MSG_CHILD_STARTED(pid)` over UDS
-5. GenServer wraps FDs in NIF resources, registers with Watcher
+1. BEAM creates a UDS listener at a random private temp path and a random 32-hex token
+2. `Port.open` (`:nouse_stdio`) launches shepherd with the UDS path as argv[1] and `--token-fd`; BEAM writes the token over fd 3
+3. Shepherd connects and echoes the token as the first frame (BEAM rejects unauthenticated connects)
+4. Shepherd forks the child, which blocks on the exec gate; shepherd sends pipe FDs (plus a Linux pidfd when `pidfd_open` succeeds) via SCM_RIGHTS, then `MSG_CHILD_STARTED(pid)`
+5. Shepherd writes `'G'` to the exec gate; only then does the child `execvp`
+6. GenServer wraps FDs (and pidfd) in NIF resources, registers with Watcher
 
 ### Key Module Relationships
 
@@ -51,12 +53,16 @@ NetRunner is a safe OS process execution library for Elixir with NIF-based backp
 - `NetRunner.Process.Exec` — spawn logic (UDS, Port, SCM_RIGHTS, Pipe creation)
 - `NetRunner.Nif` — NIF stubs (`nif_read`, `nif_write`, `nif_close`, `nif_create_fd`, `nif_kill`, `nif_kill_group`, `nif_pidfd_send_signal`, …)
 - `NetRunner.Process.Protocol` — shepherd wire protocol: frame constants, parser, command encoders
-- `NetRunner.Process.Pipe` — struct wrapping a NIF resource with owner/type metadata
+- `NetRunner.Process.Pipe` — thin struct around a NIF FD resource
 - `NetRunner.Process.Operations` — pending operation queue (park on EAGAIN, retry on select)
 - `NetRunner.Stream` — `Stream.resource` wrapper with concurrent input writer Task
 - `NetRunner.Daemon` — supervised long-running process with output draining
 - `NetRunner.Watcher` — belt-and-suspenders process monitor
-- `NetRunner.Signal` — signal atom to platform number resolution via NIF
+- `NetRunner.InputWriter` — internal; owns the `:input` writer Task lifecycle for `run/2` and `Stream`
+- `NetRunner.Command` — reusable command templates with default args/options
+- `NetRunner.Error` — exception raised by the bang variants
+- `NetRunner.Process.Stats` — I/O and lifecycle stats returned by `NetRunner.Process.stats/1`
+- `NetRunner.Signal` — internal; signal atom to platform number resolution via NIF
 
 ### Shepherd Protocol (`c_src/protocol.h`)
 
@@ -65,14 +71,14 @@ Shepherd→BEAM: `MSG_CHILD_STARTED(pid)`, `MSG_CHILD_EXITED(status)`, `MSG_ERRO
 
 ## C Code
 
-- C99, compiled with `-Wall -Wextra -Werror`
+- C99, compiled with `-Wall -Wextra -Wformat-security -Wvla -Wshadow`; `-Werror` is opt-in via `WERROR=1` (CI sets it)
 - Platform detection in Makefile: `-D_GNU_SOURCE` (Linux) or `-D_DARWIN_C_SOURCE` (macOS)
 - Two build artifacts: `priv/shepherd` (executable) and `priv/net_runner_nif.so` (shared lib)
-- NIF functions run on dirty IO schedulers to avoid blocking BEAM
+- NIF functions run on normal schedulers (no dirty flags, ADR-6); every syscall they reach is bounded
 
 ## Conventions
 
-- Elixir ~> 1.17, CI tests against 1.17 and 1.18 on OTP 27
+- Elixir ~> 1.17; CI matrix: Elixir/OTP 1.17.3/27.2, 1.18.3/27.2, 1.20.2/28.3.3, 1.20.2/29.0 on ubuntu x86, 1.20.2/29.0 on ubuntu arm, 1.18.4/28.3.3 on macOS
 - All public API functions have `@doc` and `@spec`
 - Tests are async where possible (`async: true`)
 - Credo strict mode enforced: max cyclomatic complexity 9, max nesting depth 2

@@ -52,8 +52,9 @@ Fixed, H2); use `setsid` for jobs that must.
   launcher ignored or blocked (erts: SIGFPE; `nohup`/`+Bi`: SIGHUP/SIGINT).
 - **The shepherd is non-dumpable on Linux**, so a same-uid child cannot read
   its memory or environment through `/proc` without `CAP_SYS_PTRACE`.
-- **Unknown opcodes on the shepherd socket** discard the rest of the buffer
-  (logged once) instead of resynchronising byte by byte.
+- **Unknown opcodes on the shepherd socket** are sticky: all further input on
+  that connection is ignored (logged once) instead of resynchronising byte by
+  byte.
 
 ### Fixed
 
@@ -88,8 +89,9 @@ Fixed, H2); use `setsid` for jobs that must.
   so a same-path respawn (Daemon restart) right after `await_exit/2` works.
 - **H7: the child leads its process group before it is reported.** The pipe
   mode parent now also calls `setpgid(child, child)` and PTY mode waits for
-  the child's `setsid()`; the BEAM's orphan kill falls back to a direct kill
-  of the leader if the group kill finds no group.
+  the child's `setsid()`; the BEAM's orphan kill is a group SIGKILL, plus a
+  pidfd signal to the leader where a pidfd exists; no direct kill by pid
+  number.
 - **H11: shepherd failure paths report the reaped status** when the socket is
   still usable, instead of reaping silently and leaving the BEAM to `killpg` a
   recyclable pgid.
@@ -257,7 +259,7 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
   (`1..60_000`) and `:cgroup_path` rejects NUL bytes and non-binaries, so a
   bad value raises `ArgumentError` instead of a silent 10 s
   `:shepherd_connect_timeout`.
-- **`NetRunner.Process.Protocol.kill/1`** rejects signal numbers outside
+- **NetRunner.Process.Protocol.kill/1** (internal) rejects signal numbers outside
   `1..255` instead of truncating them to one byte.
 - **macOS test flake.** Timeout tests built a `sleep` duration from
   `System.unique_integer/1`, which crossed `INT32_MAX` late in a full run;
@@ -290,7 +292,7 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
 
 ### Changed
 
-- **`NetRunner.Process.Nif` renamed to `NetRunner.Nif`** (internal,
+- **NetRunner.Process.Nif renamed to NetRunner.Nif** (internal,
   `@moduledoc false`, but referenced in tests/benches).
 - **Option-validation convention unified.** Malformed options (unknown keys,
   bad values for `:stderr`, `:stderr_tail_bytes`, `:cgroup_path`, `:env`,
@@ -298,14 +300,14 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
   runtime spawn failures keep `{:error, reason}` returns, and `stream!/2`
   uniformly wraps spawn-stage reasons as
   `%NetRunner.Error{reason: {:spawn_failed, reason}}`.
-- **Wire protocol centralized** in `NetRunner.Process.Protocol` (constants,
+- **Wire protocol centralized** in NetRunner.Process.Protocol (constants,
   parser, encoders); no inline frame bytes remain in `Process`/`Exec`.
 - **`Daemon.os_pid/1`** answers from cached daemon state instead of a
   blocking double GenServer hop.
 - **Docs corrected**: `--token-fd` handshake (never argv), Watcher's
   deliberate single-SIGTERM/no-escalation design, Layer-3 cleanup via the
   NIF owner monitor (not GC), write-budget loop exit in `backpressure.md`;
-  `Process.read/2` documents the 1 MiB cap and non-FIFO reader wakeup.
+  `NetRunner.Process.read/2` documents the 1 MiB cap and non-FIFO reader wakeup.
 - **CI supply chain**: Dependabot now covers GitHub Actions; every workflow
   action is SHA-pinned; `.credo.exs` committed; `mix deps.unlock
   --check-unused` gate added; musl container pinned by digest; the Linux
@@ -412,7 +414,7 @@ cycle below (numbers are medians on an Apple M1 Max, OTP 29 / erts 17.0.3,
 
 ### Added
 
-- **`:env` option** (`run/2`, `stream!/2`, `Process.start/3`): a map of
+- **`:env` option** (`run/2`, `stream!/2`, `NetRunner.Process.start/3`): a map of
   environment variables for the child; a binary value sets, `nil` unsets.
   PATH resolution happens before `:env` applies — pass absolute command
   paths when overriding `PATH`.
@@ -457,7 +459,7 @@ cycle below (numbers are medians on an Apple M1 Max, OTP 29 / erts 17.0.3,
   command"}}` / raise `NetRunner.Error` instead of `FunctionClauseError`.
 - **`:input` accepts any `Enumerable`** of iodata chunks (`File.stream!`,
   `Range`, function streams), not just binaries, lists and `%Stream{}`.
-- **`Process.write/2` normalises iodata to a binary at the API boundary**;
+- **`NetRunner.Process.write/2` normalises iodata to a binary at the API boundary**;
   the NIF now accepts binaries only.
 - **Stdin writes are bounded per scheduling slice**: a fast-draining child no
   longer keeps the write loop occupying the GenServer for the whole payload —

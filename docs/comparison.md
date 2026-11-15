@@ -18,7 +18,7 @@
 | Kill escalation timeout | Configurable | Fixed | Fixed | Configurable | N/A |
 | Concurrency model | Process-per-cmd | Process-per-cmd | Process-per-cmd | Single manager | Blocking |
 | Language | C NIF + Elixir | C NIF + Elixir | C wrapper + Elixir | C port + Erlang | Built-in |
-| BEAM scheduler safe | Yes (dirty IO) | Yes (dirty IO) | N/A | N/A | No |
+| BEAM scheduler safe | Yes (bounded non-blocking NIFs on normal schedulers) | Yes (dirty IO) | N/A | N/A | No |
 
 ## Architecture Comparison
 
@@ -60,7 +60,7 @@ BEAM → NIF (enif_select) + shepherd binary → child
 ```
 - Best of Exile (NIF I/O) + MuonTrap (persistent wrapper)
 - Process group kills with grandchild cleanup
-- Three-layer zombie prevention
+- Four-mechanism zombie prevention
 - PTY + cgroup + stats + daemon mode
 
 ## When to Use What

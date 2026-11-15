@@ -176,8 +176,8 @@ defmodule NetRunner.InputWriter do
   defp flush_batch(batch), do: IO.iodata_to_binary(batch)
 
   @doc """
-  Reaps a writer started by `start/2`. Must run in the process that called
-  `start/2`.
+  Reaps a writer started by `start/3`. Must run in the process that called
+  `start/3`.
 
   `Task.async` links, so an *abnormal* writer exit has already torn the caller
   down before this runs — the reap exists to stop a *live* writer leaking,

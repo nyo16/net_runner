@@ -126,9 +126,10 @@ real status.
 ### Unknown opcodes
 
 An unknown opcode means the two sides disagree about framing, so nothing after
-it in the buffer can be trusted. Both sides discard the rest of the current
-buffer instead of resynchronising byte by byte (which would reinterpret payload
-bytes as commands); the shepherd logs it once to its stderr. There is no
+it on that connection can be trusted. The reaction is sticky: all further
+input on that connection is ignored, instead of resynchronising byte by byte
+(which would reinterpret payload bytes as commands); the shepherd logs it once
+to its stderr and still detects BEAM death (`c_src/protocol.h`). There is no
 version negotiation: shepherd and library always ship together.
 
 ### BEAM → Shepherd Commands

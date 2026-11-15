@@ -78,7 +78,7 @@ defmodule NetRunner.MixProject do
       # the read-size source of truth respectively — so suppress the autolink
       # rather than the prose or the modules' internal status.
       skip_code_autolink_to: [
-        "NetRunner.Process.Exec.parse_uds_message/1",
+        "NetRunner.Process.Protocol.parse_uds_message/1",
         "NetRunner.InputWriter",
         "NetRunner.Process.Pipe.read/2"
       ],
@@ -103,7 +103,6 @@ defmodule NetRunner.MixProject do
         ],
         Internals: [
           NetRunner.Process.Exec,
-          NetRunner.Process.Nif,
           NetRunner.Process.Pipe,
           NetRunner.Process.State,
           NetRunner.Process.Operations,

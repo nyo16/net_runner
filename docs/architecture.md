@@ -72,16 +72,15 @@ it cannot run it twice (ADR-15).
 The child also leads its own process group before the BEAM hears of it: in
 pipe mode both the child (`setpgid(0, 0)`) and the shepherd
 (`setpgid(child, child)`) set it, and in PTY mode the shepherd waits for the
-child's `'R'` after `setsid()`. So the BEAM's `killpg` in
-`finish_orphaned/2` always has a group to hit; should it still get `ESRCH`,
-it falls back to signalling the leader directly.
+child's `'R'` after `setsid()`. So the BEAM's orphan kill (`kill_orphan/2`)
+always has a group to hit: it sends a group SIGKILL, plus a pidfd signal to
+the leader where a pidfd exists; there is no direct kill by pid number.
 
 Before blocking on the gate the child restores every signal disposition to
 its default and empties its signal mask: SIG_IGN and the mask survive
 `execve`, and the BEAM's launcher (erts ignores SIGFPE and a realtime
 signal; `nohup`/`+Bi` ignore SIGHUP/SIGINT) must not decide what the
 command can receive.
-```
 
 The token never appears on the command line: the shepherd is spawned with
 `--token-fd` and reads the 32-byte token from fd 3 — the `:nouse_stdio` port
@@ -93,29 +92,32 @@ world-readable via `/proc/<pid>/cmdline` on Linux and same-uid readable via
 token exists to stop. The shepherd echoes the token as the very first UDS
 frame, and the BEAM verifies it before accepting any FDs.
 
-## Zombie Prevention (3 Layers)
+## Zombie Prevention (4 Mechanisms)
 
 ```mermaid
 graph TD
     subgraph "Zombie Prevention"
-        L1[Layer 1: Shepherd<br/>Detects BEAM death via POLLHUP or its own SIGTERM/INT/HUP/QUIT<br/>SIGTERM group → always SIGKILL group<br/>sweeps the group on every child exit]
-        L2[Layer 2: Watcher GenServer<br/>Detects Process GenServer death<br/>single SIGTERM probe via NIF — no escalation]
-        L3[Layer 3: NIF owner monitor<br/>down callback closes FDs<br/>Child sees EOF/SIGPIPE]
+        L1[1: Shepherd<br/>Detects BEAM death via POLLHUP or its own SIGTERM/INT/HUP/QUIT<br/>SIGTERM group → always SIGKILL group<br/>sweeps the group on every child exit<br/>child has PR_SET_PDEATHSIG on Linux]
+        L2[2: Process orphan kill<br/>Port exit without exit status<br/>group SIGKILL + pidfd signal to leader<br/>never by pid number]
+        L3[3: Watcher GenServer<br/>Detects Process GenServer death<br/>single SIGTERM probe via NIF — no escalation]
+        L4[4: NIF owner monitor<br/>io_resource_down closes BEAM FDs<br/>child sees SIGPIPE; stdin EOF once shepherd also closes]
     end
     L1 -->|Covers| BEAM_CRASH[BEAM SIGKILL/crash]
-    L2 -->|Covers| GS_CRASH[GenServer crash]
-    L3 -->|Covers| LEAK[Owner killed / FD leak]
+    L2 -->|Covers| SHEP_CRASH[Shepherd SIGKILL/crash]
+    L3 -->|Covers| GS_CRASH[GenServer crash]
+    L4 -->|Covers| LEAK[Owner killed / FD leak]
 ```
 
-**Why all three layers?**
+**Why all four mechanisms?**
 
-| Layer | Trigger | Mechanism | Covers |
+| Mechanism | Trigger | Action | Covers |
 |-------|---------|-----------|--------|
 | Shepherd | BEAM process dies; shepherd gets SIGTERM/SIGINT/SIGHUP/SIGQUIT | UDS POLLHUP (after draining queued commands) or self-pipe → SIGTERM group → wait (WNOWAIT) up to `kill_timeout` → **always** SIGKILL group (direct-pid fallback) → reap → cgroup cleanup → `MSG_CHILD_EXITED` when the UDS still works | BEAM SIGKILL, OOM kill, segfault, `systemctl stop`/`kill` of the shepherd |
 | Shepherd | Child exits on its own | SIGCHLD → `waitid(WNOWAIT)` → `kill(-pid, SIGKILL)` → reap → cgroup cleanup → `MSG_CHILD_EXITED` | Background members left in the child's group (`sh -c 'worker & exit 0'`) |
-| Process GenServer | Shepherd dies without reporting an exit | Port exit → `killpg(child, SIGKILL)` plus a pidfd signal to the leader on Linux (direct kill on `ESRCH` elsewhere), status 137 (`finish_orphaned/2`); on Linux also `PR_SET_PDEATHSIG` in the child | Shepherd SIGKILL/OOM/crash, a child killing its parent |
-| Watcher | GenServer crashes | Process.monitor → one SIGTERM probe via NIF | Elixir-level crashes, unhandled errors |
-| NIF owner monitor | Owner process dies | `down` callback + destructor close(fd) → child SIGPIPE/EOF | Owner killed without cleanup, FD leaks |
+| Shepherd (`PR_SET_PDEATHSIG`, Linux) | Shepherd dies | Kernel SIGKILLs the child | Shepherd SIGKILL/OOM/crash |
+| `Process` orphan kill | Shepherd dies without reporting an exit | Port exit → group SIGKILL, plus a pidfd signal to the leader where a pidfd exists; no direct kill by pid number; status 137 (`finish_orphaned/2` → `kill_orphan/2`) | Shepherd SIGKILL/OOM/crash, a child killing its parent |
+| Watcher | GenServer crashes | Process.monitor → one SIGTERM probe via NIF, by pid number (ADR-16 residual) | Elixir-level crashes, unhandled errors |
+| NIF owner monitor | Owner process dies | `io_resource_down` closes the BEAM's FDs → child SIGPIPE on stdout/stderr; stdin EOF only after the shepherd also closes its copy (ADR-18) | Owner killed without cleanup, FD leaks |
 
 **The group never outlives its leader.** Every shepherd exit path sweeps the
 child's process group with SIGKILL *before* reaping the leader: the shepherd

@@ -37,7 +37,7 @@ defmodule NetRunner do
   Malformed options are programmer errors and raise `ArgumentError` — unknown
   keys (`Keyword.validate!/2`) as well as invalid values (`:output`,
   `:input_buffer`, `:stderr`, `:stderr_tail_bytes`, `:cgroup_path`, `:cwd`,
-  `:env`, `:no_new_privs`). Runtime spawn failures (an invalid command,
+  `:env`, `:no_new_privs`, `:kill_timeout`). Runtime spawn failures (an invalid command,
   shepherd errors) return `{:error, reason}` instead. This convention holds
   at every NetRunner entry point.
 
@@ -282,7 +282,12 @@ defmodule NetRunner do
       writes of up to that many bytes for throughput. Eager lists always
       coalesce.
     * `:stderr` - `:consume` (default) or `:disabled`
+    * `:stderr_tail_bytes` - cap on the retained stderr tail, as in `run/2`
+    * `:pty`, `:cgroup_path`, `:kill_timeout` - passed through to the
+      underlying `NetRunner.Process`, as in `run/2`
     * `:cwd`, `:env`, `:no_new_privs` - as in `run/2`
+    * `:name`, `:owner` - passed to `NetRunner.Process.start_link/3`; the
+      stream re-registers the consumer as owner once iteration starts
 
   `:timeout` and `:max_output_size` are `run/2`-only options and are rejected
   here — a lazy stream has no single wall-clock to bound. Unknown options

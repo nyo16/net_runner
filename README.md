@@ -5,7 +5,7 @@
 
 Safe OS process execution for Elixir. Zero zombie processes, NIF-based backpressure, PTY support, and cgroup isolation.
 
-NetRunner combines NIF-based async I/O (`enif_select`) with a persistent **shepherd binary** that watches over child processes. Three layers of cleanup guarantee zero zombies under every failure mode — BEAM crash, GenServer crash, or resource leak.
+NetRunner combines NIF-based async I/O (`enif_select`) with a persistent **shepherd binary** that watches over child processes. Four cleanup mechanisms guarantee zero zombies under every failure mode — BEAM crash, shepherd crash, GenServer crash, or resource leak.
 
 ## Installation
 
@@ -590,12 +590,12 @@ NetRunner.Watcher (belt-and-suspenders with shepherd)
     |-- Monitors GenServer, kills OS process if GenServer crashes
 ```
 
-**Layers of zombie prevention:**
+**Zombie prevention — four mechanisms:**
 
-1. **Shepherd** — detects BEAM death via POLLHUP on UDS (after executing any commands still queued on it) or its own SIGTERM/SIGINT/SIGHUP/SIGQUIT, and always ends with a SIGKILL of the child's process group; also sweeps the group whenever the child exits on its own
-2. **Process GenServer** — detects shepherd death via its Port exit; if no exit status arrived, SIGKILLs the orphaned child's process group and, via the pidfd on Linux, the child itself (on Linux the child also dies via `PR_SET_PDEATHSIG`)
-3. **Watcher** — detects GenServer crash via `Process.monitor`, kills child via NIF
-4. **NIF owner monitor** — closes FDs when the owning process dies, child sees EOF/broken pipe
+1. **Shepherd** — detects BEAM death via POLLHUP on UDS (after executing any commands still queued on it) or its own SIGTERM/SIGINT/SIGHUP/SIGQUIT, and always ends with a SIGKILL of the child's process group; also sweeps the group whenever the child exits on its own. On Linux the child additionally carries `PR_SET_PDEATHSIG(SIGKILL)`, so it dies with the shepherd
+2. **`Process` orphan kill** — detects shepherd death via its Port exit; if no exit status arrived, SIGKILLs the orphaned child's process group, plus a pidfd signal to the leader where a pidfd exists (Linux); it never kills by pid number
+3. **Watcher** — detects GenServer crash via `Process.monitor` and sends a single SIGTERM probe via NIF (no escalation; that is the shepherd's job)
+4. **NIF owner monitor** — `io_resource_down` closes the BEAM's FDs when the owning process dies. The child sees broken pipe on stdout/stderr; it sees stdin EOF only once both the BEAM and the shepherd have closed their write ends (`close_stdin/1` → `CMD_CLOSE_STDIN`, ADR-18), which on the owner-death path happens when the shepherd tears down
 
 ## Security model
 

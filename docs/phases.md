@@ -38,7 +38,7 @@ gantt
 
 **C code:**
 - `shepherd.c`: fork, pipe creation, SCM_RIGHTS FD passing, poll() event loop, signal handling via self-pipe trick
-- `net_runner_nif.c`: `nif_read/write/close/create_fd/kill/is_os_pid_alive`, all on dirty IO schedulers, `enif_select` for async readiness
+- `net_runner_nif.c`: `nif_read/write/close/create_fd/kill/is_os_pid_alive`, originally on dirty IO schedulers (since moved to normal schedulers, ADR-6), `enif_select` for async readiness
 
 **Elixir modules:**
 - `Nif`, `Signal`, `Pipe`, `State`, `Operations`, `Exec`, `Process`, `Watcher`, `Application`, `Stream`, `NetRunner`

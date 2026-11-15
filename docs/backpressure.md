@@ -16,13 +16,13 @@ sequenceDiagram
     participant Pipe as OS Pipe Buffer
     participant Child as Child Process
 
-    E->>GS: Process.read(p)
+    E->>GS: Process.read_batch(p)
     GS->>NIF: nif_read(fd, 65536)
     alt Data available
         NIF->>Pipe: read(fd, buf, 65536)
         Pipe-->>NIF: bytes
         NIF-->>GS: {:ok, binary}
-        GS-->>E: {:ok, binary}
+        GS-->>E: {:ok, [binary, ...]}
     else Pipe empty (EAGAIN)
         NIF->>NIF: enif_select(fd, READ)
         NIF-->>GS: {:error, :eagain}
@@ -31,7 +31,7 @@ sequenceDiagram
         Pipe-->>GS: {:select, fd, ref, :ready_input}
         GS->>NIF: nif_read(fd, 65536) [retry]
         NIF-->>GS: {:ok, binary}
-        GS-->>E: {:ok, binary}
+        GS-->>E: {:ok, [binary, ...]}
     end
 ```
 
@@ -39,8 +39,8 @@ sequenceDiagram
 
 ### Read Path
 
-1. `NetRunner.Process.read/2` calls `GenServer.call(pid, {:read, :stdout, max_bytes}, :infinity)`
-2. GenServer tries `Pipe.read(pipe, max_bytes)` → calls `Nif.nif_read(resource, max_bytes)`
+1. `NetRunner.Stream` (and `NetRunner.run/2`) call `NetRunner.Process.read_batch/3`, i.e. `GenServer.call(pid, {:read_batch, :stdout, max_bytes, max_chunks}, :infinity)`; `read/2` is the single-chunk variant with the same path
+2. GenServer tries `Pipe.read(pipe, max_bytes)` → calls `Nif.nif_read(resource, max_bytes)`, repeating up to `max_chunks` times until the first `EAGAIN` once a chunk is in hand
 3. NIF runs on a normal scheduler (see ADR-6); `max_bytes` defaults to
    `65_536`, exactly one pipe buffer and exactly the NIF's stack-buffer size
    (see ADR-9):
