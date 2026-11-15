@@ -26,13 +26,6 @@ defmodule NetRunner.PtyTest do
       {:ok, _status} = Proc.await_exit(pid, 5_000)
     end
 
-    test "set_window_size does not crash" do
-      {:ok, pid} = Proc.start("sleep", ["100"], pty: true)
-      assert :ok = Proc.set_window_size(pid, 40, 120)
-      Proc.kill(pid, :sigkill)
-      Proc.await_exit(pid, 5_000)
-    end
-
     test "the child observes a set_window_size resize (TIOCSWINSZ)" do
       # `stty size` asks the pty slave for its winsize, so the child polling
       # its own terminal is ground truth that the resize actually landed — a

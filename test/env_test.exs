@@ -8,11 +8,13 @@ defmodule NetRunner.EnvTest do
   # The `+` form distinguishes an unset variable from an empty value.
   @report "echo \"[$PROBE_ONE][${PROBE_ONE+set}][$PROBE_TWO][${PROBE_TWO+set}]\""
 
+  # The inherited probe is HOME, which the BEAM already has: System.put_env
+  # in an async module would change the environment every concurrently
+  # spawned child inherits.
   setup do
-    name = "PROBE_INHERITED_#{:erlang.unique_integer([:positive])}"
-    System.put_env(name, "from the BEAM")
-    on_exit(fn -> System.delete_env(name) end)
-    {:ok, inherited: name}
+    home = System.get_env("HOME")
+    if home in [nil, ""], do: flunk("these tests need a non-empty HOME in the BEAM's environment")
+    {:ok, inherited: "HOME", value: home}
   end
 
   describe "env:" do
@@ -23,19 +25,27 @@ defmodule NetRunner.EnvTest do
                )
     end
 
-    test "an empty value removes the variable rather than emptying it", %{inherited: name} do
+    test "an empty value removes the variable rather than emptying it", %{
+      inherited: name,
+      value: value
+    } do
       # A Port cannot set an empty value, so `""` and `nil` both remove it.
       empty = NetRunner.run([@sh, "-c", "echo [${#{name}-absent}]"], env: [{name, ""}])
       removed = NetRunner.run([@sh, "-c", "echo [${#{name}-absent}]"], env: [{name, nil}])
 
       assert {"[absent]\n", 0} = empty
       assert empty == removed
-      assert System.get_env(name) == "from the BEAM"
+      assert System.get_env(name) == value
     end
 
-    test "the rest of the BEAM's environment still reaches the child", %{inherited: name} do
-      assert {"from the BEAM\n", 0} =
-               NetRunner.run([@sh, "-c", "echo $#{name}"], env: [{"PROBE_ONE", "one"}])
+    test "the rest of the BEAM's environment still reaches the child", %{
+      inherited: name,
+      value: value
+    } do
+      assert {output, 0} =
+               NetRunner.run([@sh, "-c", "printf %s \"$#{name}\""], env: [{"PROBE_ONE", "one"}])
+
+      assert output == value
     end
 
     test "a name given twice takes the last value" do

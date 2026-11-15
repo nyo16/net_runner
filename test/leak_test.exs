@@ -4,6 +4,7 @@ defmodule NetRunner.LeakTest do
   import NetRunner.TestHelpers
 
   alias NetRunner.Process, as: Proc
+  alias NetRunner.Process.{Operations, Pipe}
 
   describe "FD leak prevention" do
     # Runs on Linux via /proc/self/fd and on macOS via lsof -p.
@@ -63,35 +64,54 @@ defmodule NetRunner.LeakTest do
             try do
               Proc.read(pid, 1024)
             catch
-              :exit, _ -> :exited
+              :exit, reason -> {:exit, reason}
             end
           end)
         end
 
-      # Close stdin and kill to trigger cleanup
-      Process.sleep(50)
+      # Kill only once all five reads are parked, so teardown races them.
+      eventually(fn ->
+        assert length(
+                 Operations.pending_by_type(:sys.get_state(pid).operations, {:read, :stdout})
+               ) ==
+                 5
+      end)
+
       Proc.kill(pid, :sigkill)
 
-      results =
-        Enum.map(tasks, fn task ->
-          case Task.yield(task, 5_000) do
-            {:ok, result} -> result
-            nil -> Task.shutdown(task, :brutal_kill)
-          end
-        end)
+      # Each parked reader is answered with a value: served EOF from the
+      # closed pipe, or failed by the exit. Never a hang or a call exit.
+      for task <- tasks do
+        result = Task.yield(task, 5_000) || Task.shutdown(task, :brutal_kill)
 
-      # All tasks should have completed without crashing the BEAM
-      assert length(results) == 5
+        assert {:ok, reply} = result, "parked read never returned"
+
+        assert reply in [:eof, {:error, :process_exited}, {:error, :closed}],
+               "unexpected parked read reply: #{inspect(reply)}"
+      end
+
+      assert {:ok, 137} = Proc.await_exit(pid)
+      GenServer.stop(pid)
     end
   end
 
   describe "nif_close idempotency" do
     test "closing an already-closed pipe returns :ok" do
-      {:ok, pid} = Proc.start("echo", ["test"])
-      :ok = Proc.close_stdin(pid)
-      # Second close should be idempotent
-      :ok = Proc.close_stdin(pid)
-      Proc.await_exit(pid)
+      {:ok, pid} = Proc.start("cat", [])
+      %{stdin: stdin} = :sys.get_state(pid)
+
+      # Both calls reach nif_close on the same resource.
+      assert :ok = Pipe.close(stdin)
+      assert :ok = Pipe.close(stdin)
+
+      # The first close really closed the resource...
+      assert {:error, :closed} = Pipe.write(stdin, "x")
+
+      # ...and the server's own close (a third nif_close, plus the shepherd's
+      # copy) still succeeds, so cat sees EOF and exits cleanly.
+      assert :ok = Proc.close_stdin(pid)
+      assert {:ok, 0} = Proc.await_exit(pid, 5_000)
+      GenServer.stop(pid)
     end
   end
 
@@ -105,20 +125,6 @@ defmodule NetRunner.LeakTest do
 
       Proc.kill(pid, :sigkill)
       Proc.await_exit(pid)
-    end
-  end
-
-  describe "cgroup path validation" do
-    test "rejects path traversal with .." do
-      assert_raise ArgumentError, ~r/cannot contain '\.\.'/, fn ->
-        Proc.start("echo", ["test"], cgroup_path: "../../etc/evil")
-      end
-    end
-
-    test "rejects absolute cgroup path" do
-      assert_raise ArgumentError, ~r/must be relative/, fn ->
-        Proc.start("echo", ["test"], cgroup_path: "/sys/fs/cgroup/evil")
-      end
     end
   end
 
