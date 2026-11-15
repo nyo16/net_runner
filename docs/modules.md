@@ -10,16 +10,20 @@ graph TD
     S --> IW
     S --> ERR
     CMD[NetRunner.Command] --> NR
+    NR --> OPT[Process.Options]
     P --> EX[Process.Exec]
+    P --> OPT
     P --> ST[Process.State]
     P --> OP[Process.Operations]
     P --> PI[Process.Pipe]
     P --> PR[Process.Protocol]
+    P --> CG[Process.Cgroup]
     P --> NI[NetRunner.Nif]
     P --> SIG[NetRunner.Signal]
     P --> STATS[Process.Stats]
     P --> W[NetRunner.Watcher]
     EX --> PR
+    PR --> OPT
     EX --> NI
     PI --> NI
     ST --> PI
@@ -67,10 +71,12 @@ that each Watcher is started under) and `NetRunner.TaskSupervisor`.
 |--------|---------|
 | NetRunner.Signal | Signal atom → platform-specific number resolution via NIF |
 | NetRunner.InputWriter | Owns the `:input` writer Task lifecycle for `run/2` and `NetRunner.Stream` |
-| NetRunner.Process.Exec | Process spawning: UDS, Port.open, token handshake, SCM\_RIGHTS, FD wrapping |
+| NetRunner.Process.Exec | Spawn mechanics: private UDS listener, `Port.open`, accept and token authentication, SCM\_RIGHTS fd receive and wrapping |
+| NetRunner.Process.Options | The spawn-option contract: key list, value validation, `:env`/`:cgroup_path` normalisation, `default_kill_timeout/0` |
+| NetRunner.Process.Cgroup | BEAM-side removal of a cgroup leaf whose shepherd died without cleaning up |
 | NetRunner.Nif | NIF function stubs (@on\_load :load\_nifs) |
-| NetRunner.Process.Protocol | Shepherd wire protocol: constants, frame parser, command encoders |
-| NetRunner.Process.Pipe | Thin struct around a NIF FD resource |
+| NetRunner.Process.Protocol | Shepherd wire format: frame constants, parser, command encoders, shepherd argv grammar, SCM\_RIGHTS fd layout |
+| NetRunner.Process.Pipe | Thin struct around a NIF FD resource (a PTY master's read side maps EIO to EOF) |
 | NetRunner.Process.State | GenServer state struct |
 | NetRunner.Process.Operations | Pending operation queue (park on EAGAIN, retry on ready) |
 | NetRunner.Watcher | GenServer started by `NetRunner.Process` under `NetRunner.WatcherSupervisor`; sends one SIGTERM probe when the Process GenServer dies |
@@ -80,7 +86,7 @@ that each Watcher is started under) and `NetRunner.TaskSupervisor`.
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `c_src/shepherd.c` | ~1700 | Persistent child watchdog: token handshake, fork, exec gate, FD/pidfd pass, poll loop, kill escalation, PTY, cgroup |
-| `c_src/net_runner_nif.c` | ~810 | NIF: read/write/close/create_fd/dup_fd/kill/kill_group/pidfd_send_signal/signal_number with enif_select |
+| `c_src/shepherd.c` | ~1810 | Persistent child watchdog: token handshake (listener uid check), fork, exec gate, FD/pidfd pass, poll loop (UDS, signals, port channel), kill escalation, PTY, cgroup |
+| `c_src/net_runner_nif.c` | ~830 | NIF: read/write/close/create_fd/dup_fd/kill/kill_group/pidfd_send_signal/signal_number with enif_select |
 | `c_src/protocol.h` | ~60 | Shared protocol constants |
 | `c_src/utils.h` | ~35 | Debug/error macros |

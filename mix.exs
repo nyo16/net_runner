@@ -113,14 +113,19 @@ defmodule NetRunner.MixProject do
           NetRunner.Command,
           NetRunner.Process,
           NetRunner.Stream,
-          NetRunner.Daemon
+          NetRunner.Daemon,
+          NetRunner.Error,
+          # Public type (returned by Process.stats/1); its mutators are @doc false.
+          NetRunner.Process.Stats
         ],
         Internals: [
           NetRunner.Process.Exec,
+          NetRunner.Process.Options,
+          NetRunner.Process.Protocol,
+          NetRunner.Process.Cgroup,
           NetRunner.Process.Pipe,
           NetRunner.Process.State,
           NetRunner.Process.Operations,
-          NetRunner.Process.Stats,
           NetRunner.Signal,
           NetRunner.Watcher
         ]
