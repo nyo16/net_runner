@@ -178,11 +178,7 @@ defmodule NetRunner do
     output = validate_output!(Keyword.get(opts, :output, :binary))
     capture_stderr? = Keyword.get(opts, :stderr, :consume) == :capture
 
-    if capture_stderr? and Keyword.get(opts, :pty, false) do
-      # PTY folds stderr into the master fd; the captured tail would always
-      # be "". Reject rather than silently ignore, like every other option.
-      raise ArgumentError, "stderr: :capture is not supported with pty: true"
-    end
+    validate_pty_combination!(opts, capture_stderr?)
 
     process_opts =
       opts
@@ -217,6 +213,27 @@ defmodule NetRunner do
       {:error, _reason} = error ->
         error
     end
+  end
+
+  # PTY folds stderr into the master fd, so a captured tail would always be
+  # "". And a PTY cannot signal end of :input: the master is one
+  # bidirectional fd, closing the BEAM's dup does not hang up the terminal,
+  # so a child reading to EOF would wait forever. Reject both rather than
+  # silently ignore them, like every other option.
+  defp validate_pty_combination!(opts, capture_stderr?) do
+    if Keyword.get(opts, :pty, false) do
+      if capture_stderr? do
+        raise ArgumentError, "stderr: :capture is not supported with pty: true"
+      end
+
+      if Keyword.get(opts, :input) != nil do
+        raise ArgumentError,
+              ":input is not supported with pty: true (a PTY has no stdin EOF); " <>
+                "use NetRunner.Process.write/2 on a pty process instead"
+      end
+    end
+
+    :ok
   end
 
   defp validate_output!(mode) when mode in [:binary, :iodata], do: mode

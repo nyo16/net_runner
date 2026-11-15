@@ -36,9 +36,11 @@ defmodule NetRunner.Daemon do
 
   use GenServer
 
+  require Logger
+
   alias NetRunner.Process, as: Proc
 
-  @type on_output :: :discard | :log | (binary() -> any())
+  @type on_output :: :discard | :log | (binary() -> any()) | nil
 
   # SIGTERM grace for terminate/2, replaced by `process_opts[:kill_timeout]`
   # when the caller sets it, then a SIGKILL grace. terminate/2 must finish
@@ -52,10 +54,11 @@ defmodule NetRunner.Daemon do
   @daemon_opts [:cmd, :args, :on_output, :process_opts]
 
   @doc """
-  Starts a supervised daemon. Options: `:cmd` (required), `:args`,
-  `:on_output` (see `t:on_output/0`), `:process_opts` (forwarded to
-  `NetRunner.Process.start_link/3`; `:stderr` is forced to `:disabled`), and
-  `:name`. Malformed options raise `ArgumentError` in the caller.
+  Starts a supervised daemon. Options: `:cmd` (required binary), `:args`,
+  `:on_output` (see `t:on_output/0`; `nil` means `:discard`), `:process_opts`
+  (forwarded to `NetRunner.Process.start_link/3`; `:stderr` is forced to
+  `:disabled`), and `:name`. A missing `:cmd`, an invalid `:on_output` or
+  any other malformed option raises `ArgumentError` in the caller.
 
   On shutdown the child gets SIGTERM, then SIGKILL after
   `process_opts[:kill_timeout]` ms (default 3 000), then up to 1 000 ms to
@@ -69,8 +72,29 @@ defmodule NetRunner.Daemon do
     # caller instead of surfacing as a supervisor start_link failure (and an
     # exit signal into a non-trapping caller) from inside init/1.
     daemon_opts = Keyword.validate!(daemon_opts, @daemon_opts)
+    validate_cmd!(Keyword.get(daemon_opts, :cmd))
+    validate_on_output!(Keyword.get(daemon_opts, :on_output))
     daemon_opts |> process_opts() |> Proc.validate_opts!()
     GenServer.start_link(__MODULE__, daemon_opts, gen_opts)
+  end
+
+  defp validate_cmd!(cmd) when is_binary(cmd), do: :ok
+
+  defp validate_cmd!(nil),
+    do: raise(ArgumentError, "NetRunner.Daemon requires :cmd (the executable to run)")
+
+  defp validate_cmd!(cmd),
+    do: raise(ArgumentError, ":cmd must be a binary, got: #{inspect(cmd)}")
+
+  # Checked once here rather than failing with a FunctionClauseError (logged
+  # by safe_handle_output/2) on every drained chunk. nil means the default.
+  defp validate_on_output!(on_output)
+       when on_output in [nil, :discard, :log] or is_function(on_output, 1),
+       do: :ok
+
+  defp validate_on_output!(on_output) do
+    raise ArgumentError,
+          ":on_output must be :discard, :log or a 1-arity function, got: #{inspect(on_output)}"
   end
 
   @doc """
@@ -126,8 +150,8 @@ defmodule NetRunner.Daemon do
   Writes are serialised by the forwarder: sequential writes from one caller
   stay ordered, and concurrent writers no longer interleave mid-payload.
   """
-  @spec write(GenServer.server(), binary()) :: :ok | {:error, term()}
-  def write(daemon, data) when is_binary(data) do
+  @spec write(GenServer.server(), iodata()) :: :ok | {:error, term()}
+  def write(daemon, data) when is_binary(data) or is_list(data) do
     GenServer.call(daemon, {:write, data}, :infinity)
   end
 
@@ -135,7 +159,7 @@ defmodule NetRunner.Daemon do
   def init(opts) do
     cmd = Keyword.fetch!(opts, :cmd)
     args = Keyword.get(opts, :args, [])
-    on_output = Keyword.get(opts, :on_output, :discard)
+    on_output = Keyword.get(opts, :on_output) || :discard
 
     # Trap exits so (a) a supervisor :shutdown runs terminate/2 and the child
     # gets the graceful escalation, and (b) the linked Proc's exit arrives as
@@ -217,8 +241,6 @@ defmodule NetRunner.Daemon do
   # supervisor restarts a :permanent Daemon with fresh drains.
   def handle_info({:DOWN, ref, :process, _pid, reason}, state)
       when ref in [state.drain_ref, state.stderr_drain_ref] do
-    require Logger
-
     Logger.warning("[NetRunner.Daemon] drain task crashed: #{inspect(reason)}")
     {:stop, {:shutdown, :drain_crashed}, state}
   end
@@ -228,8 +250,6 @@ defmodule NetRunner.Daemon do
   # callers get a clean exit and supervisors can restart.
   def handle_info({:DOWN, ref, :process, _pid, reason}, state)
       when ref == state.forwarder_ref do
-    require Logger
-
     Logger.warning("[NetRunner.Daemon] stdin forwarder died: #{inspect(reason)}")
     {:stop, {:shutdown, :forwarder_down}, state}
   end
@@ -364,7 +384,6 @@ defmodule NetRunner.Daemon do
     reader.(proc)
   rescue
     e ->
-      require Logger
       Logger.warning("[NetRunner.Daemon] drain exception: #{inspect(e)}")
       :error
   catch
@@ -375,7 +394,6 @@ defmodule NetRunner.Daemon do
     handle_output(on_output, data)
   rescue
     e ->
-      require Logger
       Logger.warning("[NetRunner.Daemon] on_output raised: #{inspect(e)}")
       :ok
   catch
@@ -383,7 +401,6 @@ defmodule NetRunner.Daemon do
     # classic) must not kill the drain task: a dead stdout drain disables
     # draining AND stop-on-child-exit. Mirror safe_read/2.
     kind, reason ->
-      require Logger
       Logger.warning("[NetRunner.Daemon] on_output #{kind}: #{inspect(reason)}")
       :ok
   end
@@ -391,7 +408,6 @@ defmodule NetRunner.Daemon do
   defp handle_output(:discard, _data), do: :ok
 
   defp handle_output(:log, data) do
-    require Logger
     Logger.info(["[NetRunner.Daemon] ", data])
   end
 

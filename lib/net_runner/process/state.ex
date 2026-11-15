@@ -46,11 +46,15 @@ defmodule NetRunner.Process.State do
     # The validated :cgroup_path, or nil. Only consulted when the shepherd
     # dies without reporting: the BEAM then removes the leaf itself.
     cgroup_path: nil,
+    # pty: true. Gates set_window_size/3 (pipe mode has no terminal).
+    pty_mode: false,
     # Yield budgets (see NetRunner.Process); overridable for tests only.
     write_budget: 16,
     stderr_drain_chunks: 16,
     status: :running,
-    stats: %Stats{}
+    # Set by Process.init/1 (Stats.new/0). No struct default: it was dead and
+    # the only reason for a compile-time edge to Stats.
+    stats: nil
   ]
 
   @type status :: :running | :exiting | :exited
@@ -75,10 +79,11 @@ defmodule NetRunner.Process.State do
           uds_carry: binary(),
           protocol_error?: boolean(),
           cgroup_path: String.t() | nil,
+          pty_mode: boolean(),
           write_budget: pos_integer(),
           stderr_drain_chunks: pos_integer(),
           continue_writes_scheduled?: boolean(),
           status: status(),
-          stats: Stats.t()
+          stats: Stats.t() | nil
         }
 end

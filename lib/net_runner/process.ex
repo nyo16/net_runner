@@ -21,6 +21,8 @@ defmodule NetRunner.Process do
 
   use GenServer
 
+  require Logger
+
   alias NetRunner.Nif
   alias NetRunner.Process.{Cgroup, Exec, Operations, Pipe, Protocol, Stats}
   alias NetRunner.Signal
@@ -218,7 +220,14 @@ defmodule NetRunner.Process do
     GenServer.call(process, {:write, IO.iodata_to_binary(data)}, :infinity)
   end
 
-  @doc "Close stdin pipe."
+  @doc """
+  Close stdin.
+
+  In pipe mode the child sees EOF once both the BEAM's and the shepherd's
+  write ends are closed (this call closes both). In PTY mode it only closes
+  the BEAM's duplicate of the master fd: the terminal stays open, so the
+  child does NOT see EOF; end a PTY child with `kill/2` instead.
+  """
   @spec close_stdin(GenServer.server()) :: :ok | {:error, term()}
   def close_stdin(process) do
     GenServer.call(process, :close_stdin)
@@ -320,8 +329,9 @@ defmodule NetRunner.Process do
   end
 
   @doc """
-  Set PTY window size (rows, cols). Only works in PTY mode. Values outside
-  0..65535 do not fit the 2-byte protocol fields and are rejected.
+  Set PTY window size (rows, cols). Returns `{:error, :not_pty}` for a
+  process started without `pty: true`. Values outside 0..65535 do not fit the
+  2-byte protocol fields and are rejected.
   """
   @spec set_window_size(GenServer.server(), non_neg_integer(), non_neg_integer()) ::
           :ok | {:error, term()}
@@ -525,6 +535,10 @@ defmodule NetRunner.Process do
 
   def handle_call(:stderr_tail, _from, state) do
     {:reply, state.stderr_tail, state}
+  end
+
+  def handle_call({:set_window_size, _rows, _cols}, _from, %{pty_mode: false} = state) do
+    {:reply, {:error, :not_pty}, state}
   end
 
   def handle_call({:set_window_size, rows, cols}, _from, state) do
@@ -1233,8 +1247,6 @@ defmodule NetRunner.Process do
         state
 
       {:error, {:unknown_message, byte}} ->
-        require Logger
-
         Logger.warning(
           "[NetRunner] unknown shepherd frame opcode 0x#{Integer.to_string(byte, 16)}; " <>
             "ignoring all further shepherd frames for #{inspect(state.cmd)}"
@@ -1247,8 +1259,6 @@ defmodule NetRunner.Process do
   defp apply_uds_message(state, {:child_exited, status}), do: finish_exit(state, status)
 
   defp apply_uds_message(state, {:shepherd_error, msg}) do
-    require Logger
-
     Logger.warning("[NetRunner] shepherd reported error: #{inspect(msg)}")
     # Recorded, not just logged: `stats/1` exposes it as `:shepherd_error`.
     %{state | stats: Stats.record_shepherd_error(state.stats, msg)}
@@ -1268,8 +1278,6 @@ defmodule NetRunner.Process do
   # (race-free). Without a pidfd a group ESRCH means the group is gone, and a
   # direct kill by number could hit a recycled pid, so none is attempted.
   defp finish_orphaned(state, shepherd_status) do
-    require Logger
-
     {:ok, sigkill} = Signal.resolve(:sigkill)
     kill_orphan(state, sigkill)
 

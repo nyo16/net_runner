@@ -338,6 +338,7 @@ defmodule NetRunner.Process.Exec do
       os_pid: os_pid,
       cmd: cmd,
       args: args,
+      pty_mode: pty_mode,
       stderr_mode: stderr_mode,
       stderr_tail_bytes: Keyword.get(opts, :stderr_tail_bytes, 8_192),
       cgroup_path: Keyword.get(opts, :cgroup_path),
@@ -981,7 +982,7 @@ defmodule NetRunner.Process.Exec do
     with {:ok, write_fd} <- dup_or_close(master_fd),
          {:ok, stdout} <- wrap_or_close(master_fd, owner, [], [write_fd]),
          {:ok, stdin} <- wrap_or_close(write_fd, owner, [stdout], []) do
-      {:ok, %{stdin: stdin, stdout: stdout, stderr: nil}}
+      {:ok, %{stdin: stdin, stdout: %{stdout | eio_is_eof: true}, stderr: nil}}
     end
   end
 
