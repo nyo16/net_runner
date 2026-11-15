@@ -57,8 +57,9 @@ misbehaving. See Changed (breaking).
 
 ### Fixed
 
-- **The orphan path never kills by pid number.** After a shepherd crash the
-  BEAM signals the group and, where one exists, the pidfd; it can no longer
+- **The orphan path never signals the leader by pid number.** After a
+  shepherd crash the BEAM signals the group by pgid (not reused while any
+  member lives) and, where one exists, the leader's pidfd; it can no longer
   fall back to a probe-then-kill on a recyclable pid (N-1).
 - **Teardown reaches a leader that left its process group.** The shepherd
   SIGKILLs the group *and* the leader, and directly SIGKILLs a leader still

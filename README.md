@@ -581,8 +581,9 @@ BEAM Process (NetRunner.Process GenServer)
     |     |            parked on an exec gate)
     |     |-- Passes pipe FDs (+ a pidfd on Linux) to BEAM via UDS + SCM_RIGHTS,
     |     |   reports the pid, then releases the gate → execvp
-    |     |-- poll() loop: watches UDS + signal pipe (SIGCHLD, SIGTERM/INT/HUP/QUIT)
-    |     |-- BEAM dies (POLLHUP) or shepherd is told to stop
+    |     |-- poll() loop: watches UDS + port channel (fd 3) + signal pipe
+    |     |     (SIGCHLD, SIGTERM/INT/HUP/QUIT)
+    |     |-- BEAM dies (UDS POLLHUP, or fd-3 EOF/HUP) or shepherd is told to stop
     |     |     → SIGTERM group → SIGKILL group → reap → cgroup cleanup
     |     |-- Child dies (SIGCHLD) → SIGKILL leftover group members → reap
     |     |     → cgroup cleanup → notify BEAM, exit
@@ -592,13 +593,13 @@ BEAM Process (NetRunner.Process GenServer)
     |
     v
 NetRunner.Watcher (belt-and-suspenders with shepherd)
-    |-- Monitors GenServer, kills OS process if GenServer crashes
+    |-- Monitors GenServer; on a crash sends one SIGTERM probe (no escalation)
 ```
 
 **Zombie prevention — four mechanisms:**
 
-1. **Shepherd** — detects BEAM death via POLLHUP on UDS (after executing any commands still queued on it) or its own SIGTERM/SIGINT/SIGHUP/SIGQUIT, and always ends with a SIGKILL of the child's process group; also sweeps the group whenever the child exits on its own. On Linux the child additionally carries `PR_SET_PDEATHSIG(SIGKILL)`, so it dies with the shepherd
-2. **`Process` orphan kill** — detects shepherd death via its Port exit; if no exit status arrived, SIGKILLs the orphaned child's process group, plus a pidfd signal to the leader where a pidfd exists (Linux); it never kills by pid number
+1. **Shepherd** — detects BEAM death via POLLHUP on UDS (after executing any commands still queued on it), EOF/HUP on its fd-3 port channel, or its own SIGTERM/SIGINT/SIGHUP/SIGQUIT, and always ends with a SIGKILL of the child's process group; also sweeps the group whenever the child exits on its own. On Linux the child additionally carries `PR_SET_PDEATHSIG(SIGKILL)`, so it dies with the shepherd
+2. **`Process` orphan kill** — detects shepherd death via its Port exit; if no exit status arrived, SIGKILLs the orphaned child's process group by pgid (`killpg`; a pgid is not reused while any member lives), plus a pidfd signal to the leader where a pidfd exists (Linux); the leader is never signalled directly by pid number
 3. **Watcher** — detects GenServer crash via `Process.monitor` and sends a single SIGTERM probe via NIF (no escalation; that is the shepherd's job)
 4. **NIF owner monitor** — `io_resource_down` closes the BEAM's FDs when the owning process dies. The child sees broken pipe on stdout/stderr; it sees stdin EOF only once both the BEAM and the shepherd have closed their write ends (`close_stdin/1` → `CMD_CLOSE_STDIN`, ADR-18), which on the owner-death path happens when the shepherd tears down
 

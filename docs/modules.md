@@ -6,14 +6,15 @@ graph TD
     NR --> P[NetRunner.Process]
     NR --> IW[NetRunner.InputWriter]
     NR --> ERR[NetRunner.Error]
+    NR --> CMD[NetRunner.Command]
+    NR --> OPT[Process.Options]
     S --> P
     S --> IW
     S --> ERR
-    CMD[NetRunner.Command] --> NR
-    NR --> OPT[Process.Options]
+    IW --> P
+    D[NetRunner.Daemon] --> P
     P --> EX[Process.Exec]
     P --> OPT
-    P --> ST[Process.State]
     P --> OP[Process.Operations]
     P --> PI[Process.Pipe]
     P --> PR[Process.Protocol]
@@ -23,15 +24,15 @@ graph TD
     P --> STATS[Process.Stats]
     P --> W[NetRunner.Watcher]
     EX --> PR
-    PR --> OPT
     EX --> NI
+    EX --> PI
+    EX --> ST[Process.State]
+    PR --> OPT
     PI --> NI
-    ST --> PI
     ST --> OP
-    ST --> STATS
+    SIG --> NI
     W --> NI
     W --> SIG
-    D[NetRunner.Daemon] --> P
 
     subgraph "C Native"
         SH[shepherd.c]
@@ -46,6 +47,9 @@ graph TD
     NIFC --> UTIL
     SH --> PROTO
 ```
+
+The Elixir edges are exactly those reported by `mix xref graph` (compile,
+export and runtime references); regenerate from it when modules change.
 
 The OTP application (NetRunner.Application) starts no NetRunner module
 directly; it supervises `NetRunner.WatcherSupervisor` (a `DynamicSupervisor`
@@ -86,7 +90,7 @@ that each Watcher is started under) and `NetRunner.TaskSupervisor`.
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `c_src/shepherd.c` | ~1810 | Persistent child watchdog: token handshake (listener uid check), fork, exec gate, FD/pidfd pass, poll loop (UDS, signals, port channel), kill escalation, PTY, cgroup |
+| `c_src/shepherd.c` | ~1870 | Persistent child watchdog: token handshake (listener uid check), fork, exec gate, FD/pidfd pass, poll loop (UDS, signals, port channel), kill escalation, PTY, cgroup |
 | `c_src/net_runner_nif.c` | ~830 | NIF: read/write/close/create_fd/dup_fd/kill/kill_group/pidfd_send_signal/signal_number with enif_select |
 | `c_src/protocol.h` | ~60 | Shared protocol constants |
 | `c_src/utils.h` | ~35 | Debug/error macros |

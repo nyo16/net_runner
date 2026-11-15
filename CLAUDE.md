@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 mix deps.get              # Fetch dependencies
 mix compile               # Compile Elixir + C code (via elixir_make)
-mix test                  # Run full test suite (~250 tests)
+mix test                  # Run full test suite (~330 tests: macOS 326, Linux 337)
 mix test test/process_test.exs          # Run a single test file
 mix test test/process_test.exs:10       # Run a single test at line
 mix format                # Auto-format code
@@ -32,8 +32,8 @@ NetRunner is a safe OS process execution library for Elixir with NIF-based backp
 
 ### Zero Zombie Prevention (4 mechanisms)
 
-1. **Shepherd** — `PR_SET_PDEATHSIG` (Linux) plus BEAM-death detection (POLLHUP on UDS), then a SIGTERM→SIGKILL ladder on the child's process group
-2. **`Process` orphan kill** — `kill_orphan/2` on GenServer termination: shepherd/group SIGKILL plus a pidfd signal to the leader where a pidfd exists; never kills by pid number
+1. **Shepherd** — `PR_SET_PDEATHSIG` (Linux) plus BEAM-death detection (POLLHUP on UDS, or EOF/HUP on its fd-3 port channel), then a SIGTERM→SIGKILL ladder on the child's process group
+2. **`Process` orphan kill** — `kill_orphan/2` when the shepherd exits without reporting an exit status (not on GenServer termination): SIGKILL to the child's process group by pgid (`killpg`; safe because a pgid is not reused while any member lives) plus a pidfd signal to the leader where a pidfd exists; no direct kill of the leader by pid number (ADR-15)
 3. **Watcher GenServer** — monitors the Process GenServer; on DOWN sends a single SIGTERM probe by pid number (ADR-16 residual); escalation is the shepherd's job
 4. **NIF owner monitor** — `io_resource_down` closes FDs when the owning process dies (the destructor only runs for resources with no live `enif_select`)
 
@@ -41,7 +41,7 @@ NetRunner is a safe OS process execution library for Elixir with NIF-based backp
 
 1. BEAM creates a UDS listener at a random private temp path and a random 32-hex token
 2. `Port.open` (`:nouse_stdio`) launches shepherd with the UDS path as argv[1] and `--token-fd`; BEAM writes the token over fd 3
-3. Shepherd connects and echoes the token as the first frame (BEAM rejects unauthenticated connects)
+3. Shepherd connects, checks that the listener's owner (the UDS peer) runs as its own effective uid (SO_PEERCRED / getpeereid, fail-closed), then echoes the token as the first frame (BEAM rejects unauthenticated connects)
 4. Shepherd forks the child, which blocks on the exec gate; shepherd sends pipe FDs (plus a Linux pidfd when `pidfd_open` succeeds) via SCM_RIGHTS, then `MSG_CHILD_STARTED(pid)`
 5. Shepherd writes `'G'` to the exec gate; only then does the child `execvp`
 6. GenServer wraps FDs (and pidfd) in NIF resources, registers with Watcher
@@ -92,14 +92,17 @@ Shepherd→BEAM: `MSG_CHILD_STARTED(pid)`, `MSG_CHILD_EXITED(status)`, `MSG_ERRO
   (~20 ms per boundary for a 200k-cons list, and the refc bump per binary
   is paid per element). Reduce to a few flat refc binaries in the sender
   first — binaries cross process boundaries for free. See
-  `InputWriter.prepare/1` for the pattern; bisect suspect cases by running
+  `InputWriter.start/3` (its list clause coalesces in the caller before
+  `Task.async`) for the pattern; bisect suspect cases by running
   the same code inline vs spawned.
 - **Verify achievable batch size before batching syscalls/messages.** The
   cap is `pipe_capacity / read_size`: macOS pipes (64 KiB = read size)
   yield 1-chunk batches, Linux (1 MiB shepherd-grown) up to 16. Instrument
   with a batch-size histogram probe before trusting a message-count
   projection, and bench on the platform the optimization targets.
-- **Bench discipline**: `MIX_ENV=prod mix run bench/perf.exs`, ≥3 runs,
+- **Bench discipline**: `MIX_ENV=prod mix run bench/perf.exs` (Linux-only
+  claims — `pipe_size:` throughput, cgroup exit latency — via
+  `bench/linux_ab.exs`), ≥3 runs,
   compare medians, ~11% run-to-run spread is the noise floor; measure
   BEFORE a fix lands so the gain is measured, not asserted; A/B on the
   same machine state when a gate reads ambiguous. `@default_read_size`

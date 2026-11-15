@@ -202,7 +202,8 @@ Bench.throughput("drain 16MB stderr (tail 1MiB)", 16 * 1_048_576, fn ->
 end)
 
 # --- 5b. PERF-5: max_output_size truncation ---
-# The partial is a slice of the last chunk read; report what it keeps alive.
+# The partial is a fresh binary of exactly max_output_size bytes (only those
+# are flattened), so it should pin only itself; report what it keeps alive.
 Bench.time("max_output_size 1MiB truncation of `yes`", fn ->
   {:error, {:max_output_exceeded, _}} =
     NetRunner.run(["yes"], max_output_size: 1_048_576 + 1)

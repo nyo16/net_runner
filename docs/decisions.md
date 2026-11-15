@@ -10,7 +10,7 @@
 - (+) Detects BEAM death via UDS `POLLHUP` — guaranteed child cleanup even under `SIGKILL`
 - (+) Can relay commands (kill signals, stdin close, window size) to the child
 - (-) Costs one extra process per command (~100KB resident memory)
-- (-) More complex C code (`shepherd.c` is ~1700 lines vs ~200 for an exec-away launcher)
+- (-) More complex C code (`shepherd.c` is close to 2000 lines vs ~200 for an exec-away launcher)
 
 ## ADR-2: UDS + SCM_RIGHTS (vs Named Pipes)
 
@@ -48,7 +48,7 @@
 - (+) No additional toolchain required — `gcc`/`clang` available everywhere
 - (+) Fast compilation (<1 second)
 - (+) Direct access to POSIX APIs without FFI layers
-- (+) ~2600 lines of C total (`shepherd.c` ~1700, `net_runner_nif.c` ~800, plus headers), easy to audit
+- (+) A few thousand lines of C in total (`shepherd.c`, `net_runner_nif.c` and small headers), easy to audit
 - (-) Manual memory management (mitigated by simple allocation patterns)
 - (-) No type safety beyond what C provides
 
@@ -67,11 +67,13 @@
 
 **Addendum (2026-11)**: "Dual" undercounts. The zero-zombie guarantee rests on
 four mechanisms, and every doc counts them the same way:
-1. **Shepherd** — `PR_SET_PDEATHSIG` on the child (Linux) plus the POLLHUP /
-   termination-signal SIGTERM→SIGKILL ladder on the child's process group.
+1. **Shepherd** — `PR_SET_PDEATHSIG` on the child (Linux) plus the
+   SIGTERM→SIGKILL ladder on the child's process group, triggered by UDS
+   POLLHUP, EOF/HUP on the fd-3 port channel, or a termination signal.
 2. **`Process` orphan kill** — on shepherd death without an exit status,
-   group SIGKILL plus a pidfd signal to the leader where a pidfd exists; no
-   direct kill by pid number.
+   group SIGKILL by pgid (not reused while any member lives) plus a pidfd
+   signal to the leader where a pidfd exists; no direct kill of the leader by
+   pid number.
 3. **Watcher** — a single SIGTERM probe on GenServer death (by pid number;
    the accepted residual of ADR-16).
 4. **NIF owner monitor** — `io_resource_down` closes the BEAM's FDs.
@@ -325,7 +327,8 @@ retries now back off exponentially (1, 2, 4 … 512 ms, the same ~1 s cap), and
 the ordering above is unchanged. Linux Docker, 3 runs × 100 exits under
 `cgroup_path:`: before, 5–9 per 100 took ≥ 50 ms (mean 6.3–10.4 ms); after,
 0 per 100 (mean 1.6–3.1 ms, against 1.2–3.6 ms without a cgroup). Details in
-`bench/LINUX_VERIFICATION.md`.
+`bench/LINUX_VERIFICATION.md`; reproduce the "after" numbers on Linux with
+`MIX_ENV=prod mix run bench/linux_ab.exs` (needs a writable cgroup v2).
 
 ## ADR-15: Unconditional Exec Gate; Hand Off Before Exec
 
@@ -344,8 +347,9 @@ child joins/creates its group, resets signals, blocks on the gate → parent
 after `setsid()` → `cgroup_setup` → `send_fds` → `MSG_CHILD_STARTED` → `'G'`.
 Any failure before `'G'` closes the gate (the child `_exit(127)`s without
 exec), SIGKILLs and reaps it, then reports `MSG_ERROR`. On the BEAM side the
-orphan path (`kill_orphan/2`) sends a group SIGKILL, plus a pidfd signal to
-the leader where a pidfd exists; no direct kill by pid number.
+orphan path (`kill_orphan/2`) sends a group SIGKILL by pgid, plus a pidfd
+signal to the leader where a pidfd exists; no direct kill of the leader by
+pid number.
 
 **Consequences**:
 - (+) A spawn that returns an error never ran the command.
@@ -384,7 +388,8 @@ old fd counts and the probe-then-kill path.
 - (−) Accepted residual: the Watcher's crash-path probe (one SIGTERM after
   the `Process` GenServer dies) still signals by pid number on every
   platform, Linux included — the Watcher holds no pidfd. The orphan path
-  never kills by pid number; it uses the group kill plus the pidfd only.
+  never signals the leader by pid number: it uses the group kill (`killpg`
+  by pgid, which is not reused while any member lives) plus the pidfd only.
 
 ## ADR-17: Deferred Isolation Mechanisms
 

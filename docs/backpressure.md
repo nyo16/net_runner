@@ -50,12 +50,15 @@ sequenceDiagram
 4. On `EAGAIN`, GenServer parks the caller in the operations queue
 5. When data arrives, BEAM's event loop detects fd readiness via epoll/kqueue
 6. BEAM sends `{:select, resource, ref, :ready_input}` to GenServer
-7. GenServer retries all parked read operations
+7. GenServer retries the parked read operations of the woken pipe only
+   (stdout readiness retries stdout reads; stderr readiness retries stderr
+   reads and the stderr consumer)
 
 ### Write Path
 
 1. `NetRunner.Process.write/2` calls `GenServer.call(pid, {:write, data}, :infinity)`
-2. GenServer enters `write_loop`:
+2. GenServer runs `write_some/3`, the one write engine shared by a fresh
+   write and the parked-writer pass:
    - `Pipe.write(pipe, data)` → `Nif.nif_write(resource, data)`
    - If fully written: returns `:ok`
    - If partial write: retries immediately with remaining data
@@ -63,7 +66,12 @@ sequenceDiagram
    - After `@write_budget` (16) `write(2)` calls in one pass: parks the caller
      with the remaining bytes and self-sends `:continue_writes`
 3. Partial writes are retried immediately because the kernel may have room for more
-4. The budget yield keeps a fast-draining child from letting one large payload
+4. On `:ready_output`, parked writers are retried in order sharing one
+   `@write_budget`. An `EAGAIN` ends that pass: the pipe is full, so every
+   other parked writer would only `EAGAIN` too; the select the `EAGAIN`
+   registered wakes the next pass. A writer's remaining bytes are carried
+   forward, never restarted from offset 0
+5. The budget yield keeps a fast-draining child from letting one large payload
    occupy the GenServer for its whole duration — queued calls (`kill/2`,
    `read/2`, another caller's `write/2`) run between passes. Progress never
    depends on a readiness event that was never registered: the resume comes
@@ -71,7 +79,7 @@ sequenceDiagram
 
 ### Why Partial Write Retry Matters
 
-Without immediate retry, a partial write would park the caller, but `enif_select` might not fire again because the pipe buffer isn't actually full — the NIF just happened to write less than requested. The write loop ensures we keep writing until one of its three exits:
+Without immediate retry, a partial write would park the caller, but `enif_select` might not fire again because the pipe buffer isn't actually full — the NIF just happened to write less than requested. `write_some/3` keeps writing until one of its three exits:
 - Complete the write (all bytes sent)
 - Get `EAGAIN` (pipe buffer truly full → `enif_select` registered → will get notified)
 - Exhaust the 16-call `@write_budget` (caller parked → resumed via a
@@ -81,7 +89,7 @@ A consequence of the third exit: a payload is **not atomic** against
 concurrent writers. A budget yield (or a full-pipe park) lets another
 caller's write splice between this payload's chunks — documented on
 `NetRunner.Process.write/2`; serialise externally (as `Daemon` does via its
-forwarder) when payload atomicity matters. See `write_loop/5` in
+forwarder) when payload atomicity matters. See `write_some/3` in
 `lib/net_runner/process.ex`.
 
 ## Pipe Buffer Sizes
@@ -133,6 +141,9 @@ The cost is throughput. Linux Docker (`elixir:1.18`, OrbStack kernel 7.2,
 | 64 MiB `dd` via `stream!/2` | 4249–5087 | 1555–1629 |
 | 16 MiB through `cat` via `run/2` | 1670–2296 | 992–1047 |
 | 16 MiB stderr drain | 2429–2701 | 1313–1381 |
+
+Reproduce the table on Linux with `MIX_ENV=prod mix run bench/linux_ab.exs`
+(the same rows, `:grown` vs `:default`, medians of 5).
 
 A Daemon that streams bulk data should pass `process_opts: [pipe_size: :grown]`.
 
