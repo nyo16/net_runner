@@ -130,8 +130,11 @@ defmodule NetRunner.ProcessTest do
       # write budget and every byte must land exactly once. 4 MiB total —
       # well past Linux's 256 KiB shepherd-grown stdin pipe, so parking
       # happens on every platform — and the park is asserted before the
-      # drain starts.
-      {:ok, pid} = Proc.start("sh", ["-c", "sleep 0.5; exec cat > /dev/null"])
+      # drain starts. write_budget: 1 forces a budget yield on every resume
+      # pass with work left, so the :continue_writes path (the only thing that
+      # resumes a yielded write) must carry the bytes; the trace proves it ran.
+      {:ok, pid} = Proc.start("sh", ["-c", "sleep 0.5; exec cat > /dev/null"], write_budget: 1)
+      :erlang.trace(pid, true, [:receive])
       payload = :binary.copy(<<1>>, 1_048_576)
 
       tasks = for _ <- 1..4, do: Task.async(fn -> Proc.write(pid, payload) end)
@@ -140,6 +143,7 @@ defmodule NetRunner.ProcessTest do
       results = Task.await_many(tasks, 15_000)
 
       assert results == [:ok, :ok, :ok, :ok]
+      assert_received {:trace, ^pid, :receive, :continue_writes}
       assert Proc.stats(pid).bytes_in == 4 * 1_048_576
       assert :ok = Proc.close_stdin(pid)
       assert {:ok, 0} = Proc.await_exit(pid)
