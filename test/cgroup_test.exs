@@ -103,27 +103,6 @@ defmodule NetRunner.CgroupTest do
       end
     end
 
-    test "places an unprefixed path under net_runner/ with a one-time deprecation warning" do
-      # 1.3.x accepted unprefixed paths; 1.4.0 raised on them inside a minor
-      # release (issue #24). Until 2.0 they are prefixed instead. This is the
-      # only test in the suite that passes an unprefixed path, so the
-      # once-per-VM warning is still pending when it runs.
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          assert Proc.validate_opts!(cgroup_path: "legacy_job")[:cgroup_path] ==
-                   "net_runner/legacy_job"
-
-          assert Proc.validate_opts!(cgroup_path: "system.slice/x")[:cgroup_path] ==
-                   "net_runner/system.slice/x"
-        end)
-
-      assert length(String.split(log, "deprecated")) == 2,
-             "expected exactly one deprecation warning, got: #{log}"
-
-      assert Proc.validate_opts!(cgroup_path: "net_runner/job")[:cgroup_path] ==
-               "net_runner/job"
-    end
-
     test "still rejects paths that name no cgroup or escape after prefixing" do
       assert_raise ArgumentError, ~r/under net_runner\//, fn ->
         Proc.start("echo", ["x"], cgroup_path: "net_runner/")

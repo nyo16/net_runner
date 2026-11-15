@@ -23,13 +23,6 @@ defmodule NetRunner.ExitStatusTest do
       assert {"", 3} = NetRunner.run(["/bin/sh", "-c", "exit 3"])
     end
 
-    test "does not wait for the force-exit backstop" do
-      # The backstop is 5 s. Anything near it means the status came from the
-      # timeout rather than from the shepherd.
-      {us, {"hi\n", 0}} = :timer.tc(fn -> NetRunner.run([@echo, "hi"]) end)
-      assert us < 1_000_000
-    end
-
     test "a slow child still reports correctly" do
       assert {"hi\n", 0} = NetRunner.run(["/bin/sh", "-c", "sleep 0.2; echo hi"])
       assert {"", 3} = NetRunner.run(["/bin/sh", "-c", "sleep 0.2; exit 3"])

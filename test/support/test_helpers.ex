@@ -16,32 +16,39 @@ defmodule NetRunner.TestHelpers do
   `GenServer.call` racing a Process mid-teardown exits with `:noproc` (or
   `:timeout` while the server is briefly wedged) — exactly the in-between
   states this helper exists to ride out. Any other exit propagates.
+
+  A `:timeout` exit means the attempt itself blocked for its call timeout, so
+  it is re-polled only while another attempt that long still fits before the
+  deadline: the helper overshoots `timeout_ms` by at most one call timeout.
+  Polled calls should pass a timeout well under `timeout_ms`.
   """
   def eventually(fun, timeout_ms \\ 2_000) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     poll(fun, deadline)
   end
 
-  # The on_expiry closures passed to retry_or_flunk/3 deliberately never
+  defp poll(fun, deadline), do: attempt(fun, deadline, System.monotonic_time(:millisecond))
+
+  # The on_expiry closures passed to retry_or_flunk/4 deliberately never
   # return (flunk/reraise/exit); dialyzer flags the closure creation site.
-  @dialyzer {:nowarn_function, poll: 2}
-  defp poll(fun, deadline) do
+  @dialyzer {:nowarn_function, attempt: 3}
+  defp attempt(fun, deadline, started) do
     result = fun.()
 
     if result do
       result
     else
-      retry_or_flunk(fun, deadline, fn ->
+      retry_or_flunk(fun, deadline, 0, fn ->
         ExUnit.Assertions.flunk("eventually/2: condition still falsy after deadline")
       end)
     end
   rescue
     e in [ExUnit.AssertionError] ->
-      retry_or_flunk(fun, deadline, fn -> reraise e, __STACKTRACE__ end)
+      retry_or_flunk(fun, deadline, 0, fn -> reraise e, __STACKTRACE__ end)
   catch
     :exit, reason ->
       if transient_exit?(reason) do
-        retry_or_flunk(fun, deadline, fn -> exit(reason) end)
+        retry_or_flunk(fun, deadline, blocked_ms(reason, started), fn -> exit(reason) end)
       else
         exit(reason)
       end
@@ -53,13 +60,30 @@ defmodule NetRunner.TestHelpers do
   defp transient_exit?({:timeout, _}), do: true
   defp transient_exit?(_), do: false
 
-  defp retry_or_flunk(fun, deadline, on_expiry) do
-    if System.monotonic_time(:millisecond) < deadline do
+  # How long the next attempt can be expected to block: a timed-out call
+  # will most likely time out again, after just as long.
+  defp blocked_ms(:timeout, started), do: System.monotonic_time(:millisecond) - started
+  defp blocked_ms({:timeout, _}, started), do: System.monotonic_time(:millisecond) - started
+  defp blocked_ms(_reason, _started), do: 0
+
+  defp retry_or_flunk(fun, deadline, next_attempt_ms, on_expiry) do
+    if System.monotonic_time(:millisecond) + next_attempt_ms < deadline do
       Process.sleep(10)
       poll(fun, deadline)
     else
       on_expiry.()
     end
+  end
+
+  @doc """
+  Median wall time of `samples` calls to `fun`, in microseconds. Latency
+  bounds compare this against a quiet twin measured in the same test instead
+  of an absolute constant, so ambient load from sibling async tests scales
+  both sides.
+  """
+  def median_us(fun, samples \\ 11) do
+    times = for _ <- 1..samples, do: elem(:timer.tc(fun), 0)
+    times |> Enum.sort() |> Enum.at(div(samples, 2))
   end
 
   @doc """

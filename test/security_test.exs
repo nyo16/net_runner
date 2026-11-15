@@ -109,21 +109,21 @@ defmodule NetRunner.SecurityTest do
     test "a shepherd that never receives its token gives up" do
       # --token-timeout shortens the 10 s default wait (T-19).
       port = open_tokenless_shepherd(["--token-timeout", "200"])
-      assert_receive {^port, {:exit_status, 1}}, 3_000
+      assert {output, 1} = await_shepherd_exit(port)
+      assert output =~ "timed out waiting for token"
     end
 
     test "--token-timeout is range-checked like --kill-timeout" do
       port = open_tokenless_shepherd(["--token-timeout", "0"])
-      assert_receive {^port, {:exit_status, 1}}, 3_000
+      assert {output, 1} = await_shepherd_exit(port)
+      assert output =~ "--token-timeout must be 1-60000 ms"
     end
 
     test "a shepherd whose token channel closes early exits promptly" do
-      port = open_tokenless_shepherd()
-      {:os_pid, os_pid} = Port.info(port, :os_pid)
-      true = Port.command(port, "00000")
-      Port.close(port)
-
-      eventually(fn -> not os_pid_alive?(os_pid) end, 3_000)
+      # Five bytes of the 32-byte token, then EOF on fd 3.
+      port = open_tokenless_shepherd([], "00000")
+      assert {output, 1} = await_shepherd_exit(port)
+      assert output =~ "BEAM closed before sending token"
     end
   end
 
@@ -203,19 +203,46 @@ defmodule NetRunner.SecurityTest do
     end
   end
 
-  defp open_tokenless_shepherd(extra_flags \\ []) do
+  # Runs the shepherd up to its token read, behind a /bin/sh wrapper that sets
+  # up fd 3, because :stderr_to_stdout (which brings the shepherd's error
+  # line back as port data instead of leaking it into the suite output)
+  # excludes the :nouse_stdio fd 3/4 channel. Without `token_feed`, fd 3 is
+  # the port's input, as in production; with it, fd 3 is a pipe that
+  # delivers `token_feed` and then closes.
+  defp open_tokenless_shepherd(extra_flags, token_feed \\ nil) do
     shepherd = Path.join(to_string(:code.priv_dir(:net_runner)), "shepherd")
     socket_path = Path.join(System.tmp_dir!(), "nr_unused_#{System.unique_integer([:positive])}")
 
+    {script, env} =
+      if token_feed do
+        {~S[printf %s "$NR_TOKEN_FEED" | { exec 3<&0 </dev/null; exec "$0" "$@"; }],
+         [{~c"NR_TOKEN_FEED", String.to_charlist(token_feed)}]}
+      else
+        {~S|exec 3<&0; exec "$0" "$@"|, []}
+      end
+
     Port.open(
-      {:spawn_executable, shepherd},
+      {:spawn_executable, "/bin/sh"},
       [
-        :nouse_stdio,
+        :stderr_to_stdout,
         :exit_status,
         :binary,
-        args: [socket_path, "--token-fd" | extra_flags] ++ ["--", "/bin/true"]
+        env: env,
+        args:
+          ["-c", script, shepherd, socket_path, "--token-fd" | extra_flags] ++
+            ["--", "/bin/true"]
       ]
     )
+  end
+
+  # Everything the port printed, and its exit status.
+  defp await_shepherd_exit(port, acc \\ []) do
+    receive do
+      {^port, {:data, data}} -> await_shepherd_exit(port, [acc | data])
+      {^port, {:exit_status, status}} -> {IO.iodata_to_binary(acc), status}
+    after
+      3_000 -> flunk("shepherd did not exit; output so far: #{inspect(acc)}")
+    end
   end
 
   # The pipe end or pidfd the BEAM holds for `link` ("pipe:[ino]",

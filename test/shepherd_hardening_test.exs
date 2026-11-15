@@ -61,6 +61,23 @@ defmodule NetRunner.ShepherdHardeningTest do
     {path, full}
   end
 
+  # The library hands over `pidfd: nil` where pidfd_open is unavailable
+  # (pre-5.3 kernels, seccomp profiles that filter it), so a nil pidfd is a
+  # supported configuration. CI legs known to provide pidfds set
+  # NR_PIDFD_REQUIRED=1, which makes it mandatory.
+  defp assert_linux_pidfd(pidfd) do
+    cond do
+      System.get_env("NR_PIDFD_REQUIRED") == "1" ->
+        assert %Pipe{} = pidfd, "NR_PIDFD_REQUIRED=1 but the shepherd sent no pidfd"
+
+      pidfd == nil ->
+        degraded_note("no pidfd on this host; pidfd assertions skipped")
+
+      true ->
+        assert %Pipe{} = pidfd
+    end
+  end
+
   describe "H1/S-01: teardown SIGKILLs the group even when the leader died on SIGTERM" do
     test "Proc.stop" do
       marker = sleep_marker()
@@ -260,11 +277,14 @@ defmodule NetRunner.ShepherdHardeningTest do
       %{pidfd: pidfd} = :sys.get_state(pid)
 
       if match?({:unix, :linux}, :os.type()) do
-        assert %Pipe{resource: resource} = pidfd
-        {:ok, sigcont} = Signal.resolve(:sigcont)
-        assert :ok = Nif.nif_pidfd_send_signal(resource, sigcont)
+        assert_linux_pidfd(pidfd)
       else
         assert pidfd == nil
+      end
+
+      with %Pipe{resource: resource} <- pidfd do
+        {:ok, sigcont} = Signal.resolve(:sigcont)
+        assert :ok = Nif.nif_pidfd_send_signal(resource, sigcont)
       end
 
       assert :ok = Proc.kill(pid, :sigkill)
@@ -277,17 +297,22 @@ defmodule NetRunner.ShepherdHardeningTest do
     @tag :linux_only
     test "a pidfd for a reaped child reports :esrch instead of hitting a reused pid" do
       {:ok, pid} = Proc.start("sleep", ["30"])
-      %Pipe{resource: resource} = :sys.get_state(pid).pidfd
-      # Detach the pidfd from the server so finish_exit does not close it.
-      :sys.replace_state(pid, &%{&1 | pidfd: nil})
+      %{pidfd: pidfd} = :sys.get_state(pid)
+      assert_linux_pidfd(pidfd)
 
-      assert :ok = Proc.kill(pid, :sigkill)
-      assert {:ok, 137} = Proc.await_exit(pid)
+      with %Pipe{resource: resource} <- pidfd do
+        # Detach the pidfd from the server so finish_exit does not close it.
+        :sys.replace_state(pid, &%{&1 | pidfd: nil})
 
-      {:ok, sigcont} = Signal.resolve(:sigcont)
-      assert {:error, :esrch} = Nif.nif_pidfd_send_signal(resource, sigcont)
+        assert :ok = Proc.kill(pid, :sigkill)
+        assert {:ok, 137} = Proc.await_exit(pid)
 
-      Nif.nif_close(resource)
+        {:ok, sigcont} = Signal.resolve(:sigcont)
+        assert {:error, :esrch} = Nif.nif_pidfd_send_signal(resource, sigcont)
+
+        Nif.nif_close(resource)
+      end
+
       Proc.stop(pid)
     end
   end
