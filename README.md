@@ -553,6 +553,7 @@ end, max_concurrency: 20)
 | `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only; raises elsewhere) under a `net_runner/` prefix, not nested under another live spawn's path, under 256 bytes; unprefixed paths are prefixed (deprecated) |
 | `:cwd` | string | `nil` | Child working directory. Defaults to the BEAM working directory. |
 | `:no_new_privs` | boolean | `false` | Set `PR_SET_NO_NEW_PRIVS` in the child before exec, so setuid/setgid binaries and file capabilities cannot raise its privileges (Linux only; `true` raises `ArgumentError` elsewhere). See [Security model](#security-model). |
+| `:pipe_size` | `:grown` \| `:default` | `:grown` (`Daemon`: `:default`) | Linux pipe sizing. `:grown` grows stdout to 1 MiB and stdin/stderr to 256 KiB for throughput, charged to the user's `pipe-user-pages-soft` budget while the pipes live; `:default` keeps the kernel's 64 KiB. No effect off Linux. See [docs/backpressure.md](docs/backpressure.md). |
 
 Unknown options raise `ArgumentError` (`Keyword.validate!/2`) instead of being
 silently ignored. `stream!/2` accepts the same options minus `:timeout`,
@@ -572,7 +573,7 @@ callers that manage processes directly.
 ```
 BEAM Process (NetRunner.Process GenServer)
     |
-    |-- Port.open("priv/shepherd", [:nouse_stdio, :exit_status])
+    |-- Port.open(:code.priv_dir(:net_runner) <> "/shepherd", [:nouse_stdio, :exit_status])
     |     |
     |     v
     |   Shepherd Binary (stays alive for child's lifetime)

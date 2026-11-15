@@ -6,6 +6,107 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.7.0] - Unreleased
+
+Remediation of the 2026-11-15 project-health audit: kill-path and teardown
+fixes, shepherd protocol and handshake hardening, cgroup lifecycle, API
+contracts, test-suite health, CI/build/supply-chain, and performance.
+**Breaking (minor-version convention, as in 1.4.0):** isolation options are
+rejected off Linux, and two PTY misuses now fail instead of silently
+misbehaving. See Changed (breaking).
+
+### Changed (breaking)
+
+- **`cgroup_path` and `no_new_privs: true` raise `ArgumentError` off Linux**
+  instead of running the child unconfined; the non-Linux shepherd also fails
+  closed if handed a cgroup path. Malformed values still report their usual
+  error first, on every platform (S-05).
+- **`NetRunner.Process.set_window_size/3` returns `{:error, :not_pty}`** for a pipe-mode
+  process instead of `:ok` (A-4).
+- **`run/2` rejects `:input` together with `pty: true`**: a PTY has no stdin
+  EOF, so a child reading to EOF waited forever (A-4).
+- **Build artefacts live in `_build/<env>/lib/net_runner/priv`**, not a
+  top-level `priv/`. Delete a stale top-level `priv/` from older checkouts
+  (D1).
+
+### Changed
+
+- **`:kill_timeout` is honoured by `NetRunner.Daemon` and the `Stream` EOF
+  grace.** A Daemon's SIGTERM grace is `process_opts[:kill_timeout]` (default
+  still 3 000 ms), and `Daemon.child_spec/1` sizes the supervisor `shutdown:`
+  to match; a stream that reached EOF waits `:kill_timeout` (default still
+  1 000 ms). An early-halted stream keeps its fixed 200 ms (N-2).
+- **`NetRunner.Daemon` defaults to `pipe_size: :default`** (see Added): a
+  Daemon holds its pipes for its lifetime. Pass `pipe_size: :grown` in
+  `process_opts` for bulk-streaming daemons (PERF-1r).
+- **`Daemon.start_link/1` validates `:cmd` and `:on_output` in the caller**
+  (`ArgumentError`) instead of failing in `init/1` or logging a
+  `FunctionClauseError` per drained chunk; `on_output: nil` means
+  `:discard` (A-3).
+- **`NetRunner.Daemon.write/2` accepts iodata**, like `NetRunner.Process.write/2` (N-7).
+- **End of PTY output is `:eof`**, not `{:error, :eio}` (Linux) (A-4).
+- `NetRunner.Process.Stats` mutators are `@doc false`; the struct and type
+  stay public (A-6).
+
+### Added
+
+- **`pipe_size: :grown | :default`** spawn option (`run/2`, `stream/2`,
+  `Process`, Daemon `process_opts`) to opt out of Linux pipe growth and its
+  per-user pipe budget. `:default` measured at 35–65% of `:grown`
+  throughput on Linux (docs/backpressure.md) (PERF-1r).
+
+### Fixed
+
+- **The orphan path never kills by pid number.** After a shepherd crash the
+  BEAM signals the group and, where one exists, the pidfd; it can no longer
+  fall back to a probe-then-kill on a recyclable pid (N-1).
+- **Teardown reaches a leader that left its process group.** The shepherd
+  SIGKILLs the group *and* the leader, and directly SIGKILLs a leader still
+  alive after the reap wait, instead of reporting 137 for a live process
+  (S-13).
+- **An over-long or non-Latin-1 signal atom** returns
+  `{:error, :unknown_signal}` instead of crashing the Process GenServer
+  (and its child) (S-08).
+- **An unknown shepherd frame is sticky on the BEAM side too**: nothing after
+  it is parsed (N-4).
+- **A silent same-uid connection** costs the real spawn at most 250 ms
+  instead of the whole 10 s accept deadline (S-07).
+- **A split `MSG_CHILD_STARTED`** during the handshake is completed rather
+  than misread (A-15).
+- **Closing the shepherd Port tears the child down**: the shepherd now watches
+  its port channel (fd 3), not only the UDS (S-15/F-08).
+- **cgroup exit latency.** Removal retries back off from 1 ms instead of
+  sleeping 100 ms, so exits of commands that leave background processes
+  behind are no longer delayed by ~100 ms one time in ~14 (PERF-9).
+- **A shepherd killed with a cgroup no longer leaks its leaf**: the BEAM
+  `cgroup.kill`s and removes it, so the path stays reusable (S-06).
+- **A nested `cgroup_path`** under another spawn's live leaf is refused
+  instead of being killed by that spawn's recursive teardown (S-14).
+
+### Security
+
+- The shepherd refuses a UDS listener not owned by its own uid before
+  sending the handshake token (S-15).
+- Received fds are close-on-exec in the BEAM (`MSG_CMSG_CLOEXEC` on Linux,
+  `FD_CLOEXEC` in `nif_create_fd`, `F_DUPFD_CLOEXEC` for the PTY dup) (S-04).
+- Compiler hardening flags, each probed: `-fstack-clash-protection`,
+  `-fcf-protection` / `-mbranch-protection=standard`, `_FORTIFY_SOURCE=3`
+  (S-11).
+- CI: `persist-credentials: false`, pinned Alpine packages, `HEX_API_KEY`
+  scoped to the publish steps, `--check-locked`, `mix deps.audit` (D4, D5,
+  D9, D10).
+
+### Performance
+
+- A lazy `:input` is copied into one process, not two: `run/2` starts the
+  writer from the caller. List-backed lazy input +29% (PERF-2).
+- The retained stderr tail appends in O(chunk): a 1 MiB tail drains 64%
+  faster, at parity with the 8 KiB default (PERF-3).
+- A `max_output_size` partial no longer pins the read buffer (a 1000-byte
+  partial held 64 KiB) (PERF-5).
+- One write engine; an EAGAIN ends the parked-writer pass instead of every
+  parked writer retrying a full pipe (A-8, PERF-6).
+
 ## [1.6.0] - 2026-10-31
 
 Shepherd hardening from a six-slice audit of 1.5.0 (static security review,
