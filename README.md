@@ -675,20 +675,24 @@ relying on them.
 
 ## Requirements
 
-- Elixir ~> 1.17
-- Erlang/OTP 27+
+- Elixir ≥ 1.17, Erlang/OTP ≥ 27 (tested floor: Elixir 1.17.3 / OTP 27.2)
 - C compiler (`gcc` or `clang`)
 - `make`
 - Linux or macOS
 
 ### Building for another target
 
-`make` writes the shepherd and NIF to `priv/`, or to the directory given as
-`PRIV_DIR` on its command line, and writes nothing else. A release for another
+Under Mix, `make` writes the shepherd and NIF to the app's build directory,
+`_build/<env>/lib/net_runner/priv` (`$MIX_APP_PATH/priv`, the directory
+`:code.priv_dir(:net_runner)` resolves to). Run by hand, it writes to the same
+place for `MIX_ENV`, `dev` by default. A `PRIV_DIR` on its command line
+overrides that, and the build writes nothing else. A release for another
 target, such as one that ships a musl BEAM to glibc hosts, can build into its
 own `priv`. The NIF must be built against the ERTS that will load it. Run the
 build on a Linux host, because the Makefile selects its platform flags from the
-host's `uname`.
+host's `uname`. Hardening flags (`-fstack-clash-protection`, `-fcf-protection`
+or `-mbranch-protection=standard`, `_FORTIFY_SOURCE=3`) are each probed against
+`CC` and used only where that compiler accepts them for its target.
 
 ```sh
 make -B all \

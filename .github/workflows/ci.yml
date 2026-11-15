@@ -19,6 +19,20 @@ env:
   ELIXIR_VERSION: "1.17.3"
   OTP_VERSION: "27.2"
 
+# Every checkout sets persist-credentials: false, so GITHUB_TOKEN is not left
+# in .git/config while dependency code runs. Do not export GITHUB_TOKEN into
+# the environment of any job that compiles deps either: yamerl's
+# rebar.config.script (via mix_audit) fetches a git plugin and passes the
+# token to it when GITHUB_ACTIONS and GITHUB_TOKEN are both set.
+#
+# Cache keys carry a prefix per cached path set: mix-build (deps + _build),
+# mix-deps (deps only), plt (plts/) and asan-build (sanitizer deps + _build).
+# Jobs that share a key cache exactly the same paths.
+#
+# mix deps.get runs with --check-locked wherever mix.lock is authoritative.
+# The two exceptions are deps-latest, which discards the lock on purpose, and
+# the unpacked Hex tarball in package, which ships no mix.lock.
+
 jobs:
   compile:
     name: Compile & Warnings
@@ -27,18 +41,20 @@ jobs:
       WERROR: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      # Run this before any other build step. Later steps build into priv/, and
-      # a stray write there would then go unnoticed.
+      # Run this before any other build step. Later steps build into _build/,
+      # and a stray write there would then go unnoticed.
       - name: Build into another PRIV_DIR, leaving the tree unchanged
         run: |
           make all PRIV_DIR="$RUNNER_TEMP/priv"
-          test -z "$(git status --porcelain --ignored -- c_src priv)"
+          test -z "$(git status --porcelain --ignored -- c_src priv _build)"
 
       - name: Cache deps & build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -46,13 +62,15 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-mix-build-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            ${{ runner.os }}-mix-build-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
-      - run: mix deps.get
+      - run: mix deps.get --check-locked
       - run: mix deps.unlock --check-unused
       - run: mix hex.audit
+      - name: Scan deps for security advisories
+        run: mix deps.audit
       - run: mix deps.compile
 
       - name: Compile with warnings as errors
@@ -63,6 +81,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
@@ -73,11 +93,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: deps
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-mix-deps-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            ${{ runner.os }}-mix-deps-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
-      - run: mix deps.get
+      - run: mix deps.get --check-locked
       - run: mix format --check-formatted
 
   credo:
@@ -85,6 +105,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
@@ -97,15 +119,15 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-mix-build-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            ${{ runner.os }}-mix-build-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
-      - run: mix deps.get
+      - run: mix deps.get --check-locked
       - run: mix credo --strict
 
   test:
-    name: Tests (${{ matrix.os }} / OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
+    name: Tests (${{ matrix.os }} / OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }}${{ matrix.cover && ' / cover' || '' }})
     runs-on: ${{ matrix.os }}
     env:
       WERROR: "1"
@@ -120,19 +142,30 @@ jobs:
             elixir: "1.18.3"
             otp: "27.2"
           - os: ubuntu-latest
+            elixir: "1.19.7"
+            otp: "28.3.3"
+          - os: ubuntu-latest
             elixir: "1.20.2"
             otp: "28.3.3"
           - os: ubuntu-latest
             elixir: "1.20.2"
             otp: "29.0"
+          # Coverage leg: `mix test --cover` fails below the mix.exs
+          # test_coverage threshold, and the HTML report is uploaded.
+          - os: ubuntu-latest
+            elixir: "1.20.2"
+            otp: "29.0"
+            cover: true
           - os: ubuntu-24.04-arm
             elixir: "1.20.2"
             otp: "29.0"
           - os: macos-latest
-            elixir: "1.18.4"
-            otp: "28.3.3"
+            elixir: "1.20.2"
+            otp: "29.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
@@ -145,11 +178,11 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-${{ runner.arch }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-mix-build-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
+            ${{ runner.os }}-${{ runner.arch }}-mix-build-${{ matrix.elixir }}-${{ matrix.otp }}-
 
-      - run: mix deps.get
+      - run: mix deps.get --check-locked
       - run: mix deps.compile
       - run: mix compile
       # Delegate a cgroup v2 subtree to the runner user so the positive-path
@@ -172,7 +205,21 @@ jobs:
           sudo chown -R "$(whoami)" /sys/fs/cgroup/net_runner
           sudo chown "$(whoami)" /sys/fs/cgroup/cgroup.procs
           echo "NR_CGROUP_DELEGATED=1" >> "$GITHUB_ENV"
-      - run: mix test
+      # Hosted Ubuntu kernels have pidfd_open and pidfd_send_signal, so on
+      # these legs the pidfd test's tolerant branch becomes a hard failure.
+      # Left unset elsewhere (macOS has no pidfd).
+      - name: Require pidfd support
+        if: runner.os == 'Linux'
+        run: echo "NR_PIDFD_REQUIRED=1" >> "$GITHUB_ENV"
+      - run: mix test ${{ matrix.cover && '--cover' || '' }}
+
+      - name: Upload coverage report
+        if: ${{ matrix.cover && !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-html
+          path: cover/
+          if-no-files-found: error
 
   test-alpine:
     name: Tests (Alpine / musl)
@@ -188,14 +235,20 @@ jobs:
       WERROR: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
+      # The toolchain is pinned to an upstream version; `~` still accepts
+      # Alpine's -rN security rebuilds of it. An unpinned `erlang` resolves to
+      # erlang26 on 3.22, below the OTP 27 floor. Bump these together with the
+      # container digest.
       - name: Install build toolchain and Erlang/Elixir
-        run: apk add --no-cache build-base git erlang elixir
+        run: apk add --no-cache build-base git "erlang27~27.3.4" "erlang27-dev~27.3.4" "elixir~1.18.3"
 
       - name: Install Hex & Rebar
         run: mix local.hex --force && mix local.rebar --force
 
-      - run: mix deps.get
+      - run: mix deps.get --check-locked
       - run: mix deps.compile
       - run: mix compile
       - run: mix test
@@ -215,6 +268,8 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
@@ -233,13 +288,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      - run: mix deps.get
+      - run: mix deps.get --check-locked
 
       - name: Build tarball and compile it standalone
         env:
@@ -252,12 +309,15 @@ jobs:
           cd "$PKG_DIR"
           mix deps.get
           mix compile
+          mix run -e 'NetRunner.run(["true"]) == {"", 0} or System.halt(1)'
 
   dialyzer:
     name: Dialyzer
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
@@ -270,19 +330,20 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-mix-build-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            ${{ runner.os }}-mix-build-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
+      # plts/ is where mix.exs points dialyxir (plt_core_path/plt_local_path).
       - name: Cache PLTs
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: priv/plts
+          path: plts
           key: ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
             ${{ runner.os }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
-      - run: mix deps.get
+      - run: mix deps.get --check-locked
       - run: mix deps.compile
       - run: mix compile
       - run: mix dialyzer
@@ -294,6 +355,8 @@ jobs:
       WERROR: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
@@ -306,11 +369,14 @@ jobs:
           path: |
             deps
             _build
-          key: ${{ runner.os }}-asan-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-asan-build-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
 
-      - run: mix deps.get
+      - run: mix deps.get --check-locked
       - run: mix deps.compile
 
+      # Run by hand, make builds into _build/$MIX_ENV/lib/net_runner/priv
+      # (MIX_ENV=test here), which is where `mix test` loads from; the later
+      # elixir_make run finds the binaries up to date and keeps them.
       - name: Build C with ASan + UBSan
         run: SANITIZE=1 make clean all
 
@@ -330,8 +396,12 @@ jobs:
     needs: [compile, format, credo, test, test-alpine, package, dialyzer, sanitizers]
     if: startsWith(github.ref, 'refs/tags/v')
     environment: hex-publish
+    env:
+      MIX_ENV: dev
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
@@ -351,15 +421,22 @@ jobs:
             exit 1
           fi
 
-      - run: mix deps.get
-        env:
-          MIX_ENV: dev
+      # HEX_API_KEY is scoped to the two publish steps. Fetching, compiling
+      # (which runs the Makefile) and the docs build all happen without it.
+      # `mix hex.publish docs` re-invokes the docs task before uploading, so
+      # ex_doc does run once more in that step, against the already-built
+      # code and with the key present.
+      - run: mix deps.get --check-locked
       - run: mix compile
-        env:
-          MIX_ENV: dev
+      - name: Build docs
+        run: mix docs
 
-      - name: Publish to Hex
-        run: mix hex.publish --yes
+      - name: Publish package to Hex
+        run: mix hex.publish package --yes
         env:
-          MIX_ENV: dev
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+      - name: Publish docs to HexDocs
+        run: mix hex.publish docs --yes
+        env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}

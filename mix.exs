@@ -20,9 +20,17 @@ defmodule NetRunner.MixProject do
       docs: docs(),
       name: "NetRunner",
       source_url: @source_url,
+      # The NIF stubs only raise until the library loads, and TestHelpers is
+      # test scaffolding; neither says anything about library coverage.
+      test_coverage: [
+        summary: [threshold: 80],
+        ignore_modules: [NetRunner.Nif, NetRunner.TestHelpers]
+      ],
       # test/support is compiled in :test (where dialyzer runs in CI) and
       # calls ExUnit.Assertions.flunk/1; ExUnit is not in the default PLT.
-      dialyzer: [plt_add_apps: [:ex_unit]]
+      # PLTs live in plts/ so CI can cache them on their own key; not under
+      # priv/, which Mix would link into the app path.
+      dialyzer: [plt_add_apps: [:ex_unit], plt_core_path: "plts", plt_local_path: "plts"]
     ]
   end
 
@@ -39,12 +47,13 @@ defmodule NetRunner.MixProject do
   defp deps do
     [
       # Production dependencies
-      {:elixir_make, "~> 0.10.0", runtime: false},
+      {:elixir_make, "~> 0.9", runtime: false},
 
       # Development dependencies
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
       {:stream_data, "~> 1.1", only: :test}
     ]
   end
@@ -56,8 +65,13 @@ defmodule NetRunner.MixProject do
   defp package do
     [
       name: "net_runner",
-      files:
-        ~w(lib c_src/*.c c_src/*.h docs priv/.gitkeep Makefile mix.exs README.md CHANGELOG.md LICENSE),
+      # docs/ is listed file by file: it also holds working notes that are
+      # not part of the published documentation.
+      files: ~w(
+        lib c_src/*.c c_src/*.h Makefile mix.exs README.md CHANGELOG.md LICENSE
+        docs/architecture.md docs/protocol.md docs/decisions.md
+        docs/backpressure.md docs/comparison.md docs/modules.md
+      ),
       licenses: ["Apache-2.0"],
       links: %{
         "GitHub" => @source_url,
