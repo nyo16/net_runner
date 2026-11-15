@@ -24,7 +24,7 @@ defmodule NetRunner.Process do
   require Logger
 
   alias NetRunner.Nif
-  alias NetRunner.Process.{Cgroup, Exec, Operations, Pipe, Protocol, Stats}
+  alias NetRunner.Process.{Cgroup, Exec, Operations, Options, Pipe, Protocol, Stats}
   alias NetRunner.Signal
 
   # Exactly the size of nif_read's stack buffer, and one macOS pipe buffer
@@ -61,25 +61,6 @@ defmodule NetRunner.Process do
   @stop_timeout_ms 5_000
 
   # --- Public API ---
-
-  # Every option a spawned process understands. Unknown keys raise up front
-  # (Keyword.validate!) instead of being silently ignored — a misspelt
-  # :stderr_tail_byte or a run/2-level :timeout must not pass unnoticed.
-  # :write_budget and :stderr_drain_chunks are test hooks (see above).
-  @process_opts [
-    :name,
-    :owner,
-    :pty,
-    :stderr,
-    :stderr_tail_bytes,
-    :cgroup_path,
-    :kill_timeout,
-    :cwd,
-    :env,
-    :no_new_privs,
-    :write_budget,
-    :stderr_drain_chunks
-  ]
 
   @doc """
   Starts the process GenServer linked to the caller.
@@ -118,11 +99,7 @@ defmodule NetRunner.Process do
   as `NetRunner.Daemon` can fail in their caller instead of inside `init/1`.
   """
   @spec validate_opts!(keyword()) :: keyword()
-  def validate_opts!(opts) do
-    opts
-    |> Keyword.validate!(@process_opts)
-    |> Exec.validate_opts!()
-  end
+  def validate_opts!(opts), do: Options.validate!(opts)
 
   @doc """
   Stops the server, releasing its pipes, UDS socket and `Watcher` entry.

@@ -1,7 +1,10 @@
 defmodule NetRunner.Process.Exec do
   @moduledoc false
 
-  require Logger
+  # Spawn mechanics: the private UDS listener, the shepherd Port, accept and
+  # token authentication, and the SCM_RIGHTS fd hand-off. Option validation
+  # lives in NetRunner.Process.Options; the wire format (frames and the
+  # shepherd argv grammar) in NetRunner.Process.Protocol.
 
   alias NetRunner.Nif
   alias NetRunner.Process.{Pipe, Protocol, State}
@@ -10,19 +13,6 @@ defmodule NetRunner.Process.Exec do
   # Per-connection bound on the token read; see verify_token/3.
   @token_recv_timeout_ms 250
   @uds_base_dir_key {__MODULE__, :uds_base_dir}
-  # Upper bound on the retained stderr tail. Above this the "bounded
-  # diagnostic tail" turns into an unbounded-ish per-process buffer.
-  @stderr_tail_bytes_max 1_048_576
-
-  # SIGTERM->SIGKILL escalation window forwarded to the shepherd as
-  # --kill-timeout; the max mirrors shepherd.c's argv check.
-  @default_kill_timeout_ms 5_000
-  @kill_timeout_max_ms 60_000
-
-  # Every NetRunner cgroup lives under this shared parent, which the shepherd
-  # creates on demand and never tears down.
-  @cgroup_prefix "net_runner/"
-  @cgroup_prefix_warned_key {__MODULE__, :cgroup_prefix_warned}
 
   @doc """
   Spawns a new OS process via the shepherd binary.
@@ -359,282 +349,6 @@ defmodule NetRunner.Process.Exec do
     _, _ -> :ok
   end
 
-  @doc """
-  Validates spawn option *values*, raising `ArgumentError` on any malformed
-  one. Returns normalized `opts`: an unprefixed `:cgroup_path` is placed under
-  `net_runner/` (deprecated until 2.0, when it will raise) and `:env` is put
-  in its canonical list form.
-
-  Called on the client by `NetRunner.Process.start/3` / `start_link/3`, so
-  every entry point (`NetRunner.run/2`, `stream!/2`, `Daemon`, direct
-  `Process.start/3`) shares one convention: malformed options are programmer
-  errors and raise in the caller; `{:error, reason}` is reserved for runtime
-  spawn failures.
-  """
-  @spec validate_opts!(keyword()) :: keyword()
-  def validate_opts!(opts) do
-    pty_mode = Keyword.get(opts, :pty, false)
-    requested_cgroup_path = Keyword.get(opts, :cgroup_path, nil)
-    opts = normalize_cgroup_path(opts)
-    validate_stderr_mode!(Keyword.get(opts, :stderr, :consume), pty_mode)
-    validate_stderr_tail_bytes!(Keyword.get(opts, :stderr_tail_bytes, 8_192))
-    validate_cgroup_path!(Keyword.get(opts, :cgroup_path, nil))
-    validate_kill_timeout!(Keyword.get(opts, :kill_timeout, @default_kill_timeout_ms))
-    validate_cwd!(Keyword.get(opts, :cwd, nil))
-    validate_no_new_privs!(Keyword.get(opts, :no_new_privs, false))
-    validate_budget!(:write_budget, Keyword.get(opts, :write_budget))
-    validate_budget!(:stderr_drain_chunks, Keyword.get(opts, :stderr_drain_chunks))
-    environment = normalize_env!(Keyword.get(opts, :env, nil))
-    require_linux_for_isolation!(opts)
-    warn_if_prefixed(requested_cgroup_path, Keyword.get(opts, :cgroup_path, nil))
-
-    case environment do
-      nil -> Keyword.delete(opts, :env)
-      environment -> Keyword.put(opts, :env, environment)
-    end
-  end
-
-  # Isolation the caller explicitly asked for must not silently degrade:
-  # cgroups and PR_SET_NO_NEW_PRIVS exist only on Linux, and an unconfined
-  # child is worse than a failed spawn (the shepherd's own policy for a
-  # cgroup it cannot set up). Runs after every shape check, so a malformed
-  # value reports the same error on every platform.
-  defp require_linux_for_isolation!(opts) do
-    if :os.type() != {:unix, :linux} do
-      if Keyword.get(opts, :cgroup_path) do
-        raise ArgumentError, ":cgroup_path requires Linux (cgroup v2); got #{inspect(:os.type())}"
-      end
-
-      if Keyword.get(opts, :no_new_privs, false) do
-        raise ArgumentError, "no_new_privs: true requires Linux; got #{inspect(:os.type())}"
-      end
-    end
-
-    :ok
-  end
-
-  # 1.3.x accepted any relative :cgroup_path; 1.4.0 started requiring the
-  # net_runner/ prefix and raised otherwise, which broke callers within a
-  # minor version. Until 2.0 an unprefixed path is placed under the prefix
-  # instead. Absolute and empty paths are left alone so
-  # validate_cgroup_path!/1 rejects them with the usual message.
-  defp normalize_cgroup_path(opts) do
-    case Keyword.get(opts, :cgroup_path) do
-      path when is_binary(path) and path != "" ->
-        if String.starts_with?(path, [@cgroup_prefix, "/"]),
-          do: opts,
-          else: Keyword.put(opts, :cgroup_path, @cgroup_prefix <> path)
-
-      _ ->
-        opts
-    end
-  end
-
-  # Logged once per VM, and only for a path that passed validation, so an
-  # options error never consumes the one deprecation notice.
-  defp warn_if_prefixed(same, same), do: :ok
-
-  defp warn_if_prefixed(requested, prefixed) do
-    if not :persistent_term.get(@cgroup_prefix_warned_key, false) do
-      :persistent_term.put(@cgroup_prefix_warned_key, true)
-
-      Logger.warning(
-        "[NetRunner] :cgroup_path #{inspect(requested)} has no #{@cgroup_prefix} prefix; " <>
-          "using #{inspect(prefixed)}. Unprefixed paths are deprecated and will " <>
-          "raise in 2.0. (Logged once per VM.)"
-      )
-    end
-  end
-
-  # Mirrors the shepherd's own --kill-timeout check (1..60000). Anything else
-  # makes the shepherd exit before it ever connects; the caller would get a
-  # bare {:shepherd_spawn_failed, {:exit_status, 1}} with the real reason only
-  # on the VM's stderr — so reject it here with a message the caller can read.
-  defp validate_kill_timeout!(ms) when is_integer(ms) and ms in 1..@kill_timeout_max_ms, do: :ok
-
-  defp validate_kill_timeout!(ms) do
-    raise ArgumentError,
-          ":kill_timeout must be an integer in 1..#{@kill_timeout_max_ms} (ms), " <>
-            "got: #{inspect(ms)}"
-  end
-
-  # In PTY mode stderr is folded into the bidirectional master FD, so the
-  # :stderr option is ignored. In pipe mode only :consume (drained internally
-  # to avoid blocking the child on a full pipe) and :disabled are supported.
-  defp validate_stderr_mode!(_mode, true), do: :ok
-  defp validate_stderr_mode!(mode, false) when mode in [:consume, :disabled], do: :ok
-
-  defp validate_stderr_mode!(mode, false) do
-    raise ArgumentError, ":stderr must be :consume or :disabled, got: #{inspect(mode)}"
-  end
-
-  # The bounded stderr tail cap. 0 disables retention (drain-and-drop) while
-  # still draining the pipe so the child never blocks. Capped above so callers
-  # cannot turn the diagnostic tail into an unbounded buffer.
-  defp validate_stderr_tail_bytes!(bytes)
-       when is_integer(bytes) and bytes >= 0 and bytes <= @stderr_tail_bytes_max,
-       do: :ok
-
-  defp validate_stderr_tail_bytes!(bytes) do
-    raise ArgumentError,
-          ":stderr_tail_bytes must be an integer in 0..#{@stderr_tail_bytes_max}, " <>
-            "got: #{inspect(bytes)}"
-  end
-
-  defp normalize_env!(nil), do: nil
-
-  defp normalize_env!({:replace, environment}) do
-    {:replace, normalize_environment!(environment)}
-  end
-
-  defp normalize_env!({tag, _environment}) when is_atom(tag) do
-    raise ArgumentError,
-          ":env got #{inspect(tag)}, which is not an environment mode; " <>
-            "the only tagged form is {:replace, environment}"
-  end
-
-  defp normalize_env!(env), do: normalize_environment!(env)
-
-  defp normalize_environment!(environment)
-       when is_map(environment) and not is_struct(environment) do
-    normalize_env_entries!(Map.to_list(environment), %{})
-  end
-
-  defp normalize_environment!(environment) when is_list(environment) do
-    normalize_env_entries!(environment, %{})
-  end
-
-  defp normalize_environment!(environment) do
-    raise ArgumentError,
-          ":env must be a map or a list of {name, value} pairs, got #{env_shape(environment)}"
-  end
-
-  defp normalize_env_entries!([], environment), do: Map.to_list(environment)
-
-  defp normalize_env_entries!([{k, v} | rest], environment)
-       when is_binary(k) and (is_binary(v) or is_nil(v)) do
-    validate_env_name!(k)
-    validate_env_value!(k, v)
-    value = if v == "", do: nil, else: v
-    normalize_env_entries!(rest, Map.put(environment, k, value))
-  end
-
-  defp normalize_env_entries!([{k, _v} | _rest], _environment) do
-    raise ArgumentError,
-          ":env entry #{inspect(k)} must map a binary name to a binary or nil"
-  end
-
-  defp normalize_env_entries!([other | _rest], _environment) do
-    raise ArgumentError, ":env entry must be a {name, value} pair, got #{env_shape(other)}"
-  end
-
-  defp normalize_env_entries!(tail, _environment) do
-    raise ArgumentError, ":env must be a proper list, got an improper tail: #{env_shape(tail)}"
-  end
-
-  # Describes a malformed :env term without echoing it. Environment values
-  # are often secrets, and ArgumentError messages end up in logs and crash
-  # reports; names are shown (via inspect) elsewhere, values never.
-  defp env_shape(term) when is_struct(term), do: "a %#{inspect(term.__struct__)}{} struct"
-  defp env_shape(term) when is_tuple(term), do: "a #{tuple_size(term)}-tuple"
-  defp env_shape(term) when is_binary(term), do: "a binary"
-  defp env_shape(term) when is_list(term), do: "a list"
-  defp env_shape(term) when is_map(term), do: "a map"
-  defp env_shape(term) when is_atom(term), do: inspect(term)
-  defp env_shape(term) when is_number(term), do: "a number"
-  defp env_shape(_term), do: "an unsupported term"
-
-  defp validate_env_name!(name) do
-    cond do
-      name == "" or String.contains?(name, ["=", <<0>>]) ->
-        raise ArgumentError, ":env has an invalid variable name: #{inspect(name)}"
-
-      not String.valid?(name) ->
-        raise ArgumentError, ":env variable name #{inspect(name)} must be UTF-8 text"
-
-      true ->
-        :ok
-    end
-  end
-
-  defp validate_env_value!(_name, nil), do: :ok
-
-  defp validate_env_value!(name, value) do
-    cond do
-      String.contains?(value, <<0>>) ->
-        raise ArgumentError, ":env value for #{inspect(name)} must not contain NUL bytes"
-
-      not String.valid?(value) ->
-        raise ArgumentError, ":env value for #{inspect(name)} must be UTF-8 text"
-
-      true ->
-        :ok
-    end
-  end
-
-  defp validate_cgroup_path!(nil), do: :ok
-
-  defp validate_cgroup_path!(path) when is_binary(path) do
-    cond do
-      String.contains?(path, <<0>>) ->
-        raise ArgumentError, ":cgroup_path must not contain NUL bytes"
-
-      String.starts_with?(path, "/") ->
-        raise ArgumentError, ":cgroup_path must be relative, got: #{path}"
-
-      String.contains?(path, "..") ->
-        raise ArgumentError, ":cgroup_path cannot contain '..', got: #{path}"
-
-      byte_size(path) >= 256 ->
-        raise ArgumentError, ":cgroup_path must be under 256 bytes"
-
-      not String.starts_with?(path, @cgroup_prefix) or path == @cgroup_prefix ->
-        raise ArgumentError,
-              ":cgroup_path must name a cgroup under #{@cgroup_prefix}, got: #{inspect(path)}"
-
-      true ->
-        :ok
-    end
-  end
-
-  defp validate_cgroup_path!(path) do
-    raise ArgumentError, ":cgroup_path must be a binary, got: #{inspect(path)}"
-  end
-
-  defp validate_no_new_privs!(value) when is_boolean(value), do: :ok
-
-  defp validate_no_new_privs!(value) do
-    raise ArgumentError, ":no_new_privs must be a boolean, got: #{inspect(value)}"
-  end
-
-  # Test hooks (:write_budget, :stderr_drain_chunks): a budget below 1 would
-  # never make progress.
-  defp validate_budget!(_key, nil), do: :ok
-  defp validate_budget!(_key, n) when is_integer(n) and n >= 1, do: :ok
-
-  defp validate_budget!(key, value) do
-    raise ArgumentError, "#{inspect(key)} must be a positive integer, got: #{inspect(value)}"
-  end
-
-  defp validate_cwd!(nil), do: :ok
-
-  defp validate_cwd!(cwd) when is_binary(cwd) do
-    cond do
-      cwd == "" ->
-        raise ArgumentError, ":cwd must not be empty"
-
-      String.contains?(cwd, <<0>>) ->
-        raise ArgumentError, ":cwd must not contain NUL bytes"
-
-      true ->
-        :ok
-    end
-  end
-
-  defp validate_cwd!(other) do
-    raise ArgumentError, ":cwd must be a binary, got: #{inspect(other)}"
-  end
-
   # Place the socket inside a 0700 directory so only the current user can
   # traverse to it. Without this the socket lives directly in the
   # world-traversable tmp dir, and a same-host attacker who wins the accept
@@ -736,40 +450,7 @@ defmodule NetRunner.Process.Exec do
 
   defp open_shepherd(uds_path, token, cmd, args, opts) do
     shepherd = shepherd_executable()
-    kill_timeout = Keyword.get(opts, :kill_timeout, @default_kill_timeout_ms)
-    pty_mode = Keyword.get(opts, :pty, false)
-
-    cgroup_path = Keyword.get(opts, :cgroup_path, nil)
-    cwd = Keyword.get(opts, :cwd, nil)
-
-    # --token-fd, not --token <hex>: argv is world-readable via
-    # /proc/<pid>/cmdline (Linux) and same-uid readable via KERN_PROCARGS2
-    # (macOS), which is exactly the attacker the token exists to stop. The
-    # token travels over the private fd-3 port channel instead.
-    shepherd_flags = ["--kill-timeout", to_string(kill_timeout), "--token-fd"]
-    shepherd_flags = if pty_mode, do: shepherd_flags ++ ["--pty"], else: shepherd_flags
-
-    shepherd_flags =
-      if cgroup_path,
-        do: shepherd_flags ++ ["--cgroup-path", cgroup_path],
-        else: shepherd_flags
-
-    shepherd_flags = if cwd, do: shepherd_flags ++ ["--cwd", cwd], else: shepherd_flags
-
-    # Linux-only in the shepherd (prctl(PR_SET_NO_NEW_PRIVS) before exec);
-    # accepted and ignored on other platforms.
-    shepherd_flags =
-      if Keyword.get(opts, :no_new_privs, false),
-        do: shepherd_flags ++ ["--no-new-privs"],
-        else: shepherd_flags
-
-    {environment_flags, port_environment} =
-      environment_options(Keyword.get(opts, :env, nil))
-
-    # "--" ends shepherd option parsing: a cmd beginning with "-" must reach
-    # execvp verbatim, never be read as a shepherd flag (--cgroup-path,
-    # --kill-timeout, --pty, --cwd, --replace-env, --no-new-privs).
-    port_args = [uds_path | shepherd_flags ++ environment_flags] ++ ["--", cmd | args]
+    {port_args, port_environment} = Protocol.shepherd_argv(uds_path, cmd, args, opts)
 
     port_opts = [
       :nouse_stdio,
@@ -806,49 +487,6 @@ defmodule NetRunner.Process.Exec do
     # accept_or_shepherd_exit/4 reports {:shepherd_spawn_failed, _} promptly.
     :error, :badarg -> :ok
   end
-
-  # The port interprets env charlists in the VM's native filename encoding:
-  # under :utf8 each element is a codepoint, under :latin1 each element is one
-  # byte. Byte lists on a UTF-8 VM double-encode non-ASCII text (`é` arrives as
-  # c3 83 c2 a9); codepoint lists on a latin1 VM corrupt it (`é` arrives as
-  # e9) or raise above U+00FF. Either way the child gets the binary's bytes.
-  defp format_env(env) do
-    Enum.map(env, fn
-      {name, nil} -> {env_chars(name), false}
-      {name, value} -> {env_chars(name), env_chars(value)}
-    end)
-  end
-
-  defp env_chars(binary) do
-    case :file.native_name_encoding() do
-      :utf8 -> String.to_charlist(binary)
-      :latin1 -> :binary.bin_to_list(binary)
-    end
-  end
-
-  defp environment_options(nil), do: {[], nil}
-
-  # Replacement mode uses two layers. The shepherd's --replace-env allowlist
-  # is authoritative for the child: it drops every name outside the selection
-  # just before fork, so the result does not depend on timing. In addition,
-  # every variable in an :os.env/0 snapshot that the caller did not select is
-  # unset (`false`) in the port environment, so the shepherd itself normally
-  # never holds ambient values such as RELEASE_COOKIE. A variable put into the
-  # BEAM environment between the snapshot and Port.open reaches the shepherd
-  # but is still filtered out of the child.
-  defp environment_options({:replace, environment}) do
-    selected = format_env(environment)
-    selected_names = MapSet.new(selected, fn {name, _value} -> name end)
-
-    unset =
-      for {name, _value} <- :os.env(), not MapSet.member?(selected_names, name), do: {name, false}
-
-    kept_names = for {name, value} <- environment, value != nil, do: name
-    flags = ["--replace-env", Integer.to_string(length(kept_names)) | kept_names]
-    {flags, unset ++ selected}
-  end
-
-  defp environment_options(environment), do: {[], format_env(environment)}
 
   defp shepherd_executable do
     app_dir = :code.priv_dir(:net_runner)
@@ -899,7 +537,7 @@ defmodule NetRunner.Process.Exec do
             do: binary_part(iov_data, 1, byte_size(iov_data) - 1),
             else: <<>>
 
-        base = io_fd_count(pty_mode)
+        base = Protocol.io_fd_count(pty_mode)
 
         if length(fds) in [base, base + 1] do
           {:ok, fds, iov_rest}
@@ -926,9 +564,6 @@ defmodule NetRunner.Process.Exec do
     end
   end
 
-  defp io_fd_count(true), do: 1
-  defp io_fd_count(false), do: 3
-
   # On any failure every fd handed in is released: wrapped ones through their
   # NIF resource, unwrapped ones via nif_close_fd. nif_create_fd's contract is
   # that on error the caller retains ownership of the raw fd.
@@ -947,7 +582,7 @@ defmodule NetRunner.Process.Exec do
 
   # The pidfd, when present, is always the last fd of the SCM_RIGHTS message.
   defp split_pidfd(fds, pty_mode) do
-    case Enum.split(fds, io_fd_count(pty_mode)) do
+    case Enum.split(fds, Protocol.io_fd_count(pty_mode)) do
       {io_fds, [pidfd_fd]} -> {io_fds, pidfd_fd}
       {io_fds, []} -> {io_fds, nil}
     end

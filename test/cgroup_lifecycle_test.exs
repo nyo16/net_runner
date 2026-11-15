@@ -86,6 +86,11 @@ defmodule NetRunner.CgroupLifecycleTest do
           assert msg =~ "has live processes"
           refute File.exists?(@root <> outer <> "/b")
           assert Proc.alive?(pid)
+          # The exit frame follows the shepherd's cgroup cleanup, so on_exit's
+          # rmdir cannot race it.
+          :ok = Proc.kill(pid, :sigkill)
+          assert {:ok, 137} = Proc.await_exit(pid, 5_000)
+          refute File.exists?(@root <> outer)
           Proc.stop(pid)
 
         {:error, reason} ->

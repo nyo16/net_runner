@@ -23,6 +23,7 @@ defmodule NetRunner do
 
   alias NetRunner.InputWriter
   alias NetRunner.Process, as: Proc
+  alias NetRunner.Process.Options
   alias NetRunner.Stream, as: NRStream
 
   @doc """
@@ -131,9 +132,6 @@ defmodule NetRunner do
       cmd = NetRunner.Command.new("echo", ["hello"], timeout: 5_000)
       {output, 0} = NetRunner.run(cmd)
   """
-  # Same default as NetRunner.Process.Exec (the shepherd's escalation).
-  @default_kill_timeout_ms 5_000
-
   @run_opts [
     :input,
     :input_buffer,
@@ -203,7 +201,7 @@ defmodule NetRunner do
       capture_stderr?: capture_stderr?,
       # The SIGTERM grace on run/2's own timeout/error path; same option and
       # default as the shepherd's escalation (issue #28).
-      kill_timeout: Keyword.get(opts, :kill_timeout, @default_kill_timeout_ms)
+      kill_timeout: Keyword.get(opts, :kill_timeout, Options.default_kill_timeout())
     }
 
     case Proc.start(cmd, args, process_opts) do

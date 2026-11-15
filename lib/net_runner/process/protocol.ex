@@ -1,6 +1,8 @@
 defmodule NetRunner.Process.Protocol do
   @moduledoc false
 
+  alias NetRunner.Process.Options
+
   # Single Elixir-side owner of the shepherd <-> BEAM wire protocol. The C
   # counterpart is c_src/protocol.h — any frame change must touch both files
   # and nowhere else. Mirror of protocol.h's frame table:
@@ -145,4 +147,91 @@ defmodule NetRunner.Process.Protocol do
   end
 
   def recv_shepherd_error(_socket, _buffer, _timeout), do: :no_error
+
+  # --- BEAM -> shepherd process launch: argv and fd layout ---
+
+  @doc """
+  The SCM_RIGHTS fds that carry the child's I/O: 3 in pipe mode (stdin_w,
+  stdout_r, stderr_r), 1 in PTY mode (the master). On Linux a pidfd may
+  follow as one more, trailing fd.
+  """
+  def io_fd_count(true = _pty_mode), do: 1
+  def io_fd_count(false), do: 3
+
+  @doc """
+  Builds the shepherd's argv (after the executable) and the port
+  environment for validated spawn `opts`. Mirrors `parse_args` in
+  c_src/shepherd.c. Returns `{argv, port_env}`, `port_env` being `nil` when
+  the BEAM's environment is inherited unchanged.
+  """
+  def shepherd_argv(uds_path, cmd, args, opts) do
+    kill_timeout = Keyword.get(opts, :kill_timeout, Options.default_kill_timeout())
+
+    # --token-fd, not --token <hex>: argv is world-readable via
+    # /proc/<pid>/cmdline (Linux) and same-uid readable via KERN_PROCARGS2
+    # (macOS), which is exactly the attacker the token exists to stop. The
+    # token travels over the private fd-3 port channel instead.
+    flags =
+      ["--kill-timeout", to_string(kill_timeout), "--token-fd"] ++
+        flag_if(Keyword.get(opts, :pty, false), ["--pty"]) ++
+        value_flag("--cgroup-path", Keyword.get(opts, :cgroup_path)) ++
+        value_flag("--cwd", Keyword.get(opts, :cwd)) ++
+        flag_if(Keyword.get(opts, :no_new_privs, false), ["--no-new-privs"])
+
+    {environment_flags, port_environment} = environment_options(Keyword.get(opts, :env, nil))
+
+    # "--" ends shepherd option parsing: a cmd beginning with "-" must reach
+    # execvp verbatim, never be read as a shepherd flag (--cgroup-path,
+    # --kill-timeout, --pty, --cwd, --replace-env, --no-new-privs).
+    {[uds_path | flags ++ environment_flags] ++ ["--", cmd | args], port_environment}
+  end
+
+  defp flag_if(true, flags), do: flags
+  defp flag_if(_, _flags), do: []
+
+  defp value_flag(_flag, nil), do: []
+  defp value_flag(flag, value), do: [flag, value]
+
+  # The port interprets env charlists in the VM's native filename encoding:
+  # under :utf8 each element is a codepoint, under :latin1 each element is one
+  # byte. Byte lists on a UTF-8 VM double-encode non-ASCII text (`é` arrives as
+  # c3 83 c2 a9); codepoint lists on a latin1 VM corrupt it (`é` arrives as
+  # e9) or raise above U+00FF. Either way the child gets the binary's bytes.
+  defp format_env(env) do
+    Enum.map(env, fn
+      {name, nil} -> {env_chars(name), false}
+      {name, value} -> {env_chars(name), env_chars(value)}
+    end)
+  end
+
+  defp env_chars(binary) do
+    case :file.native_name_encoding() do
+      :utf8 -> String.to_charlist(binary)
+      :latin1 -> :binary.bin_to_list(binary)
+    end
+  end
+
+  defp environment_options(nil), do: {[], nil}
+
+  # Replacement mode uses two layers. The shepherd's --replace-env allowlist
+  # is authoritative for the child: it drops every name outside the selection
+  # just before fork, so the result does not depend on timing. In addition,
+  # every variable in an :os.env/0 snapshot that the caller did not select is
+  # unset (`false`) in the port environment, so the shepherd itself normally
+  # never holds ambient values such as RELEASE_COOKIE. A variable put into the
+  # BEAM environment between the snapshot and Port.open reaches the shepherd
+  # but is still filtered out of the child.
+  defp environment_options({:replace, environment}) do
+    selected = format_env(environment)
+    selected_names = MapSet.new(selected, fn {name, _value} -> name end)
+
+    unset =
+      for {name, _value} <- :os.env(), not MapSet.member?(selected_names, name), do: {name, false}
+
+    kept_names = for {name, value} <- environment, value != nil, do: name
+    flags = ["--replace-env", Integer.to_string(length(kept_names)) | kept_names]
+    {flags, unset ++ selected}
+  end
+
+  defp environment_options(environment), do: {[], format_env(environment)}
 end
