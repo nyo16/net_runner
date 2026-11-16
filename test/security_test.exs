@@ -177,6 +177,11 @@ defmodule NetRunner.SecurityTest do
       on_exit(fn -> Proc.stop(pid) end)
       os_pid = Proc.os_pid(pid)
 
+      # start/2 returns at MSG_CHILD_STARTED, before the exec gate opens, and
+      # until it execs the child is non-dumpable like the shepherd it forked
+      # from: a non-root reader gets EACCES on its fd links until then.
+      eventually(fn -> match?({:ok, _}, File.read_link("/proc/#{os_pid}/fd/0")) end)
+
       {:ok, stdin_link} = File.read_link("/proc/#{os_pid}/fd/0")
       {:ok, stdout_link} = File.read_link("/proc/#{os_pid}/fd/1")
 
