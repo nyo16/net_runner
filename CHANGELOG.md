@@ -47,6 +47,16 @@ misbehaving. See Changed (breaking).
 - **End of PTY output is `:eof`**, not `{:error, :eio}` (Linux) (A-4).
 - `NetRunner.Process.Stats` mutators are `@doc false`; the struct and type
   stay public (A-6).
+- **A shepherd that exits normally without delivering the exit status is
+  reported as 255 (unknown), not 137**, and nothing is killed: it already
+  reaped the child, so the old orphan kill could hit a reused process group.
+  A shepherd killed by a signal is still settled with a group SIGKILL and 137.
+- **The `:input` writer stops at the first failed write**, so a child that
+  exits early no longer keeps a lazy input running until a grace timeout;
+  `run/2`'s join with the writer never runs past `:timeout`. A malformed list
+  `:input` raises before anything is spawned.
+- The handshake gives each connection up to 2 s to present its token (a
+  silent impostor costs at most that, not the 10 s accept deadline).
 
 ### Added
 

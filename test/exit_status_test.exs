@@ -219,5 +219,26 @@ defmodule NetRunner.ExitStatusTest do
       assert %{status: :running, uds_carry: <<>>} = inject.(<<0x81, 0::big-32>>)
       assert Proc.alive?(pid)
     end
+
+    # The shepherd still reaps the child and exits 0, but its exit frame was
+    # ignored. A shepherd that exits on its own has already reaped, so the
+    # BEAM must not group-kill a pgid that may be reused, and must not claim
+    # 137: the status is unknown (255).
+    test "a lost exit report from a normally-exiting shepherd is 255, not an orphan kill" do
+      {:ok, pid} = Proc.start("sh", ["-c", "sleep 0.3; exit 3"])
+      on_exit(fn -> Proc.stop(pid) end)
+      %{uds_socket: socket} = :sys.get_state(pid)
+
+      log =
+        capture_log(fn ->
+          :sys.replace_state(pid, &%{&1 | uds_carry: &1.uds_carry <> <<0x7F>>})
+          send(pid, {:"$socket", socket, :select, make_ref()})
+          assert {:ok, 255} = Proc.await_exit(pid, 5_000)
+        end)
+
+      # 255 (not the orphan path's 137) proves no orphan kill ran. Refuting
+      # the orphan log line would race other async tests' captured logs.
+      assert log =~ "exit report was lost"
+    end
   end
 end

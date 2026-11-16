@@ -106,11 +106,19 @@ endif
 
 # -fvisibility=hidden: only nif_init needs to be exported, and ERL_NIF_INIT
 # already marks it default-visible.
-NIF_CFLAGS = $(CFLAGS) -I$(ERTS_INCLUDE_DIR) -fPIC -fvisibility=hidden
+NIF_CFLAGS = $(CFLAGS) -I"$(ERTS_INCLUDE_DIR)" -fPIC -fvisibility=hidden
 
 SHEPHERD_CFLAGS = $(CFLAGS) -fPIE
 
-# Targets
+# Targets. PRIV_DIR is an absolute path from elixir_make and may contain
+# spaces ("My Projects", iCloud's "Mobile Documents", a path dependency
+# anywhere). GNU make splits target names on whitespace, so every path used
+# as a target or prerequisite goes through `esc` (space -> "\ "), while
+# recipes use the plain path, quoted ($@ arrives unescaped).
+empty :=
+space := $(empty) $(empty)
+esc = $(subst $(space),\$(space),$(1))
+
 SHEPHERD = $(PRIV_DIR)/shepherd
 NIF_LIB = $(PRIV_DIR)/net_runner_nif$(NIF_EXT)
 
@@ -121,7 +129,7 @@ HEADERS = $(C_SRC_DIR)/protocol.h $(C_SRC_DIR)/utils.h
 
 .PHONY: all clean asan bench bench-perf bench-claims bench-deadlock bench-spawn bench-exec
 
-all: $(SHEPHERD) $(NIF_LIB)
+all: $(call esc,$(SHEPHERD)) $(call esc,$(NIF_LIB))
 
 # Convenience: force a sanitizer rebuild. Same as SANITIZE=1 make clean all.
 asan:
@@ -131,22 +139,22 @@ asan:
 # Builds before 1.7 wrote to a top-level priv/, which Mix symlinks into the
 # app path. Once that directory is deleted the symlink dangles and mkdir -p
 # fails on it, so replace a dangling link with a real directory.
-$(PRIV_DIR):
+$(call esc,$(PRIV_DIR)):
 	@if [ -L "$@" ] && [ ! -e "$@" ]; then rm -f "$@"; fi
 	mkdir -p "$@"
 
-$(SHEPHERD) $(NIF_LIB): | $(PRIV_DIR)
+$(call esc,$(SHEPHERD)) $(call esc,$(NIF_LIB)): | $(call esc,$(PRIV_DIR))
 
 # Each binary has one source file, so each rule compiles and links it in one
 # command; there are no intermediate objects.
-$(SHEPHERD): $(SHEPHERD_SRC) $(HEADERS)
-	$(CC) $(SHEPHERD_CFLAGS) $(SHEPHERD_LDFLAGS) $(LDFLAGS) -o $@ $<
+$(call esc,$(SHEPHERD)): $(SHEPHERD_SRC) $(HEADERS)
+	$(CC) $(SHEPHERD_CFLAGS) $(SHEPHERD_LDFLAGS) $(LDFLAGS) -o "$@" $<
 
-$(NIF_LIB): $(NIF_SRC) $(HEADERS)
-	$(CC) $(NIF_CFLAGS) $(NIF_LDFLAGS) $(LDFLAGS) -o $@ $<
+$(call esc,$(NIF_LIB)): $(NIF_SRC) $(HEADERS)
+	$(CC) $(NIF_CFLAGS) $(NIF_LDFLAGS) $(LDFLAGS) -o "$@" $<
 
 clean:
-	rm -f $(SHEPHERD) $(NIF_LIB)
+	rm -f "$(SHEPHERD)" "$(NIF_LIB)"
 
 # --- Benchmarks (repo-only; see bench/README.md) ---
 #

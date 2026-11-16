@@ -11,7 +11,7 @@ defmodule NetRunner.Process.Exec do
 
   @accept_timeout 10_000
   # Per-connection bound on the token read; see verify_token/3.
-  @token_recv_timeout_ms 250
+  @token_recv_timeout_ms 2_000
   @uds_base_dir_key {__MODULE__, :uds_base_dir}
 
   @doc """
@@ -182,9 +182,11 @@ defmodule NetRunner.Process.Exec do
   # listening.
   @doc false
   # Public only for the handshake tests (over a local socket pair).
-  def authenticate_shepherd(conn_socket, token, deadline) do
+  # `conn_timeout` exists for tests (a short silent-peer bound); the accept
+  # loop always uses @token_recv_timeout_ms.
+  def authenticate_shepherd(conn_socket, token, deadline, conn_timeout \\ @token_recv_timeout_ms) do
     with :ok <- verify_peer_uid(conn_socket),
-         :ok <- verify_token(conn_socket, token, deadline) do
+         :ok <- verify_token(conn_socket, token, deadline, conn_timeout) do
       :ok
     else
       {:error, _} = error ->
@@ -193,16 +195,18 @@ defmodule NetRunner.Process.Exec do
     end
   end
 
-  defp verify_token(conn_socket, token, deadline) do
+  defp verify_token(conn_socket, token, deadline, conn_timeout) do
     # Bounded twice: by the overall accept deadline, so a stalling peer cannot
     # extend the spawn beyond @accept_timeout, and per connection, so a
     # same-uid peer that connects and stays silent costs the real shepherd
-    # (queued behind it) @token_recv_timeout_ms, not the whole deadline. The
-    # shepherd writes the token right after connect, so it is normally
-    # already buffered when this recv runs.
+    # (queued behind it) at most @token_recv_timeout_ms, not the whole
+    # deadline. The bound is generous on purpose: the BEAM accepts as soon as
+    # connect() completes, before the shepherd writes the token, so the REAL
+    # shepherd must also fit in it while descheduled (a CPU-throttled
+    # container). 250 ms dropped real spawns under throttling.
     remaining = max(deadline - System.monotonic_time(:millisecond), 1)
 
-    case :socket.recv(conn_socket, byte_size(token), [], min(remaining, @token_recv_timeout_ms)) do
+    case :socket.recv(conn_socket, byte_size(token), [], min(remaining, conn_timeout)) do
       {:ok, ^token} -> :ok
       {:ok, _other} -> {:error, :shepherd_auth_failed}
       {:error, reason} -> {:error, {:shepherd_auth_failed, reason}}

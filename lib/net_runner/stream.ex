@@ -56,7 +56,8 @@ defmodule NetRunner.Stream do
   @spec stream(String.t(), [String.t()], keyword()) :: {:ok, Enumerable.t()} | {:error, term()}
   def stream(cmd, args, opts) do
     opts = Keyword.validate!(opts, @stream_opts)
-    input = Keyword.get(opts, :input, nil)
+    # Eager lists are coalesced and validated before the spawn (as in run/2).
+    input = InputWriter.prepare(Keyword.get(opts, :input, nil))
     input_buffer = InputWriter.validate_buffer!(Keyword.get(opts, :input_buffer, 0))
     eof_grace = Keyword.get(opts, :kill_timeout, @eof_grace_ms)
     # Pass the caller as :owner so the Process GenServer stops (and kills the OS

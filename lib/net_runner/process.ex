@@ -1235,12 +1235,29 @@ defmodule NetRunner.Process do
     %{state | stats: Stats.record_shepherd_error(state.stats, msg)}
   end
 
-  # The shepherd died without reporting the child's exit, so nothing will ever
-  # reap or supervise the child: SIGKILL its process group and report 137, the
-  # status a SIGKILL produces. The child leads its group (setpgid/setsid), and
-  # the kernel never reuses a pid as a group id while a member of that group
-  # lives, so this reaches the orphan and anything it spawned in its group,
-  # not a stranger. ESRCH (already dead, e.g. via PR_SET_PDEATHSIG) is fine.
+  # A shepherd that exited on its own (status < 128: its main() returned
+  # after reaping the child and cleaning up its cgroup) only lost or never
+  # sent its exit frame (a sticky protocol error, a dropped write). The
+  # child is gone and its pgid may already be reused, so nothing is killed;
+  # the real status is unknown, reported as 255 like the shepherd's own
+  # EXIT_STATUS_UNKNOWN.
+  defp finish_orphaned(state, shepherd_status) when shepherd_status < 128 do
+    Logger.warning(
+      "[NetRunner] shepherd for #{inspect(state.cmd)} exited normally (status " <>
+        "#{shepherd_status}) but its exit report was lost; the child was already " <>
+        "reaped, reporting 255"
+    )
+
+    finish_exit(state, 255)
+  end
+
+  # A shepherd killed by a signal (status >= 128) died without reporting the
+  # child's exit, so nothing will ever reap or supervise the child: SIGKILL
+  # its process group and report 137, the status a SIGKILL produces. The
+  # child leads its group (setpgid/setsid), and the kernel never reuses a pid
+  # as a group id while a member of that group lives, so this reaches the
+  # orphan and anything it spawned in its group, not a stranger. ESRCH
+  # (already dead, e.g. via PR_SET_PDEATHSIG) is fine.
   #
   # The shepherd reports the child only after it leads its group (parent
   # setpgid in pipe mode, the ready gate after setsid in PTY mode), so the

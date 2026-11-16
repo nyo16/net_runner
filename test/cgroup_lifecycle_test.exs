@@ -99,4 +99,36 @@ defmodule NetRunner.CgroupLifecycleTest do
       end
     end
   end
+
+  describe "orphaned-leaf cleanup identity (S-17)" do
+    alias NetRunner.Process.Cgroup
+
+    # Cleanup after a shepherd crash must only touch the leaf this spawn
+    # created. A path that was removed and re-created (by another spawn) has
+    # a new inode and is left alone; a path already gone is fine.
+    @tag :linux_only
+    test "removes only the recorded leaf, never a re-created one" do
+      path = leaf("inode")
+      full = @root <> path
+
+      case File.mkdir_p(full) do
+        :ok ->
+          recorded = Cgroup.identify(path)
+          assert {^path, _inode} = recorded
+
+          :ok = File.rmdir(full)
+          assert :ok = Cgroup.remove_orphaned_leaf(recorded)
+
+          :ok = File.mkdir(full)
+          assert :not_ours = Cgroup.remove_orphaned_leaf(recorded)
+          assert File.dir?(full), "a re-created leaf was removed"
+
+          assert :ok = Cgroup.remove_orphaned_leaf(Cgroup.identify(path))
+          refute File.exists?(full)
+
+        {:error, reason} ->
+          degraded("S-17 cgroup test skipped: mkdir #{full}: #{inspect(reason)}")
+      end
+    end
+  end
 end

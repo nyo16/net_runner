@@ -854,14 +854,18 @@ static void signal_group(pid_t child_pid, int sig) {
     if (kill(-child_pid, sig) != 0) (void)kill(child_pid, sig);
 }
 
-/* Teardown signal: the group AND the leader, both unconditionally. A leader
- * that moved itself into another group (setpgid(0, other)) is not reached
- * by kill(-pid) while its original group still has members, and
- * signal_group's fallback only fires on an empty group. child_pid is our
- * unreaped child, so the direct kill cannot hit a recycled pid. */
+/* Teardown signal: the group AND, if it left it, the leader. A leader that
+ * moved itself into another group (setpgid(0, other)) is not reached by
+ * kill(-pid) while its original group still has members, and signal_group's
+ * fallback only fires on an empty group. The leader is signalled directly
+ * only when it is no longer in its own group: one still in it already got
+ * the group signal, and a second, separate SIGTERM makes some programs
+ * (e.g. Go controller-runtime) skip their graceful shutdown. getpgid runs
+ * after the group kill, so a leader in the group at that moment was
+ * reached. child_pid is our unreaped child, so no recycled pid is hit. */
 static void signal_group_and_leader(pid_t child_pid, int sig) {
     (void)kill(-child_pid, sig);
-    (void)kill(child_pid, sig);
+    if (getpgid(child_pid) != child_pid) (void)kill(child_pid, sig);
 }
 
 /* Reap child_pid after it was sent SIGKILL. Bounded — a child wedged in

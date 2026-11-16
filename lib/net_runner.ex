@@ -174,7 +174,9 @@ defmodule NetRunner do
 
   defp run_impl(cmd, args, opts) do
     opts = Keyword.validate!(opts, @run_opts)
-    input = Keyword.get(opts, :input, nil)
+    # Eager lists coalesce (and are validated) here, before anything is
+    # spawned, so a malformed list raises with no child to leak.
+    input = InputWriter.prepare(Keyword.get(opts, :input, nil))
     input_buffer = InputWriter.validate_buffer!(Keyword.get(opts, :input_buffer, 0))
     timeout = Keyword.get(opts, :timeout, nil)
     max_output_size = Keyword.get(opts, :max_output_size, nil)
@@ -259,6 +261,7 @@ defmodule NetRunner do
     # it started. Now it crosses one boundary, and run_io's closure carries
     # no input at all. Task.async links the writer to the caller exactly as
     # the run_io task already was, so a writer crash propagates the same way.
+    started = System.monotonic_time(:millisecond)
     writer = InputWriter.start(pid, io.input, io.input_buffer)
     io = %{io | input: nil}
     task = Task.async(fn -> run_io(pid, io) end)
@@ -267,9 +270,14 @@ defmodule NetRunner do
       (Task.yield(task, timeout || :infinity) || Task.shutdown(task))
       |> handle_run_result(pid, io.kill_timeout)
 
-    # Reaped by its owner. :done only after a natural end of output; on a
-    # timeout or error the child is being killed and nothing is left to write.
-    InputWriter.reap(writer, if(match?({:error, _}, result), do: :halted, else: :done))
+    # Reaped by its owner. :done only after a natural end of output, and the
+    # join never runs past what is left of :timeout; on a timeout or error the
+    # child is being killed and nothing is left to write.
+    if match?({:error, _}, result) do
+      InputWriter.reap(writer, :halted)
+    else
+      InputWriter.reap(writer, :done, remaining_ms(timeout, started))
+    end
 
     # run/2 never hands the pid to the caller, so nothing else can ever stop
     # this server. Without it, each call leaks the Process GenServer, its
@@ -277,6 +285,11 @@ defmodule NetRunner do
     Proc.stop(pid)
     result
   end
+
+  defp remaining_ms(nil, _started), do: :infinity
+
+  defp remaining_ms(timeout, started),
+    do: max(timeout - (System.monotonic_time(:millisecond) - started), 0)
 
   defp handle_run_result({:ok, {output, exit_status}}, _pid, _kill_timeout)
        when (is_binary(output) or is_list(output)) and is_integer(exit_status) do

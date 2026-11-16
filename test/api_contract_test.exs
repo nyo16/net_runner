@@ -1,6 +1,8 @@
 defmodule NetRunner.ApiContractTest do
   use ExUnit.Case, async: true
 
+  import NetRunner.TestHelpers
+
   alias NetRunner.Daemon
   alias NetRunner.Process, as: Proc
 
@@ -9,7 +11,7 @@ defmodule NetRunner.ApiContractTest do
       assert_raise ArgumentError, ~r/requires :cmd/, fn -> Daemon.start_link(args: ["1"]) end
 
       assert_raise ArgumentError, ~r/:cmd must be a binary/, fn ->
-        Daemon.start_link(cmd: 'sleep')
+        Daemon.start_link(cmd: ~c"sleep")
       end
     end
 
@@ -40,11 +42,15 @@ defmodule NetRunner.ApiContractTest do
   end
 
   describe "Stream teardown honours :kill_timeout (N-2)" do
-    # The child closes stdout at once (the stream reaches EOF immediately) but
-    # ignores SIGTERM and keeps running, so teardown takes exactly the EOF
-    # grace before SIGKILL: the default is 1_000 ms, :kill_timeout replaces it.
+    # The child ignores SIGTERM (trap installed FIRST, so a fast SIGTERM can
+    # never kill it early and make the test pass vacuously), then closes
+    # stdout (the stream reaches EOF at once) and keeps running. Teardown thus
+    # takes exactly the EOF grace before SIGKILL: the default is 1_000 ms,
+    # :kill_timeout replaces it.
     test "the EOF grace is the caller's :kill_timeout" do
-      script = "exec 1>&-; trap '' TERM; while :; do sleep 0.05; done"
+      marker = sleep_marker()
+      on_exit(fn -> System.cmd("pkill", ["-KILL", "-f", "^sleep #{marker}$"]) end)
+      script = "trap '' TERM; exec 1>&-; exec sleep #{marker}"
 
       {us, []} =
         :timer.tc(fn ->
@@ -52,6 +58,7 @@ defmodule NetRunner.ApiContractTest do
         end)
 
       assert us < 800_000, "stream teardown took #{div(us, 1000)} ms; :kill_timeout ignored"
+      eventually(fn -> pgrep_count(marker) == 0 end)
     end
   end
 

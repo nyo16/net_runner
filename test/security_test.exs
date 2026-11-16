@@ -157,12 +157,13 @@ defmodule NetRunner.SecurityTest do
 
     # A same-uid peer that connects and stays silent used to hold the accept
     # loop for the whole 10 s deadline, failing the real spawn queued behind
-    # it. Each connection now gets at most 250 ms.
-    test "a silent peer is dropped after ~250 ms, not the whole deadline" do
+    # it. Each connection is now bounded (2 s in the accept loop; 250 ms
+    # injected here to keep the test fast).
+    test "a silent peer is dropped after the per-connection bound, not the whole deadline" do
       {beam_side, _peer} = uds_pair()
 
       {us, result} =
-        :timer.tc(fn -> Exec.authenticate_shepherd(beam_side, @token, far_deadline()) end)
+        :timer.tc(fn -> Exec.authenticate_shepherd(beam_side, @token, far_deadline(), 250) end)
 
       assert {:error, {:shepherd_auth_failed, :timeout}} = result
       assert us in 200_000..2_000_000, "silent peer held the accept loop #{div(us, 1000)} ms"

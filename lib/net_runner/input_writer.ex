@@ -77,14 +77,14 @@ defmodule NetRunner.InputWriter do
     batches = list_batches(list, @list_coalesce_bytes)
 
     Task.async(fn ->
-      Enum.each(batches, &Proc.write(pid, &1))
+      write_all(batches, pid)
       Proc.close_stdin(pid)
     end)
   end
 
   def start(pid, enumerable, 0) do
     Task.async(fn ->
-      Enum.each(enumerable, &Proc.write(pid, &1))
+      write_all(enumerable, pid)
       Proc.close_stdin(pid)
     end)
   end
@@ -93,6 +93,33 @@ defmodule NetRunner.InputWriter do
     Task.async(fn ->
       write_coalesced(pid, enumerable, buffer)
       Proc.close_stdin(pid)
+    end)
+  end
+
+  @doc """
+  Coalesces an eager list `:input` into flat batch binaries (validating every
+  element as iodata); any other input passes through unchanged.
+
+  Call it BEFORE spawning the process: a malformed list raises
+  `ArgumentError` here, with nothing running yet. Raised inside `start/3`
+  instead, after the spawn, it left the child and its server behind for a
+  caller that rescued it. `start/3` on already-prepared input is a no-op
+  pass (each batch is one element).
+  """
+  @spec prepare(term()) :: term()
+  def prepare(list) when is_list(list), do: list_batches(list, @list_coalesce_bytes)
+  def prepare(other), do: other
+
+  # Writes every chunk, stopping at the first error: a child that exits (or
+  # closes stdin) before consuming its input makes every later write fail,
+  # and a lazy or infinite enumerable would otherwise keep producing chunks
+  # until the reap grace killed the writer.
+  defp write_all(enumerable, pid) do
+    Enum.reduce_while(enumerable, :ok, fn chunk, :ok ->
+      case Proc.write(pid, chunk) do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
     end)
   end
 
@@ -134,7 +161,7 @@ defmodule NetRunner.InputWriter do
         {acc, _n} -> {:cont, Enum.reverse(acc), {[], 0}}
       end
     )
-    |> Enum.each(&Proc.write(pid, &1))
+    |> write_all(pid)
   end
 
   # Eager twin of write_coalesced/3 for lists: batches the elements into flat
@@ -179,15 +206,19 @@ defmodule NetRunner.InputWriter do
     * `:halted` — the reader stopped early and the child is being killed
       anyway. There is nothing left to write, so do not wait for it.
   """
-  @spec reap(Task.t() | nil, :done | :halted) :: :ok
-  def reap(nil, _mode), do: :ok
+  @spec reap(Task.t() | nil, :done | :halted, timeout()) :: :ok
+  def reap(writer, mode, grace_ms \\ @reap_grace_ms)
 
-  def reap(writer, :done) do
-    Task.yield(writer, @reap_grace_ms) || Task.shutdown(writer, :brutal_kill)
+  def reap(nil, _mode, _grace_ms), do: :ok
+
+  # `grace_ms` caps the join below the default (run/2 passes what is left of
+  # its :timeout).
+  def reap(writer, :done, grace_ms) do
+    Task.yield(writer, min(grace_ms, @reap_grace_ms)) || Task.shutdown(writer, :brutal_kill)
     :ok
   end
 
-  def reap(writer, :halted) do
+  def reap(writer, :halted, _grace_ms) do
     Task.shutdown(writer, :brutal_kill)
     :ok
   end
