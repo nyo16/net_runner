@@ -23,6 +23,7 @@ defmodule NetRunner do
 
   alias NetRunner.InputWriter
   alias NetRunner.Process, as: Proc
+  alias NetRunner.Process.Options
   alias NetRunner.Stream, as: NRStream
 
   @doc """
@@ -37,7 +38,7 @@ defmodule NetRunner do
   Malformed options are programmer errors and raise `ArgumentError` — unknown
   keys (`Keyword.validate!/2`) as well as invalid values (`:output`,
   `:input_buffer`, `:stderr`, `:stderr_tail_bytes`, `:cgroup_path`, `:cwd`,
-  `:env`, `:no_new_privs`). Runtime spawn failures (an invalid command,
+  `:env`, `:no_new_privs`, `:kill_timeout`). Runtime spawn failures (an invalid command,
   shepherd errors) return `{:error, reason}` instead. This convention holds
   at every NetRunner entry point.
 
@@ -94,8 +95,14 @@ defmodule NetRunner do
     * `:no_new_privs` - when `true`, the child calls
       `prctl(PR_SET_NO_NEW_PRIVS, 1)` before exec, so neither it nor anything
       it executes can gain privileges through setuid/setgid binaries or file
-      capabilities. Linux only; accepted and ignored elsewhere. Default
-      `false`. Must be a boolean.
+      capabilities. Linux only; `true` raises `ArgumentError` elsewhere.
+      Default `false`. Must be a boolean.
+    * `:pipe_size` - `:grown` (default) lets the shepherd grow the Linux
+      pipes (stdout 1 MiB, stdin/stderr 256 KiB) for throughput; `:default`
+      keeps the kernel's 64 KiB. Grown pipes are charged to the user's
+      `pipe-user-pages-soft` budget for as long as they live, so long-lived,
+      low-volume children should use `:default` (`NetRunner.Daemon` does).
+      No effect off Linux.
 
   Also accepted and passed through to the underlying process: `:pty`,
   `:cgroup_path`, `:kill_timeout`.
@@ -131,9 +138,6 @@ defmodule NetRunner do
       cmd = NetRunner.Command.new("echo", ["hello"], timeout: 5_000)
       {output, 0} = NetRunner.run(cmd)
   """
-  # Same default as NetRunner.Process.Exec (the shepherd's escalation).
-  @default_kill_timeout_ms 5_000
-
   @run_opts [
     :input,
     :input_buffer,
@@ -147,7 +151,8 @@ defmodule NetRunner do
     :cgroup_path,
     :kill_timeout,
     :env,
-    :no_new_privs
+    :no_new_privs,
+    :pipe_size
   ]
 
   @spec run(NetRunner.Command.t() | [String.t()], keyword()) ::
@@ -169,8 +174,8 @@ defmodule NetRunner do
 
   defp run_impl(cmd, args, opts) do
     opts = Keyword.validate!(opts, @run_opts)
-    # Lists coalesce here, in the caller, before the input is captured by any
-    # task closure (see InputWriter.prepare/1).
+    # Eager lists coalesce (and are validated) here, before anything is
+    # spawned, so a malformed list raises with no child to leak.
     input = InputWriter.prepare(Keyword.get(opts, :input, nil))
     input_buffer = InputWriter.validate_buffer!(Keyword.get(opts, :input_buffer, 0))
     timeout = Keyword.get(opts, :timeout, nil)
@@ -178,11 +183,7 @@ defmodule NetRunner do
     output = validate_output!(Keyword.get(opts, :output, :binary))
     capture_stderr? = Keyword.get(opts, :stderr, :consume) == :capture
 
-    if capture_stderr? and Keyword.get(opts, :pty, false) do
-      # PTY folds stderr into the master fd; the captured tail would always
-      # be "". Reject rather than silently ignore, like every other option.
-      raise ArgumentError, "stderr: :capture is not supported with pty: true"
-    end
+    validate_pty_combination!(opts, capture_stderr?)
 
     process_opts =
       opts
@@ -207,7 +208,7 @@ defmodule NetRunner do
       capture_stderr?: capture_stderr?,
       # The SIGTERM grace on run/2's own timeout/error path; same option and
       # default as the shepherd's escalation (issue #28).
-      kill_timeout: Keyword.get(opts, :kill_timeout, @default_kill_timeout_ms)
+      kill_timeout: Keyword.get(opts, :kill_timeout, Options.default_kill_timeout())
     }
 
     case Proc.start(cmd, args, process_opts) do
@@ -219,6 +220,27 @@ defmodule NetRunner do
     end
   end
 
+  # PTY folds stderr into the master fd, so a captured tail would always be
+  # "". And a PTY cannot signal end of :input: the master is one
+  # bidirectional fd, closing the BEAM's dup does not hang up the terminal,
+  # so a child reading to EOF would wait forever. Reject both rather than
+  # silently ignore them, like every other option.
+  defp validate_pty_combination!(opts, capture_stderr?) do
+    if Keyword.get(opts, :pty, false) do
+      if capture_stderr? do
+        raise ArgumentError, "stderr: :capture is not supported with pty: true"
+      end
+
+      if Keyword.get(opts, :input) != nil do
+        raise ArgumentError,
+              ":input is not supported with pty: true (a PTY has no stdin EOF); " <>
+                "use NetRunner.Process.write/2 on a pty process instead"
+      end
+    end
+
+    :ok
+  end
+
   defp validate_output!(mode) when mode in [:binary, :iodata], do: mode
 
   defp validate_output!(other) do
@@ -226,11 +248,36 @@ defmodule NetRunner do
   end
 
   defp run_with_pid(pid, timeout, io) do
+    # The writer runs concurrently with the reader. Writing to completion
+    # first deadlocks any filter command once the input exceeds
+    # stdin_buffer + stdout_buffer (~128 KiB on macOS): the child fills its
+    # stdout pipe, blocks in write(2), and therefore stops draining stdin,
+    # while we are blocked filling stdin.
+    #
+    # It starts HERE, in the caller, not inside run_io: a closure copies
+    # everything it captures into the process it spawns, so a lazy :input
+    # (and the terms it captures, e.g. the list behind a Stream.map/2) used to
+    # be copied twice — into the run_io task and again into the writer task
+    # it started. Now it crosses one boundary, and run_io's closure carries
+    # no input at all. Task.async links the writer to the caller exactly as
+    # the run_io task already was, so a writer crash propagates the same way.
+    started = System.monotonic_time(:millisecond)
+    writer = InputWriter.start(pid, io.input, io.input_buffer)
+    io = %{io | input: nil}
     task = Task.async(fn -> run_io(pid, io) end)
 
     result =
       (Task.yield(task, timeout || :infinity) || Task.shutdown(task))
       |> handle_run_result(pid, io.kill_timeout)
+
+    # Reaped by its owner. :done only after a natural end of output, and the
+    # join never runs past what is left of :timeout; on a timeout or error the
+    # child is being killed and nothing is left to write.
+    if match?({:error, _}, result) do
+      InputWriter.reap(writer, :halted)
+    else
+      InputWriter.reap(writer, :done, remaining_ms(timeout, started))
+    end
 
     # run/2 never hands the pid to the caller, so nothing else can ever stop
     # this server. Without it, each call leaks the Process GenServer, its
@@ -238,6 +285,11 @@ defmodule NetRunner do
     Proc.stop(pid)
     result
   end
+
+  defp remaining_ms(nil, _started), do: :infinity
+
+  defp remaining_ms(timeout, started),
+    do: max(timeout - (System.monotonic_time(:millisecond) - started), 0)
 
   defp handle_run_result({:ok, {output, exit_status}}, _pid, _kill_timeout)
        when (is_binary(output) or is_list(output)) and is_integer(exit_status) do
@@ -282,7 +334,12 @@ defmodule NetRunner do
       writes of up to that many bytes for throughput. Eager lists always
       coalesce.
     * `:stderr` - `:consume` (default) or `:disabled`
-    * `:cwd`, `:env`, `:no_new_privs` - as in `run/2`
+    * `:stderr_tail_bytes` - cap on the retained stderr tail, as in `run/2`
+    * `:pty`, `:cgroup_path`, `:kill_timeout` - passed through to the
+      underlying `NetRunner.Process`, as in `run/2`
+    * `:cwd`, `:env`, `:no_new_privs`, `:pipe_size` - as in `run/2`
+    * `:name`, `:owner` - passed to `NetRunner.Process.start_link/3`; the
+      stream re-registers the consumer as owner once iteration starts
 
   `:timeout` and `:max_output_size` are `run/2`-only options and are rejected
   here — a lazy stream has no single wall-clock to bound. Unknown options
@@ -353,11 +410,14 @@ defmodule NetRunner do
         new_collected = collected + chunks_size(chunks)
 
         if max_size && new_collected > max_size do
-          # Flatten once and cut at the limit; identical bytes to truncating
-          # the overflowing chunk in place, on a path that is already an error.
+          # Flatten exactly the first max_size bytes: `acc` holds `collected`
+          # (≤ max_size) of them, the rest come from this batch. Flattening a
+          # list always builds a fresh binary, so the partial pins nothing; a
+          # binary_part of the whole flattened buffer kept up to max_size plus
+          # one read alive for as long as the caller held the error (PERF-5).
           # The partial is always a binary, whatever the :output mode.
-          partial = IO.iodata_to_binary([acc | chunks])
-          {:error, {:max_output_exceeded, binary_part(partial, 0, max_size)}}
+          partial = IO.iodata_to_binary([acc | take_bytes(chunks, max_size - collected)])
+          {:error, {:max_output_exceeded, partial}}
         else
           # Nested iodata — no Enum.reverse, no per-batch list rebuild; the
           # single flatten (if :binary mode asks for one) happens at :eof.
@@ -383,18 +443,15 @@ defmodule NetRunner do
 
   defp chunks_size(chunks), do: Enum.reduce(chunks, 0, &(byte_size(&1) + &2))
 
-  defp run_io(pid, io) do
-    # The writer must run concurrently with the reader. Writing to completion
-    # first deadlocks any filter command once the input exceeds
-    # stdin_buffer + stdout_buffer (~128 KiB on macOS): the child fills its
-    # stdout pipe, blocks in write(2), and therefore stops draining stdin,
-    # while we are blocked filling stdin. Neither side can move and the
-    # default :timeout of nil means there is no escape.
-    writer = InputWriter.start(pid, io.input, io.input_buffer)
+  # The first `n` bytes of `chunks` as iodata (n < their total).
+  defp take_bytes([chunk | rest], n) when byte_size(chunk) < n,
+    do: [chunk | take_bytes(rest, n - byte_size(chunk))]
 
+  defp take_bytes([chunk | _rest], n), do: [binary_part(chunk, 0, n)]
+
+  defp run_io(pid, io) do
     case read_all_with_limits(pid, io.max_output_size, io.output) do
       {:ok, output} ->
-        InputWriter.reap(writer, :done)
         {:ok, exit_status} = Proc.await_exit(pid)
 
         if io.capture_stderr? do
@@ -406,7 +463,6 @@ defmodule NetRunner do
         end
 
       {:error, _} = error ->
-        InputWriter.reap(writer, :halted)
         error
     end
   end

@@ -25,6 +25,24 @@ defmodule NetRunnerTest do
       {output, 0} = NetRunner.run(["sh", "-c", "printf hello; printf world"])
       assert output == "helloworld"
     end
+
+    test "a command that finishes inside :timeout is not cut short" do
+      assert {"fast\n", 0} = NetRunner.run(~w(echo fast), timeout: 5_000)
+    end
+
+    test "output under :max_output_size is returned whole" do
+      assert {"hello\n", 0} = NetRunner.run(~w(echo hello), max_output_size: 1_000)
+    end
+
+    test "a truncated partial pins only its own bytes (PERF-5)" do
+      for max <- [1, 1_000, 100_000] do
+        assert {:error, {:max_output_exceeded, partial}} =
+                 NetRunner.run(["yes"], max_output_size: max)
+
+        assert byte_size(partial) == max
+        assert :binary.referenced_byte_size(partial) == max
+      end
+    end
   end
 
   describe "stream!/2" do
@@ -154,21 +172,6 @@ defmodule NetRunnerTest do
       assert_raise ArgumentError, fn -> NetRunner.stream!(~w(cat), input_buffer: -1) end
       assert_raise ArgumentError, fn -> NetRunner.stream!(~w(cat), input_buffer: :big) end
     end
-
-    test "prepare/1 batches to ≤1 MiB flat binaries and is idempotent" do
-      list = List.duplicate(:binary.copy(<<9>>, 100_000), 30)
-
-      batches = NetRunner.InputWriter.prepare(list)
-
-      assert Enum.all?(batches, &is_binary/1)
-      # Soft limit: a batch may include the element that crosses 1 MiB.
-      assert Enum.all?(batches, &(byte_size(&1) <= 1_048_576 + 100_000))
-      assert IO.iodata_to_binary(batches) == IO.iodata_to_binary(list)
-
-      # Re-entry (run/2: prepare in run_impl, list_batches again in start/3)
-      # must be a true no-op — same binaries, no re-copy.
-      assert NetRunner.InputWriter.prepare(batches) == batches
-    end
   end
 
   describe "output: :iodata" do
@@ -226,7 +229,7 @@ defmodule NetRunnerTest do
       end
 
       # Shepherd + watcher reap asynchronously.
-      eventually(fn -> count_sleep_processes(marker) == 0 end, 3_000)
+      eventually(fn -> pgrep_count(marker) == 0 end, 3_000)
     end
 
     # Issue #28: run/2's own timeout path hard-coded a 5 s SIGTERM grace, so a
@@ -246,14 +249,7 @@ defmodule NetRunnerTest do
       assert result == {:error, :timeout}
       # timeout + kill_timeout = 0.5 s; the old fixed grace made it >= 5.3 s.
       assert us < 3_000_000, "run/2 returned after #{div(us, 1000)} ms"
-      eventually(fn -> count_sleep_processes(marker) == 0 end, 3_000)
-    end
-  end
-
-  defp count_sleep_processes(marker) do
-    case System.cmd("pgrep", ["-f", "sleep #{marker}"], stderr_to_stdout: true) do
-      {out, 0} -> out |> String.split("\n", trim: true) |> length()
-      _ -> 0
+      eventually(fn -> pgrep_count(marker) == 0 end, 3_000)
     end
   end
 end

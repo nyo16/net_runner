@@ -67,7 +67,7 @@ defmodule NetRunner.IOPipeliningTest do
                  timeout: 300
                )
 
-      eventually(fn -> count_matching("sleep #{marker}") == 0 end, 3_000)
+      eventually(fn -> pgrep_count(marker) == 0 end, 3_000)
     end
 
     test "times out even while the writer is still blocked on a full stdin pipe" do
@@ -78,7 +78,7 @@ defmodule NetRunner.IOPipeliningTest do
       assert {:error, :timeout} =
                NetRunner.run(["sh", "-c", "sleep #{marker}"], input: payload, timeout: 300)
 
-      eventually(fn -> count_matching("sleep #{marker}") == 0 end, 3_000)
+      eventually(fn -> pgrep_count(marker) == 0 end, 3_000)
     end
   end
 
@@ -172,28 +172,28 @@ defmodule NetRunner.IOPipeliningTest do
       assert Proc.stats(pid).bytes_err == 64 * 1_048_576
     end
 
-    # The bound only engages when a single pass runs past @stderr_drain_chunks,
-    # and a 64 KiB pipe rarely refills that fast on its own. A large retained
-    # tail makes every drained chunk expensive (the tail is rebuilt at `cap`
-    # bytes per chunk), so the producer outruns the drain and the budget is
-    # exhausted for real. That is the ONLY path that schedules
-    # :consume_stderr_more. If that clause is ever moved below the catch-all in
+    # A pass that exhausts its chunk budget yields and resumes via
+    # :consume_stderr_more — the ONLY message that keeps a budget-exhausted
+    # drain going. If that clause is ever moved below the catch-all in
     # handle_info/2 the message is silently dropped, enif_select is not armed
     # (the pass stopped short of EAGAIN), draining stops dead and the child
-    # blocks forever on a full stderr pipe — so this fails on await_exit, which
-    # is a far worse regression than the latency bound above.
+    # blocks forever on a full stderr pipe — so this fails on await_exit.
+    # stderr_drain_chunks: 1 makes every non-empty pass yield, so the path is
+    # exercised deterministically; the trace proves the resume message ran.
     test "draining resumes after a pass exhausts its chunk budget" do
       mb = 8
       total = mb * 1_048_576
 
       pid =
         start_proc("sh", ["-c", "dd if=/dev/zero bs=1048576 count=#{mb} status=none >&2"],
-          stderr_tail_bytes: 1_048_576
+          stderr_drain_chunks: 1
         )
 
+      :erlang.trace(pid, true, [:receive])
+
       assert {:ok, 0} = Proc.await_exit(pid, 30_000)
+      assert_receive {:trace, ^pid, :receive, :consume_stderr_more}, 5_000
       eventually(fn -> Proc.stats(pid).bytes_err == total end, 5_000)
-      assert byte_size(Proc.stderr_tail(pid)) == 1_048_576
     end
   end
 
@@ -238,12 +238,5 @@ defmodule NetRunner.IOPipeliningTest do
     {:ok, pid} = Proc.start(cmd, args, opts)
     on_exit(fn -> Proc.stop(pid) end)
     pid
-  end
-
-  defp count_matching(pattern) do
-    case System.cmd("pgrep", ["-f", pattern], stderr_to_stdout: true) do
-      {out, 0} -> out |> String.split("\n", trim: true) |> length()
-      _ -> 0
-    end
   end
 end

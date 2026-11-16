@@ -243,6 +243,17 @@ static ERL_NIF_TERM nif_create_fd(ErlNifEnv *env, int argc,
                                 MAKE_ATOM(env, "fcntl_failed"));
     }
 
+    /* Close-on-exec: fds received via SCM_RIGHTS arrive without it (Linux
+     * passes MSG_CMSG_CLOEXEC, elsewhere this is the only place it is set),
+     * and every fork the VM performs (os:cmd, other ports) would otherwise
+     * inherit the child's pipe ends — a stray stdin write end keeps the
+     * child from ever seeing EOF. */
+    int fd_flags = fcntl(fd, F_GETFD, 0);
+    if (fd_flags == -1 || fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) == -1) {
+        return enif_make_tuple2(env, atom_error,
+                                MAKE_ATOM(env, "fcntl_failed"));
+    }
+
     io_resource_t *res = enif_alloc_resource(io_resource_type,
                                              sizeof(io_resource_t));
     if (!res) {
@@ -532,7 +543,9 @@ static ERL_NIF_TERM nif_dup_fd(ErlNifEnv *env, int argc,
         return enif_make_badarg(env);
     }
 
-    int new_fd = dup(fd);
+    /* CLOEXEC atomically: a plain dup() drops the flag, and any fork in the
+     * VM (os:cmd, another port) would inherit the PTY master. */
+    int new_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (new_fd < 0) {
         return enif_make_tuple2(env, atom_error,
                                 MAKE_ATOM(env, errno_to_atom(errno)));
@@ -733,16 +746,25 @@ static ERL_NIF_TERM nif_is_os_pid_alive(ErlNifEnv *env, int argc,
 /*
  * nif_signal_number(signal_atom) -> {:ok, number} | {:error, :unknown_signal}
  *
- * Converts a signal atom to its platform-specific number.
+ * Converts a signal atom to its platform-specific number. An atom that does
+ * not fit the buffer (>= 32 bytes) or is not Latin-1 cannot name a signal:
+ * it is an unknown signal, not a badarg — a raise here would crash the
+ * Process GenServer (and with it the child) on a caller's typo. badarg is
+ * kept for non-atoms only.
  */
 static ERL_NIF_TERM nif_signal_number(ErlNifEnv *env, int argc,
                                       const ERL_NIF_TERM argv[]) {
     ASSERT_ARGC(env, argc, 1);
 
+    if (!enif_is_atom(env, argv[0])) {
+        return enif_make_badarg(env);
+    }
+
     char atom_buf[32];
     if (!enif_get_atom(env, argv[0], atom_buf, sizeof(atom_buf),
                        ERL_NIF_LATIN1)) {
-        return enif_make_badarg(env);
+        return enif_make_tuple2(env, atom_error,
+                                MAKE_ATOM(env, "unknown_signal"));
     }
 
     int sig = -1;

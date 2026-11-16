@@ -10,7 +10,7 @@
 - (+) Detects BEAM death via UDS `POLLHUP` — guaranteed child cleanup even under `SIGKILL`
 - (+) Can relay commands (kill signals, stdin close, window size) to the child
 - (-) Costs one extra process per command (~100KB resident memory)
-- (-) Slightly more complex C code (~950 lines vs ~200)
+- (-) More complex C code (`shepherd.c` is close to 2000 lines vs ~200 for an exec-away launcher)
 
 ## ADR-2: UDS + SCM_RIGHTS (vs Named Pipes)
 
@@ -48,7 +48,7 @@
 - (+) No additional toolchain required — `gcc`/`clang` available everywhere
 - (+) Fast compilation (<1 second)
 - (+) Direct access to POSIX APIs without FFI layers
-- (+) ~1600 lines of C total (shepherd + NIF), easy to audit
+- (+) A few thousand lines of C in total (`shepherd.c`, `net_runner_nif.c` and small headers), easy to audit
 - (-) Manual memory management (mitigated by simple allocation patterns)
 - (-) No type safety beyond what C provides
 
@@ -61,9 +61,22 @@
 **Consequences**:
 - (+) Shepherd covers BEAM crash (SIGKILL, OOM, segfault)
 - (+) Watcher covers GenServer crash (Elixir-level errors)
-- (+) NIF destructors provide a third layer (GC-based cleanup)
+- (+) The NIF owner monitor (`io_resource_down`) provides a further layer: when the owning process dies it closes the BEAM's FDs (the destructor alone cannot, since it never runs while an `enif_select` is live)
 - (-) Slightly redundant — both may try to kill the same process
 - (-) Requires careful handling of the race (both use `kill()` which is idempotent)
+
+**Addendum (2026-11)**: "Dual" undercounts. The zero-zombie guarantee rests on
+four mechanisms, and every doc counts them the same way:
+1. **Shepherd** — `PR_SET_PDEATHSIG` on the child (Linux) plus the
+   SIGTERM→SIGKILL ladder on the child's process group, triggered by UDS
+   POLLHUP, EOF/HUP on the fd-3 port channel, or a termination signal.
+2. **`Process` orphan kill** — on shepherd death without an exit status,
+   group SIGKILL by pgid (not reused while any member lives) plus a pidfd
+   signal to the leader where a pidfd exists; no direct kill of the leader by
+   pid number.
+3. **Watcher** — a single SIGTERM probe on GenServer death (by pid number;
+   the accepted residual of ADR-16).
+4. **NIF owner monitor** — `io_resource_down` closes the BEAM's FDs.
 
 ## ADR-6: Normal Schedulers for All NIFs
 
@@ -306,6 +319,17 @@ exits on its own gets the sweep immediately, with no grace period.
   deliberate: the leader is already gone, and a grace period would hold the
   exit status hostage to whatever it left behind.
 
+**Addendum (2026-11, PERF-9)**: running `cgroup_cleanup` before the exit
+frame put its `rmdir` retry loop on the exit path. A fixed 100 ms sleep
+between attempts delayed the frame by 100 ms whenever the first `rmdir` raced
+the processes `cgroup.kill` had just killed (`sh -c 'sleep 60 & exit 0'`). The
+retries now back off exponentially (1, 2, 4 … 512 ms, the same ~1 s cap), and
+the ordering above is unchanged. Linux Docker, 3 runs × 100 exits under
+`cgroup_path:`: before, 5–9 per 100 took ≥ 50 ms (mean 6.3–10.4 ms); after,
+0 per 100 (mean 1.6–3.1 ms, against 1.2–3.6 ms without a cgroup). Details in
+`bench/LINUX_VERIFICATION.md`; reproduce the "after" numbers on Linux with
+`MIX_ENV=prod mix run bench/linux_ab.exs` (needs a writable cgroup v2).
+
 ## ADR-15: Unconditional Exec Gate; Hand Off Before Exec
 
 **Context**: The sync-pipe gate existed only for cgroup spawns, and even then
@@ -322,9 +346,10 @@ child joins/creates its group, resets signals, blocks on the gate → parent
 (pipe mode) `setpgid(child, child)`; PTY mode waits for the child's `'R'`
 after `setsid()` → `cgroup_setup` → `send_fds` → `MSG_CHILD_STARTED` → `'G'`.
 Any failure before `'G'` closes the gate (the child `_exit(127)`s without
-exec), SIGKILLs and reaps it, then reports `MSG_ERROR`. On the BEAM side
-`finish_orphaned/2` additionally falls back to a direct kill of the leader on
-a group `ESRCH`.
+exec), SIGKILLs and reaps it, then reports `MSG_ERROR`. On the BEAM side the
+orphan path (`kill_orphan/2`) sends a group SIGKILL by pgid, plus a pidfd
+signal to the leader where a pidfd exists; no direct kill of the leader by
+pid number.
 
 **Consequences**:
 - (+) A spawn that returns an error never ran the command.
@@ -339,9 +364,9 @@ a group `ESRCH`.
 
 **Context**: Inside the shepherd a pid is safe to signal: the shepherd is the
 parent and holds the zombie until it reaps. The BEAM has no such guarantee.
-Once the shepherd is gone (or has reaped), `direct_kill` and
-`finish_orphaned/2` signal a pid number that may already belong to someone
-else; probe-then-kill only narrows that window.
+Once the shepherd is gone (or has reaped), a `kill(2)` from the BEAM signals a
+pid number that may already belong to someone else; probe-then-kill only
+narrows that window.
 
 **Decision**: On Linux the shepherd calls `pidfd_open(child, 0)` right after
 `fork` and appends the pidfd as the optional last `SCM_RIGHTS` fd. The BEAM
@@ -360,6 +385,11 @@ old fd counts and the probe-then-kill path.
 - (−) A pidfd signals one process; a group-wide pidfd signal needs Linux ≥
   6.9 (`PIDFD_SIGNAL_PROCESS_GROUP`), so the orphan path still pairs it with
   `killpg`.
+- (−) Accepted residual: the Watcher's crash-path probe (one SIGTERM after
+  the `Process` GenServer dies) still signals by pid number on every
+  platform, Linux included — the Watcher holds no pidfd. The orphan path
+  never signals the leader by pid number: it uses the group kill (`killpg`
+  by pgid, which is not reused while any member lives) plus the pidfd only.
 
 ## ADR-17: Deferred Isolation Mechanisms
 
@@ -385,3 +415,25 @@ new information.
 - **`posix_spawn` instead of `fork`**: rejected. It cannot portably do
   `PR_SET_PDEATHSIG`, the exec gate or `TIOCSCTTY`, and spawn cost is
   dominated by the two `exec`s anyway (Spawn Cost in `architecture.md`).
+
+## ADR-18: The Shepherd Holds the stdin Write End
+
+**Context**: In pipe mode the shepherd sends `stdin_pipe[1]` to the BEAM via
+`SCM_RIGHTS` but keeps its own copy (`*stdin_w` in `spawn_pipe`), so the
+pipe has two writers. A reader asked whether the shepherd should close its
+copy right after the hand-off.
+
+**Decision**: Keep it. The shepherd's copy is one half of a two-party close
+protocol: `NetRunner.Process.close_stdin/1` closes the BEAM's write end via
+the NIF *and* sends `CMD_CLOSE_STDIN`, on which the shepherd closes its copy
+(`handle_command` in `shepherd.c`). The child sees stdin EOF only after both
+sides have closed. No protocol change.
+
+**Consequences**:
+- (+) stdin EOF is an explicit act (`close_stdin/1`) or a shepherd teardown,
+  never a side effect of the BEAM-side fd's lifecycle.
+- (+) The shepherd can still close stdin on the child's behalf at teardown.
+- (−) Closing only the BEAM's fd (e.g. the NIF owner monitor after the owner
+  dies) does not deliver EOF; the child sees it when the shepherd closes its
+  copy on `CMD_CLOSE_STDIN` or on exit. Docs must not claim otherwise.
+- (−) One extra fd in the shepherd per pipe-mode child.

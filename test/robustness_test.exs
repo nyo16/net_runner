@@ -35,14 +35,17 @@ defmodule NetRunner.RobustnessTest do
       marker = sleep_marker()
       {:ok, pid} = Proc.start("sh", ["-c", "trap '' TERM; sleep #{marker} & wait"])
       os_pid = Proc.os_pid(pid)
-      eventually(fn -> pgrep(marker) != [] end)
+      # Anchored count: only the real `sleep <marker>` (not the `sh -c` that
+      # carries the marker in its argv) proves the grandchild exists before
+      # the shepherd is killed.
+      eventually(fn -> pgrep_count(marker) > 0 end)
 
       capture_log(fn ->
         System.cmd("kill", ["-KILL", to_string(parent_pid!(os_pid))])
         assert {:ok, 137} = Proc.await_exit(pid, 2_000)
       end)
 
-      eventually(fn -> not os_pid_alive?(os_pid) and pgrep(marker) == [] end)
+      eventually(fn -> not os_pid_alive?(os_pid) and pgrep_count(marker) == 0 end)
       Proc.stop(pid)
     end
 
@@ -57,6 +60,117 @@ defmodule NetRunner.RobustnessTest do
 
       eventually(fn -> not os_pid_alive?(os_pid) end)
       Proc.stop(pid)
+    end
+
+    # T-18: a kill/2 that lands after the shepherd died but before its Port
+    # exit is processed. The exit message is made unmatchable (shepherd_port
+    # cleared while the server is suspended) so the kill deterministically
+    # takes the shepherd-dead branch: the pidfd on Linux, probe_and_kill/2
+    # elsewhere.
+    test "kill/2 between shepherd death and its Port exit reaches the orphan" do
+      {:ok, pid} = Proc.start("sleep", ["100"])
+      on_exit(fn -> Proc.stop(pid) end)
+      os_pid = Proc.os_pid(pid)
+      %{shepherd_port: port} = :sys.get_state(pid)
+
+      :ok = :sys.suspend(pid)
+      System.cmd("kill", ["-KILL", to_string(parent_pid!(os_pid))])
+      eventually(fn -> Port.info(port) == nil end)
+      :sys.replace_state(pid, fn state -> %{state | shepherd_port: nil} end)
+      :ok = :sys.resume(pid)
+
+      # Linux: PR_SET_PDEATHSIG may have killed the orphan already, which the
+      # pidfd reports as ESRCH. macOS has no PDEATHSIG, so the orphan is alive
+      # and only this kill ends it.
+      result = Proc.kill(pid, :sigkill)
+
+      if match?({:unix, :linux}, :os.type()) do
+        assert result in [:ok, {:error, :not_running}]
+      else
+        assert result == :ok
+      end
+
+      eventually(fn -> not os_pid_alive?(os_pid) end)
+    end
+  end
+
+  describe "shepherd command framing (T-17)" do
+    # An unknown opcode makes the shepherd ignore ALL further command bytes
+    # (sticky). 0x01 0x09 after it is the payload of a hypothetical newer
+    # frame and must not run as CMD_KILL SIGKILL; neither may a later,
+    # well-formed CMD_KILL.
+    test "bytes after an unknown opcode are never executed as commands" do
+      {:ok, pid} = Proc.start("sleep", ["100"])
+      on_exit(fn -> Proc.stop(pid) end)
+      os_pid = Proc.os_pid(pid)
+      %{uds_socket: socket} = :sys.get_state(pid)
+
+      :ok = :socket.send(socket, <<0x42, 0x01, 0x09>>)
+      assert :ok = Proc.kill(pid, :sigterm)
+
+      # Negative check: a misparse would have signalled within microseconds.
+      Process.sleep(200)
+      assert os_pid_alive?(os_pid)
+
+      # BEAM-side teardown (UDS hangup) still works.
+      Proc.stop(pid)
+      eventually(fn -> not os_pid_alive?(os_pid) end, 7_000)
+    end
+  end
+
+  describe "shepherd watches its port channel (S-15/F-08)" do
+    # Closing only the Port (fd 3/4) used to leave the shepherd running: it
+    # watched the UDS alone. Port EOF now runs the same teardown ladder.
+    test "closing the shepherd Port tears the child down" do
+      {:ok, pid} = Proc.start("sleep", ["100"], kill_timeout: 200)
+      on_exit(fn -> Proc.stop(pid) end)
+      os_pid = Proc.os_pid(pid)
+      %{shepherd_port: port} = :sys.get_state(pid)
+
+      Port.close(port)
+
+      # The UDS is still up, so the real status arrives: sleep dies on SIGTERM.
+      assert {:ok, 143} = Proc.await_exit(pid, 5_000)
+      eventually(fn -> not os_pid_alive?(os_pid) end)
+    end
+  end
+
+  describe "teardown reaches a leader that left its process group (S-13)" do
+    # The leader joins a sibling's group while a TERM-ignoring `sleep` keeps
+    # the original group populated. kill(-pid) then succeeds without reaching
+    # the leader, so a group-only SIGKILL (falling back to the leader only on
+    # an empty group) reported 137 and left the leader running.
+    @perl System.find_executable("perl")
+
+    test "Proc.stop kills the leader, not just its old group" do
+      if @perl do
+        marker = sleep_marker()
+        on_exit(fn -> System.cmd("pkill", ["-KILL", "-f", "^sleep #{marker}$"]) end)
+        ready = Path.join(System.tmp_dir!(), "nr_s13_#{System.unique_integer([:positive])}")
+        on_exit(fn -> File.rm(ready) end)
+
+        # S stays in the original group; B leads a new one; the leader moves
+        # into B's group and reports success via the ready file.
+        script = """
+        $SIG{TERM} = 'IGNORE';
+        my $s = fork(); if ($s == 0) { exec 'sleep', '#{marker}'; }
+        my $b = fork(); if ($b == 0) { setpgrp(0, 0); exec 'sleep', '#{marker}'; }
+        setpgrp($b, $b);
+        setpgrp(0, $b) or die "setpgrp: $!";
+        open(my $f, '>', '#{ready}') or die; print $f 'moved'; close($f);
+        sleep 1 while 1;
+        """
+
+        {:ok, pid} = Proc.start(@perl, ["-e", script], kill_timeout: 200)
+        os_pid = Proc.os_pid(pid)
+        eventually(fn -> File.read(ready) == {:ok, "moved"} end)
+
+        Proc.stop(pid)
+
+        eventually(fn -> not os_pid_alive?(os_pid) end, 3_000)
+      else
+        degraded_note("S-13 leader-left-group test skipped: perl not found")
+      end
     end
   end
 
@@ -222,13 +336,6 @@ defmodule NetRunner.RobustnessTest do
 
       assert Proc.stats(pid).bytes_err == 4
       GenServer.stop(pid)
-    end
-  end
-
-  defp pgrep(pattern) do
-    case System.cmd("pgrep", ["-f", "sleep #{pattern}"]) do
-      {out, 0} -> String.split(out, "\n", trim: true)
-      {_, _} -> []
     end
   end
 end

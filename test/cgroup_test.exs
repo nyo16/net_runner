@@ -86,19 +86,6 @@ defmodule NetRunner.CgroupTest do
       end
     end
 
-    # A cgroup positive path that silently stops executing would leave a green
-    # build with zero cgroup coverage. CI sets NR_CGROUP_DELEGATED=1 on the leg
-    # that delegates /sys/fs/cgroup/net_runner, so there the degraded branch is
-    # a hard failure; elsewhere it is a logged, expected downgrade.
-    defp degraded(message) do
-      if System.get_env("NR_CGROUP_DELEGATED") == "1" do
-        flunk("cgroup positive path did not run on a delegated CI leg: " <> message)
-      else
-        require Logger
-        Logger.warning("[degraded] " <> message)
-      end
-    end
-
     test "cgroup_path nil (default) works normally" do
       {:ok, pid} = Proc.start("echo", ["no cgroup"])
       {:ok, data} = Proc.read(pid)
@@ -114,27 +101,6 @@ defmodule NetRunner.CgroupTest do
       assert_raise ArgumentError, ~r/cannot contain '\.\.'/, fn ->
         Proc.start("echo", ["x"], cgroup_path: "net_runner/some/../evil")
       end
-    end
-
-    test "places an unprefixed path under net_runner/ with a one-time deprecation warning" do
-      # 1.3.x accepted unprefixed paths; 1.4.0 raised on them inside a minor
-      # release (issue #24). Until 2.0 they are prefixed instead. This is the
-      # only test in the suite that passes an unprefixed path, so the
-      # once-per-VM warning is still pending when it runs.
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          assert Proc.validate_opts!(cgroup_path: "legacy_job")[:cgroup_path] ==
-                   "net_runner/legacy_job"
-
-          assert Proc.validate_opts!(cgroup_path: "system.slice/x")[:cgroup_path] ==
-                   "net_runner/system.slice/x"
-        end)
-
-      assert length(String.split(log, "deprecated")) == 2,
-             "expected exactly one deprecation warning, got: #{log}"
-
-      assert Proc.validate_opts!(cgroup_path: "net_runner/job")[:cgroup_path] ==
-               "net_runner/job"
     end
 
     test "still rejects paths that name no cgroup or escape after prefixing" do

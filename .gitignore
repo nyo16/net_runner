@@ -24,16 +24,15 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 net_runner-*.tar
 
-# Native build artifacts
-priv/*.so
-priv/*.dylib
-priv/shepherd
-# Object files from builds before the one-step compile+link; kept ignored so
-# stale copies in existing checkouts are never committed.
+# Native build artifacts are written to _build/<env>/lib/net_runner/priv.
+# Builds before 1.7 wrote them to a top-level priv/; keep it ignored so stale
+# copies in existing checkouts are never committed. Object files from builds
+# before the one-step compile+link likewise.
+/priv/
 c_src/*.o
 
-# Dialyzer
-/priv/plts/
+# Dialyzer PLTs (mix.exs dialyzer config; cached in CI)
+/plts/
 
 # Local agent settings and scratch.
 /.claude/

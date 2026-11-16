@@ -1,7 +1,7 @@
 defmodule NetRunner.MixProject do
   use Mix.Project
 
-  @version "1.6.0"
+  @version "1.7.0"
   @source_url "https://github.com/nyo16/net_runner"
 
   def project do
@@ -20,9 +20,17 @@ defmodule NetRunner.MixProject do
       docs: docs(),
       name: "NetRunner",
       source_url: @source_url,
+      # The NIF stubs only raise until the library loads, and TestHelpers is
+      # test scaffolding; neither says anything about library coverage.
+      test_coverage: [
+        summary: [threshold: 80],
+        ignore_modules: [NetRunner.Nif, NetRunner.TestHelpers]
+      ],
       # test/support is compiled in :test (where dialyzer runs in CI) and
       # calls ExUnit.Assertions.flunk/1; ExUnit is not in the default PLT.
-      dialyzer: [plt_add_apps: [:ex_unit]]
+      # PLTs live in plts/ so CI can cache them on their own key; not under
+      # priv/, which Mix would link into the app path.
+      dialyzer: [plt_add_apps: [:ex_unit], plt_core_path: "plts", plt_local_path: "plts"]
     ]
   end
 
@@ -39,12 +47,13 @@ defmodule NetRunner.MixProject do
   defp deps do
     [
       # Production dependencies
-      {:elixir_make, "~> 0.10.0", runtime: false},
+      {:elixir_make, "~> 0.9", runtime: false},
 
       # Development dependencies
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
       {:stream_data, "~> 1.1", only: :test}
     ]
   end
@@ -56,8 +65,13 @@ defmodule NetRunner.MixProject do
   defp package do
     [
       name: "net_runner",
-      files:
-        ~w(lib c_src/*.c c_src/*.h docs priv/.gitkeep Makefile mix.exs README.md CHANGELOG.md LICENSE),
+      # docs/ is listed file by file: it also holds working notes that are
+      # not part of the published documentation.
+      files: ~w(
+        lib c_src/*.c c_src/*.h Makefile mix.exs README.md CHANGELOG.md LICENSE
+        docs/architecture.md docs/protocol.md docs/decisions.md
+        docs/backpressure.md docs/comparison.md docs/modules.md
+      ),
       licenses: ["Apache-2.0"],
       links: %{
         "GitHub" => @source_url,
@@ -78,7 +92,7 @@ defmodule NetRunner.MixProject do
       # the read-size source of truth respectively — so suppress the autolink
       # rather than the prose or the modules' internal status.
       skip_code_autolink_to: [
-        "NetRunner.Process.Exec.parse_uds_message/1",
+        "NetRunner.Process.Protocol.parse_uds_message/1",
         "NetRunner.InputWriter",
         "NetRunner.Process.Pipe.read/2"
       ],
@@ -99,15 +113,19 @@ defmodule NetRunner.MixProject do
           NetRunner.Command,
           NetRunner.Process,
           NetRunner.Stream,
-          NetRunner.Daemon
+          NetRunner.Daemon,
+          NetRunner.Error,
+          # Public type (returned by Process.stats/1); its mutators are @doc false.
+          NetRunner.Process.Stats
         ],
         Internals: [
           NetRunner.Process.Exec,
-          NetRunner.Process.Nif,
+          NetRunner.Process.Options,
+          NetRunner.Process.Protocol,
+          NetRunner.Process.Cgroup,
           NetRunner.Process.Pipe,
           NetRunner.Process.State,
           NetRunner.Process.Operations,
-          NetRunner.Process.Stats,
           NetRunner.Signal,
           NetRunner.Watcher
         ]

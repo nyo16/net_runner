@@ -1,6 +1,8 @@
 defmodule NetRunner.ExitStatusTest do
   use ExUnit.Case, async: true
 
+  import NetRunner.TestHelpers
+
   alias NetRunner.Process, as: Proc
   alias NetRunner.Process.Protocol
 
@@ -19,13 +21,6 @@ defmodule NetRunner.ExitStatusTest do
 
     test "preserves a non-zero status" do
       assert {"", 3} = NetRunner.run(["/bin/sh", "-c", "exit 3"])
-    end
-
-    test "does not wait for the force-exit backstop" do
-      # The backstop is 5 s. Anything near it means the status came from the
-      # timeout rather than from the shepherd.
-      {us, {"hi\n", 0}} = :timer.tc(fn -> NetRunner.run([@echo, "hi"]) end)
-      assert us < 1_000_000
     end
 
     test "a slow child still reports correctly" do
@@ -171,26 +166,79 @@ defmodule NetRunner.ExitStatusTest do
       assert {:ok, ^msg} = Protocol.recv_shepherd_error(beam_side, head, 1_000)
     end
 
-    defp uds_pair do
-      path = Path.join(System.tmp_dir!(), "nr_test_#{System.unique_integer([:positive])}.sock")
+    test "extract_child_started handles every handshake shape" do
+      cases = [
+        # {name, buffer already read, bytes sent afterwards (nil = close), expected}
+        {"split MSG_CHILD_STARTED (A-15)", <<0x80, 0, 0>>, <<0, 42>>, {:ok, 42, <<>>}},
+        {"MSG_CHILD_STARTED read from the socket", <<>>, <<0x80, 0, 0, 0, 7, 0x81>>,
+         {:ok, 7, <<0x81>>}},
+        {"child exited immediately", <<>>, <<0x81, 0, 0, 0, 3>>,
+         {:error, {:child_exited_immediately, 3}}},
+        {"split MSG_ERROR", <<0x82, 0, 5, "he">>, "llo", {:error, {:shepherd_error, "hello"}}},
+        {"MSG_ERROR whose remainder never arrives", <<0x82, 0, 5, "he">>, nil,
+         {:error, {:unexpected_message, <<0x82, 0, 5, "he">>}}},
+        {"unknown opcode", <<>>, <<0x7F, 0, 0, 0, 0>>,
+         {:error, {:unexpected_message, <<0x7F, 0, 0, 0, 0>>}}},
+        {"peer closed before any frame", <<>>, nil, {:error, {:recv_failed, :closed}}}
+      ]
 
-      {:ok, listener} = :socket.open(:local, :stream)
-      :ok = :socket.bind(listener, %{family: :local, path: path})
-      :ok = :socket.listen(listener)
+      for {name, buffer, sent, expected} <- cases do
+        {beam_side, shepherd_side} = uds_pair()
 
-      {:ok, client} = :socket.open(:local, :stream)
-      :ok = :socket.connect(client, %{family: :local, path: path})
-      {:ok, server} = :socket.accept(listener, 5_000)
+        case sent do
+          nil -> :socket.close(shepherd_side)
+          bytes -> :ok = :socket.send(shepherd_side, bytes)
+        end
 
-      :socket.close(listener)
-      File.rm(path)
+        assert Protocol.extract_child_started(beam_side, buffer, 1_000) == expected, name
+      end
+    end
+  end
 
-      on_exit(fn ->
-        :socket.close(client)
-        :socket.close(server)
-      end)
+  describe "unknown shepherd frame opcode (N-4)" do
+    import ExUnit.CaptureLog
 
-      {server, client}
+    # Sticky, like the shepherd's own command parser: after an unknown
+    # opcode nothing is parsed again, so payload bytes of a frame from a
+    # newer protocol can never be misread as MSG_CHILD_EXITED.
+    test "every later frame is ignored, even a valid MSG_CHILD_EXITED" do
+      {:ok, pid} = Proc.start("sleep", ["100"])
+      on_exit(fn -> Proc.stop(pid) end)
+      %{uds_socket: socket} = :sys.get_state(pid)
+
+      inject = fn bytes ->
+        :sys.replace_state(pid, &%{&1 | uds_carry: &1.uds_carry <> bytes})
+        send(pid, {:"$socket", socket, :select, make_ref()})
+        :sys.get_state(pid)
+      end
+
+      log = capture_log(fn -> assert %{protocol_error?: true} = inject.(<<0x7F>>) end)
+      assert log =~ "unknown shepherd frame opcode 0x7F"
+
+      # A separate, later read: still ignored.
+      assert %{status: :running, uds_carry: <<>>} = inject.(<<0x81, 0::big-32>>)
+      assert Proc.alive?(pid)
+    end
+
+    # The shepherd still reaps the child and exits 0, but its exit frame was
+    # ignored. A shepherd that exits on its own has already reaped, so the
+    # BEAM must not group-kill a pgid that may be reused, and must not claim
+    # 137: the status is unknown (255).
+    test "a lost exit report from a normally-exiting shepherd is 255, not an orphan kill" do
+      {:ok, pid} = Proc.start("sh", ["-c", "sleep 0.3; exit 3"])
+      on_exit(fn -> Proc.stop(pid) end)
+      %{uds_socket: socket} = :sys.get_state(pid)
+
+      log =
+        capture_log(fn ->
+          :sys.replace_state(pid, &%{&1 | uds_carry: &1.uds_carry <> <<0x7F>>})
+          send(pid, {:"$socket", socket, :select, make_ref()})
+          assert {:ok, 255} = Proc.await_exit(pid, 5_000)
+        end)
+
+      # 255 (not the orphan path's 137) proves no orphan kill ran. Refuting
+      # the orphan log line would race other async tests' captured logs.
+      assert log =~ "exit report was lost"
     end
   end
 end

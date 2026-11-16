@@ -13,8 +13,12 @@ Communication between the BEAM and the shepherd binary occurs over a Unix domain
    the private fd-3 port channel. For a replacement environment, the port
    environment already unsets every unselected variable the BEAM saw, and
    `--replace-env` carries the selected-name allowlist
-3. Shepherd reads the token from fd 3, connects to the UDS and writes the
-   32 hex bytes verbatim as its very first frame
+3. Shepherd reads the token from fd 3 and connects to the UDS. It then checks
+   that the listener's owner (the connected peer, via `SO_PEERCRED` on Linux,
+   `getpeereid` elsewhere) runs as its own effective uid, failing closed
+   (exit, no `MSG_ERROR` to an unverified peer) when it does not or the
+   credentials cannot be read. Only then does it write the 32 hex bytes
+   verbatim as its very first frame
 4. BEAM verifies the token (and, where the platform exposes peer
    credentials, the peer uid); a failed or stalling connection is closed and
    the BEAM keeps accepting until the deadline
@@ -35,9 +39,10 @@ Communication between the BEAM and the shepherd binary occurs over a Unix domain
 13. On child exit: SIGKILL of the remaining process group (while the zombie
     leader still pins the pgid), reap, cgroup cleanup, *then*
     `MSG_CHILD_EXITED`, shepherd exits
-14. On BEAM death (`POLLHUP`/`POLLERR`/`POLLNVAL`) or a SIGTERM/SIGINT/SIGHUP/
-    SIGQUIT to the shepherd: drain queued commands, then the teardown ladder
-    (see [BEAM Death Detection](#beam-death-detection))
+14. On BEAM death (UDS `POLLHUP`/`POLLERR`/`POLLNVAL`), EOF/HUP on the fd-3
+    port channel (the port was closed while the UDS stayed open), or a
+    SIGTERM/SIGINT/SIGHUP/SIGQUIT to the shepherd: drain queued commands, then
+    the teardown ladder (see [BEAM Death Detection](#beam-death-detection))
 
 Any shepherd failure in steps 8–11 closes the gate (the child `_exit(127)`s
 without exec), SIGKILLs and reaps the child, and only then sends `MSG_ERROR`
@@ -59,9 +64,11 @@ receive the child's pipe FDs via `SCM_RIGHTS`. The token is:
 - written by the shepherd as the first 32 bytes on the socket, before any
   FD or message
 
-A connection that fails authentication (wrong bytes, wrong peer uid, or a
-stall past the accept deadline) is closed and the listener keeps accepting,
-so an impostor costs only its own connection.
+Both sides check the other. The shepherd refuses to send its token to a
+listener owned by another uid (step 3). On the BEAM side, a connection that
+fails authentication (wrong bytes, wrong peer uid where the platform exposes
+it, or a stall past the accept deadline) is closed and the listener keeps
+accepting, so an impostor costs only its own connection.
 
 The shepherd binary and the Elixir library always ship together, so there is
 no compatibility shim for token-less shepherds.
@@ -126,9 +133,10 @@ real status.
 ### Unknown opcodes
 
 An unknown opcode means the two sides disagree about framing, so nothing after
-it in the buffer can be trusted. Both sides discard the rest of the current
-buffer instead of resynchronising byte by byte (which would reinterpret payload
-bytes as commands); the shepherd logs it once to its stderr. There is no
+it on that connection can be trusted. The reaction is sticky: all further
+input on that connection is ignored, instead of resynchronising byte by byte
+(which would reinterpret payload bytes as commands); the shepherd logs it once
+to its stderr and still detects BEAM death (`c_src/protocol.h`). There is no
 version negotiation: shepherd and library always ship together.
 
 ### BEAM → Shepherd Commands
@@ -188,6 +196,10 @@ The shepherd watches the UDS with `poll()`:
   instead of being replaced by the ladder
 - SIGTERM/SIGINT/SIGHUP/SIGQUIT delivered to the shepherd take the same path
   through its self-pipe
+- The shepherd also polls its fd-3 port channel (the BEAM writes only the
+  token there and later bytes are discarded): EOF, an error, `POLLHUP` or
+  `POLLNVAL` means the port was closed, and tears down like a UDS hangup. This
+  is the only trigger when the BEAM closes the Port but leaves the UDS open
 - Triggers `kill_child()`: SIGTERM to the group → wait for the leader's exit
   without reaping it (`WNOWAIT`) up to `--kill-timeout` → **always** SIGKILL
   the group (direct-pid fallback) → reap → cgroup cleanup

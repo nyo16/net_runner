@@ -8,11 +8,14 @@ defmodule NetRunner.EnvReplaceTest do
   # The `+` form distinguishes an unset variable from an empty value.
   @report "echo \"[$PROBE_ONE][${PROBE_ONE+set}][$PROBE_TWO][${PROBE_TWO+set}]\""
 
+  # The ambient probe is HOME, which the BEAM already has: System.put_env in
+  # an async module would change the environment every concurrently spawned
+  # child inherits.
   setup do
-    name = "PROBE_AMBIENT_#{:erlang.unique_integer([:positive])}"
-    System.put_env(name, "from the BEAM")
-    on_exit(fn -> System.delete_env(name) end)
-    {:ok, ambient: name}
+    if System.get_env("HOME") in [nil, ""],
+      do: flunk("these tests need a non-empty HOME in the BEAM's environment")
+
+    {:ok, ambient: "HOME"}
   end
 
   describe "env: {:replace, environment}" do
@@ -162,9 +165,9 @@ defmodule NetRunner.EnvReplaceTest do
       end
     end
 
-    test "an unknown tag is refused rather than treated as an overlay", %{ambient: name} do
+    test "an unknown tag is refused rather than treated as an overlay" do
       assert_raise ArgumentError, ~r/:overlay.*\{:replace, environment\}/s, fn ->
-        NetRunner.run([@sh, "-c", "echo $#{name}"], env: {:overlay, %{"PROBE_ONE" => "one"}})
+        NetRunner.run([@sh, "-c", "echo hi"], env: {:overlay, %{"PROBE_ONE" => "one"}})
       end
     end
   end

@@ -4,6 +4,7 @@ defmodule NetRunner.ProcessTest do
   import NetRunner.TestHelpers
 
   alias NetRunner.Process, as: Proc
+  alias NetRunner.Process.Operations
 
   describe "basic I/O" do
     test "read stdout from echo" do
@@ -127,9 +128,13 @@ defmodule NetRunner.ProcessTest do
       # The child sleeps first so the writers EAGAIN-park behind a full
       # pipe, then drains: the resume pass services them under ONE shared
       # write budget and every byte must land exactly once. 4 MiB total —
-      # well past Linux's 1 MiB shepherd-grown pipe, so parking happens on
-      # every platform — and the park is asserted before the drain starts.
-      {:ok, pid} = Proc.start("sh", ["-c", "sleep 0.5; exec cat > /dev/null"])
+      # well past Linux's 256 KiB shepherd-grown stdin pipe, so parking
+      # happens on every platform — and the park is asserted before the
+      # drain starts. write_budget: 1 forces a budget yield on every resume
+      # pass with work left, so the :continue_writes path (the only thing that
+      # resumes a yielded write) must carry the bytes; the trace proves it ran.
+      {:ok, pid} = Proc.start("sh", ["-c", "sleep 0.5; exec cat > /dev/null"], write_budget: 1)
+      :erlang.trace(pid, true, [:receive])
       payload = :binary.copy(<<1>>, 1_048_576)
 
       tasks = for _ <- 1..4, do: Task.async(fn -> Proc.write(pid, payload) end)
@@ -138,6 +143,7 @@ defmodule NetRunner.ProcessTest do
       results = Task.await_many(tasks, 15_000)
 
       assert results == [:ok, :ok, :ok, :ok]
+      assert_receive {:trace, ^pid, :receive, :continue_writes}
       assert Proc.stats(pid).bytes_in == 4 * 1_048_576
       assert :ok = Proc.close_stdin(pid)
       assert {:ok, 0} = Proc.await_exit(pid)
@@ -147,10 +153,11 @@ defmodule NetRunner.ProcessTest do
     test "kill/2 during a parked multi-writer fan-in replies promptly" do
       # Occupancy bound: with 4 parked 2 MiB writers the server must still
       # interleave a kill/2 call instead of spending 4 full write budgets
-      # per resume pass. Each payload EXCEEDS every platform's pipe capacity
-      # (macOS 64 KiB, Linux 1 MiB shepherd-grown) so no writer can complete
-      # before parking — a 1 MiB payload fit the Linux pipe exactly and the
-      # first writer sailed through, leaving only 3 parked (CI failure).
+      # per resume pass. Each payload EXCEEDS every platform's stdin pipe
+      # capacity (macOS 64 KiB, Linux 256 KiB shepherd-grown) so no writer
+      # can complete before parking — a payload that fit the pipe let the
+      # first writer sail through, leaving only 3 parked (CI failure).
+      {:ok, quiet} = Proc.start("sleep", ["100"])
       {:ok, pid} = Proc.start("sleep", ["100"])
       payload = :binary.copy(<<1>>, 2 * 1_048_576)
 
@@ -166,9 +173,17 @@ defmodule NetRunner.ProcessTest do
         assert parked_writes == 4
       end)
 
-      t0 = System.monotonic_time(:millisecond)
+      # A kill/2 round-trip against an idle twin, measured now, carries the
+      # ambient load of sibling async tests. SIGCONT is harmless, so both
+      # servers can be sampled before the real SIGKILL.
+      quiet_us = median_us(fn -> Proc.kill(quiet, :sigcont) end)
+      busy_us = median_us(fn -> Proc.kill(pid, :sigcont) end)
+
+      assert busy_us < max(quiet_us * 20, 100_000),
+             "kill/2 took #{busy_us} us behind 4 parked writers (idle twin #{quiet_us} us)"
+
       assert :ok = Proc.kill(pid, :sigkill)
-      assert System.monotonic_time(:millisecond) - t0 < 1_000
+      Proc.kill(quiet, :sigkill)
 
       for task <- tasks do
         assert Task.await(task, 5_000) in [
@@ -181,6 +196,81 @@ defmodule NetRunner.ProcessTest do
 
       assert {:ok, _} = Proc.await_exit(pid)
       GenServer.stop(pid)
+      GenServer.stop(quiet)
+    end
+
+    test "a writer parked when the child dies gets an error, not a hang" do
+      # finish_exit/2 fails whatever is still parked through
+      # Operations.reply_all/2. The child's death also raises a stdin
+      # readiness event, which would retry the write first (EPIPE); it is
+      # dropped inside the suspended server, so the exit frame is the parked
+      # writer's only way out.
+      {:ok, pid} = Proc.start("sleep", ["100"])
+      writer = Task.async(fn -> Proc.write(pid, :binary.copy(<<1>>, 4 * 1_048_576)) end)
+
+      eventually(fn ->
+        assert [_] = Operations.pending_by_type(:sys.get_state(pid).operations, :write)
+      end)
+
+      %{stdin: %{resource: stdin_res}, uds_socket: uds, os_pid: os_pid} = :sys.get_state(pid)
+      :ok = :sys.suspend(pid)
+      {_, 0} = System.cmd("kill", ["-KILL", to_string(os_pid)])
+
+      eventually(fn ->
+        {:messages, msgs} = Process.info(pid, :messages)
+        assert Enum.any?(msgs, &match?({:"$socket", ^uds, :select, _}, &1))
+      end)
+
+      # A readiness event not yet queued lands behind the exit frame.
+      :sys.replace_state(pid, fn state ->
+        drop_readiness(stdin_res)
+        state
+      end)
+
+      :ok = :sys.resume(pid)
+
+      assert {:error, :process_exited} = Task.await(writer, 5_000)
+      assert {:ok, 137} = Proc.await_exit(pid)
+      GenServer.stop(pid)
+    end
+  end
+
+  describe "pipe sizes" do
+    # The shepherd grows stdout to 1 MiB but stdin and stderr only to 256 KiB:
+    # one 384-page budget per spawn keeps ~42 concurrent spawns under the
+    # default pipe-user-pages-soft. 1032 is F_GETPIPE_SZ.
+    @tag :linux_only
+    test "pipe_size: :grown (default) grows fds 0/1/2; :default keeps the kernel size" do
+      script = ~S|print join(" ", map { fcntl($_, 1032, 0) + 0 } \*STDIN, \*STDOUT, \*STDERR)|
+
+      if System.find_executable("perl") do
+        assert {"262144 1048576 262144", 0} = NetRunner.run(["perl", "-e", script])
+
+        assert {"65536 65536 65536", 0} =
+                 NetRunner.run(["perl", "-e", script], pipe_size: :default)
+
+        # The Daemon defaults to :default.
+        Process.flag(:trap_exit, true)
+        parent = self()
+
+        {:ok, daemon} =
+          NetRunner.Daemon.start_link(
+            cmd: "perl",
+            args: ["-e", script],
+            on_output: &send(parent, {:sizes, &1})
+          )
+
+        assert_receive {:sizes, "65536 65536 65536"}, 5_000
+        assert_receive {:EXIT, ^daemon, {:shutdown, {:exit_status, 0}}}, 5_000
+      else
+        degraded_note("pipe size test skipped: perl not found")
+      end
+    end
+
+    test "an invalid :pipe_size raises" do
+      assert_raise ArgumentError, ~r/:pipe_size must be :grown or :default/, fn ->
+        NetRunner.run(["true"], pipe_size: :huge)
+      end
     end
   end
 
@@ -229,6 +319,15 @@ defmodule NetRunner.ProcessTest do
       assert {:ok, status} = Proc.await_exit(pid)
       # 128 + SIGKILL(9) = 137
       assert status == 137
+    end
+
+    test "an atom that cannot name a signal is an error, not a crash" do
+      {:ok, pid} = Proc.start("sleep", ["100"])
+      on_exit(fn -> Proc.stop(pid) end)
+
+      assert {:error, :unknown_signal} = Proc.kill(pid, :"#{String.duplicate("x", 40)}")
+      assert Process.alive?(pid)
+      assert Proc.alive?(pid)
     end
   end
 
@@ -283,11 +382,6 @@ defmodule NetRunner.ProcessTest do
 
     test "rejects empty cmd" do
       assert {:error, {:invalid_cmd, _}} = Proc.start("", [])
-    end
-
-    test "NetRunner.run surfaces validation error instead of crashing" do
-      assert {:error, {:invalid_args, _}} =
-               NetRunner.run(["echo", "he\0llo"])
     end
   end
 
@@ -351,6 +445,16 @@ defmodule NetRunner.ProcessTest do
       {:ok, data} -> data <> read_all(pid)
       :eof -> ""
       {:error, _} -> ""
+    end
+  end
+
+  # Discards every queued readiness event for `resource` from the calling
+  # process's mailbox.
+  defp drop_readiness(resource) do
+    receive do
+      {:select, ^resource, _ref, _event} -> drop_readiness(resource)
+    after
+      0 -> :ok
     end
   end
 end

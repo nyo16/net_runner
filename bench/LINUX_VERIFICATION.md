@@ -1,160 +1,76 @@
-# Linux verification — handoff
+# Linux verification
 
-**Branch**: `perf/io-pipelining-followup`
-**Commit**: the single `perf:` commit on this branch — its message is the
-condensed changelog and is worth reading first.
+## Reproducing the Linux tables (current)
 
-> The planning artifacts for this work (plan, scratchpad, before/after audit)
-> are **local-only** and deliberately not in the repo — they live under `tmp/`,
-> which is gitignored. You do not need them: everything actionable has been
-> inlined below. If you *do* have the authoring working copy, `tmp/plans/` and
-> `tmp/audit/` have the long form.
+The two Linux-only tables the docs publish are reproduced by one script:
 
-Everything in this branch was implemented and measured on **macOS 25.5, Apple
-M1 Max, OTP 29 / erts 17.0.3**. Four things cannot be verified on that host.
-This file is the instruction set for finishing them on Linux.
+```sh
+MIX_ENV=prod mix run bench/linux_ab.exs
+```
 
-Nothing here is speculative work — the code is written, the suite is green
-(236 tests / 4 properties as of 2026-08-31; the branch snapshot said 184),
-and the CHANGELOG already carries the caveats. What is missing is *evidence*
-for two claims and *coverage* for two tools.
+- **cgroup exit latency** ("cgroup exit latency" below; ADR-14 addendum in
+  `docs/decisions.md`): `sh -c 'sleep 60 & exit 0'` with and without
+  `cgroup_path:`, 100 sequential exits per variant, 3 runs, reporting p50, p90,
+  mean and the count ≥ 50 ms. Needs a writable cgroup v2 (root, or a delegated
+  `/sys/fs/cgroup/net_runner`); otherwise only this part is skipped, with the
+  reason.
+- **`pipe_size: :grown` vs `:default`** (`docs/backpressure.md`): 64 MiB `dd`
+  via `stream!/2`, 16 MiB through `cat` via `run/2` and a 16 MiB stderr drain,
+  median of 5 samples per row, 3 runs.
 
----
+Off Linux the script prints why and exits. Apply the CLAUDE.md bench
+discipline (≥ 3 runs, medians, ~11% noise floor) before comparing numbers.
 
-## State of the branch
-
-| | |
-|---|---|
-| `mix test` | green — 236 tests / 4 properties, 2 excluded (`:linux_only`) — on macOS (counts refreshed 2026-08-31; the original branch snapshot said 184) |
-| `mix compile --warnings-as-errors` / `format` / `credo` / `dialyzer` / `docs` | all clean |
-| `make clean && make all` | clean under `-Wall -Wextra -Werror` |
-| ASan/UBSan **build** | clean under `-Werror` |
-| ASan **suite** | never ran (see Task C) |
-| Phase 3 (cgroup exit-status ordering) | **zero runtime evidence** (see Task A) |
-| Phase 2 (read size) on Linux | unmeasured (see Task B) |
-
-The two `:linux_only` tests excluded on macOS are both in
-`test/cgroup_test.exs`. (`test/leak_test.exs` now runs on both platforms:
-`/proc/self/fd` on Linux, `lsof -p` on macOS.)
+**Current behaviour, not to be reverted**: every shepherd exit path sweeps the
+group, reaps, runs `cgroup_cleanup` and only *then* sends `MSG_CHILD_EXITED`
+(ADR-14). The cleanup's `rmdir` retries back off 1, 2, 4 … 512 ms (PERF-9).
 
 ---
+
+> **Everything from here to "Pipe sizes and the per-user budget" is a
+> historical handoff** for the `perf/io-pipelining-followup` branch
+> (2026-08), kept for its method notes. Its branch, test counts and Task A
+> are obsolete: Task A's "report the exit before the cgroup cleanup" ordering
+> was reversed by ADR-14, so do not re-apply any of it.
+
+## Historical: state of the branch (2026-08)
+
+Everything in that branch was implemented and measured on **macOS 25.5, Apple
+M1 Max, OTP 29 / erts 17.0.3**; four things could not be verified on that
+host. At the time the suite was 236 tests / 4 properties, with the
+`:linux_only` tests in `test/cgroup_test.exs` excluded on macOS. The planning
+artifacts lived under the gitignored `tmp/` and are not needed.
 
 ## Setup
 
 ```sh
-git checkout perf/io-pipelining-followup
 mix deps.get
-make clean && make all          # must be warning-free under -Werror
-mix test                        # expect the full suite on Linux (the 2 :linux_only in cgroup_test.exs unlock)
+make clean && make all
+mix test                        # the :linux_only tests unlock on Linux
 ```
 
-If `mix test` is not green **stop here** — something is Linux-specific in the
-Elixir changes and that is a finding in itself, not a setup problem.
+If `mix test` is not green **stop here** — something is Linux-specific and
+that is a finding in itself, not a setup problem.
 
 ---
 
-## Task A — Phase 3: exit status before cgroup cleanup
+## Task A (historical, superseded by ADR-14) — cgroup cleanup and the exit frame
 
-**This is the one that matters.** It is the only change in the branch with no
-runtime evidence behind it at all.
+The 2026-08 branch moved `send_child_exited` *above* `cgroup_cleanup()` and
+asked for a before/after measurement. That ordering is gone: ADR-14 runs the
+group sweep, the reap and `cgroup_cleanup` **before** `MSG_CHILD_EXITED` on
+every path, so a same-path respawn (a `Daemon` restart) never sees a stale
+leaf, and PERF-9 replaced the fixed 100 ms `rmdir` retry with exponential
+backoff. The old "flip the statements back and re-measure" recipe and the note
+that `kill_child()` alone cleans up last are obsolete; do not re-apply them.
 
-### The claim
-
-`c_src/shepherd.c`, end of `event_loop()`. It used to be:
-
-```c
-cgroup_cleanup();                          /* up to 10 x usleep(100000) */
-send_child_exited(uds_fd, child_status);
-```
-
-and is now the other way round. `cgroup_cleanup()` (`c_src/shepherd.c`)
-writes `cgroup.kill`, then polls `rmdir` up to **ten times with
-`usleep(100000)` between** — so with `--cgroup-path` set, the caller's
-`await_exit` could block for up to a full second on a status the shepherd
-already held in `child_status`.
-
-### The trap — read this before measuring
-
-**A naive cgroup run will show nothing.** Look at the loop:
-
-```c
-for (int i = 0; i < 10; i++) {
-    if (rmdir(full_path) == 0) return;                 /* usually first try */
-    if (errno != EBUSY && errno != ENOTEMPTY) return;  /* real error, bail */
-    usleep(100000);
-}
-```
-
-It only sleeps while `rmdir` returns `EBUSY`/`ENOTEMPTY`, i.e. while the kernel
-still has unreaped tasks in the cgroup. A single `echo` in its own cgroup will
-`rmdir` on the **first** attempt and cost 0 ms. Measure that and you will
-"prove" a 0 ms delta in both orderings and learn nothing.
-
-This is the single most likely way to waste the trip, and it already happened
-once on the macOS side with a different test: the obvious stderr-flood test
-passed, *and* passed the mutation that broke the code it was supposed to guard,
-because a 64 KiB pipe never let the drain reach its budget. A test that passes
-against a path that never executes reads like coverage and is worse than no
-test.
-
-**You must force at least one `EBUSY`.** Give the cgroup a straggler that
-outlives the direct child, so `cgroup.kill` + reap takes longer than the
-`rmdir` that immediately follows it:
-
-```elixir
-# A child that spawns a grandchild which outlives it. The direct child exits
-# at once (so child_status is ready), but the cgroup is not empty yet.
-NetRunner.run(["sh", "-c", "sleep 5 & exit 0"], cgroup_path: path)
-```
-
-Confirm you actually hit the slow path before trusting any number — e.g. strace
-the shepherd and check for repeated `rmdir` + `nanosleep`, or temporarily add a
-counter to the loop.
-
-### Measuring it
-
-Requires cgroup v2 and write access under `/sys/fs/cgroup/`. Either run as root
-or delegate a subtree:
-
-```sh
-mount | grep cgroup2                     # confirm cgroup v2
-sudo mkdir -p /sys/fs/cgroup/net_runner_bench
-sudo chown -R "$USER" /sys/fs/cgroup/net_runner_bench
-```
-
-Note `cgroup_path` is validated as **relative** (`test/cgroup_test.exs` asserts
-absolute paths and `..` are rejected), and the shepherd prefixes
-`/sys/fs/cgroup/`. So pass `net_runner_bench/run1`, not the full path.
-
-Measure `await_exit` latency both ways. The honest comparison is to flip the
-two statements back locally and re-measure — the ordering is the only variable:
-
-```sh
-# after (current HEAD)
-MIX_ENV=prod mix run <your probe>.exs
-
-# before
-#   edit c_src/shepherd.c: put cgroup_cleanup() back above send_child_exited()
-make clean && make all
-MIX_ENV=prod mix run <your probe>.exs
-git checkout c_src/shepherd.c && make clean && make all
-```
-
-**Expected**: "before" shows a multi-hundred-ms (up to ~1000 ms) `await_exit`
-on the straggler case; "after" shows the status arriving promptly (target
-≤ 5 ms) with the cleanup happening behind it. Non-cgroup runs must be identical
-in both orderings — `cgroup_cleanup` returns immediately on an empty
-`cgroup_path`, which is exactly why macOS could not see this.
-
-**If the delta does not appear**, do not paper over it. Either the straggler
-case is not hitting `EBUSY` (see the trap above) or the claim is wrong — and
-"the claim is wrong" is a perfectly good outcome to write down.
-
-### Also check
-
-`kill_child()` (`c_src/shepherd.c`) still calls `cgroup_cleanup()` last, and
-that is deliberate — on the kill path the cleanup *is* the point. Do not
-"consistency fix" it to match `event_loop`.
+One method note still holds for any cgroup latency measurement: **a naive run
+shows nothing**. The `rmdir` only retries while the kernel still has the
+`cgroup.kill`ed tasks in the leaf, so a lone `echo` removes its leaf on the
+first attempt. Give the cgroup a straggler that outlives the direct child —
+`sh -c 'sleep 60 & exit 0'`, as `bench/linux_ab.exs` does — and confirm the
+slow path is hit (e.g. strace the shepherd for repeated `rmdir` +
+`nanosleep`) before trusting a number. Results: "cgroup exit latency" below.
 
 ---
 
@@ -243,7 +159,7 @@ OTP 29 / erts 17.0.3, `MIX_ENV=prod`:
 | stdin round trip, 16 MiB via `cat` | `run/2` 1002–1163 MB/s vs `stream!/2` 1074–1130 | grown pipes (stdin 256 KiB, stdout 1 MiB) mean fewer round trips; both should rise together |
 | stderr drain | 928–978 MB/s | 256 KiB stderr pipe → four chunks per full pipe, below the 16-chunk drain budget |
 | spawn | 4.4–7.2 ms | Linux `posix_spawn`/`vfork` is usually faster than macOS |
-| spawn with `cgroup_path:` | n/a (macOS no-op) | `cgroup_setup` (mkdir + `cgroup.procs` write on cgroupfs) now runs *before* the child's `execvp`, gated by a sync pipe. Run `spawn_breakdown.exs` with and without `cgroup_path:` on a delegated subtree and record the delta here |
+| spawn with `cgroup_path:` | n/a (raises `ArgumentError` off Linux since 1.7.0) | `cgroup_setup` (mkdir + `cgroup.procs` write on cgroupfs) now runs *before* the child's `execvp`, gated by a sync pipe. Run `spawn_breakdown.exs` with and without `cgroup_path:` on a delegated subtree and record the delta here |
 | ≥48 concurrent 64 MiB `stream!/2` reads | n/a (64 KiB pipes regardless) | `pipe-user-pages-soft` (default 64 MiB) is exhausted by ~42 concurrent spawns at 384 pages each; past it every new pipe for the uid is capped at 8 KiB. Compare the per-stream chunk count (`Proc.stats/1` `read_count`) at 1, 32 and 48 concurrent streams — a jump of 8× or more confirms the cliff. Chunk counts are structural, so no median/variance discipline is needed |
 
 ### One Linux-specific behaviour to watch
@@ -285,40 +201,33 @@ The chosen variant doubles the headroom, keeps `run/2` with large input within
 noise and stdout `read_batch` at up to 16 chunks, and costs about 22% on bulk
 stderr drains.
 
----
+## cgroup exit latency (PERF-9, measured 2026-11-15)
 
-## When you are done
+`NetRunner.run(["sh", "-c", "sleep 60 & exit 0"], cgroup_path: …)`, measured in a
+Docker `elixir:1.18` container (OrbStack, kernel 7.2, `--privileged`, cgroup v2,
+`--cpus=4`, `MIX_ENV=prod`) as 100 sequential calls per run, 3 runs. "Slow" means
+≥ 50 ms. The no-cgroup control is the same command without `cgroup_path:`.
 
-Update these, in this order:
+| shepherd `cgroup_cleanup` retry | p50 | p90 | mean | slow / 100 | no-cgroup mean |
+|---|---|---|---|---|---|
+| fixed 100 ms sleep (≤ 1.6.0) | 1.0–1.2 ms | 1.6–2.2 ms | 6.3–10.4 ms | 5–9 | 0.9 ms |
+| backoff 1, 2, 4 … 512 ms | 1.4–1.9 ms | 2.0–6.2 ms | 1.6–3.1 ms | 0 | 1.2–3.6 ms |
 
-1. **`CHANGELOG.md`**, `[Unreleased]`:
-   - The Phase 3 entry currently ends with *"**Not verified on Linux with a real
-     cgroup**"*. Replace with the measurement, or with what you found instead.
-   - The read-size entry says *"The win is macOS-shaped"*. Put the Linux figure
-     next to it.
-2. **This file** — replace each task with its result, so the next person does
-   not repeat the run. Keep the macOS numbers alongside the Linux ones; the
-   whole point is that they are two hosts.
-3. **`docs/decisions.md`** ADR-9 — its consequences section predicts the Linux
-   win is "much weaker". Confirm or correct that with the real figure.
-4. If you have the authoring working copy: `tmp/plans/perf-io-followup/plan.md`
-   has one unchecked box (the Linux run) and
-   `tmp/plans/perf-io-followup/scratchpad.md` is where anything surprising
-   belongs. Skip both if you cloned fresh — nothing depends on them.
-
-Then this branch is ready to merge and tag.
+The win is in the tail: about one exit in fourteen used to wait a full 100 ms
+sleep. The "after" runs shared the host with other builds, which is why their
+no-cgroup control is noisier too. Reproduce the "after" row with
+`MIX_ENV=prod mix run bench/linux_ab.exs`; the "before" row is history (≤ 1.6.0)
+and needs no re-measurement.
 
 ---
 
 ## Context, in reading order
 
-Everything below is in the repo; nothing here depends on the local-only
-artifacts.
+Everything below is in the repo.
 
 | file | what it gives you |
 |---|---|
-| the branch's commit message | the condensed changelog: what broke, what changed, what was measured |
-| `CHANGELOG.md` `[Unreleased]` | the same, user-facing, with the caveats spelled out |
+| `CHANGELOG.md` | what broke, what changed, what was measured, with the caveats spelled out |
 | `docs/decisions.md` ADR-9 | why the read size is exactly 65 536, bounded on *both* sides |
 | `docs/architecture.md` | the two-`exec` spawn cost, and why `:input` must be written concurrently with reading |
 | `bench/README.md` | how to run the harness and how to read its noise |
@@ -333,7 +242,7 @@ fail. Three examples, all of which did fail as intended: reverting
 `handle_info(:consume_stderr_more, …)` clause so the catch-all swallows it
 (30 s `await_exit` timeout); and `keep = cap - size - 1` in
 `append_stderr_tail/3` (3 of 10 tail tests). Do the same for anything you add,
-especially in Task A where the slow path is easy to miss entirely.
+especially for cgroup latency, where the slow path is easy to miss entirely.
 
 **A stated target can be arithmetically impossible.** The original plan asked
 for "`run/2` 128 KiB through `cat` ≥ 500 MB/s" on a bench row that spans one

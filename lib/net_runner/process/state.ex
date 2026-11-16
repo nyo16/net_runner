@@ -25,20 +25,39 @@ defmodule NetRunner.Process.State do
     stderr_mode: :consume,
     # Bounded tail of consumed stderr: only the most-recent
     # `stderr_tail_bytes` bytes are retained (the rest is drained and
-    # dropped). Stats still count every byte. Held as a single binary.
-    stderr_tail: <<>>,
+    # dropped). Stats still count every byte. Held as {chunk queue, total
+    # bytes} so an append is O(chunk), and materialised only when read.
+    stderr_tail: {:queue.new(), 0},
     stderr_tail_bytes: 8_192,
     # Unconsumed bytes read from the shepherd's UDS. The socket is a byte
     # stream, so a read can deliver half a frame or several frames at once —
     # a frame boundary is not a read boundary. Anything not yet parsed lives
     # here until the next read completes it.
     uds_carry: <<>>,
+    # Set on the first unknown opcode from the shepherd. Sticky, like the
+    # shepherd's own handling of unknown commands: resynchronising could parse
+    # payload bytes of an unknown frame as MSG_CHILD_EXITED. Everything after
+    # it is discarded; the shepherd Port exit (finish_orphaned/2) settles the
+    # process.
+    protocol_error?: false,
     # True while a :continue_writes self-send is in flight; dedupes budget
     # yields so a retry pass over N parked writes queues one resume message,
     # not N.
     continue_writes_scheduled?: false,
+    # {path, inode} of the cgroup leaf this spawn created, or nil. Only
+    # consulted when the shepherd dies without reporting: the BEAM then
+    # removes the leaf itself, if it is still the same one.
+    cgroup: nil,
+    # pty: true. Gates set_window_size/3 (pipe mode has no terminal).
+    pty_mode: false,
+    # Yield budgets, always set by Process.init/1 (defaults live there;
+    # overridable for tests only).
+    write_budget: nil,
+    stderr_drain_chunks: nil,
     status: :running,
-    stats: %Stats{}
+    # Set by Process.init/1 (Stats.new/0). No struct default: it was dead and
+    # the only reason for a compile-time edge to Stats.
+    stats: nil
   ]
 
   @type status :: :running | :exiting | :exited
@@ -58,11 +77,16 @@ defmodule NetRunner.Process.State do
           operations: Operations.t(),
           awaiting_exit: [GenServer.from()],
           stderr_mode: :consume | :disabled,
-          stderr_tail: binary(),
+          stderr_tail: {:queue.queue(binary()), non_neg_integer()},
           stderr_tail_bytes: non_neg_integer(),
           uds_carry: binary(),
+          protocol_error?: boolean(),
+          cgroup: NetRunner.Process.Cgroup.leaf() | nil,
+          pty_mode: boolean(),
+          write_budget: pos_integer() | nil,
+          stderr_drain_chunks: pos_integer() | nil,
           continue_writes_scheduled?: boolean(),
           status: status(),
-          stats: Stats.t()
+          stats: Stats.t() | nil
         }
 end

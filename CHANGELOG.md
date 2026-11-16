@@ -6,6 +6,118 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.7.0] - Unreleased
+
+Remediation of the 2026-11-15 project-health audit: kill-path and teardown
+fixes, shepherd protocol and handshake hardening, cgroup lifecycle, API
+contracts, test-suite health, CI/build/supply-chain, and performance.
+**Breaking (minor-version convention, as in 1.4.0):** isolation options are
+rejected off Linux, and two PTY misuses now fail instead of silently
+misbehaving. See Changed (breaking).
+
+### Changed (breaking)
+
+- **`cgroup_path` and `no_new_privs: true` raise `ArgumentError` off Linux**
+  instead of running the child unconfined; the non-Linux shepherd also fails
+  closed if handed a cgroup path. Malformed values still report their usual
+  error first, on every platform (S-05).
+- **`NetRunner.Process.set_window_size/3` returns `{:error, :not_pty}`** for a pipe-mode
+  process instead of `:ok` (A-4).
+- **`run/2` rejects `:input` together with `pty: true`**: a PTY has no stdin
+  EOF, so a child reading to EOF waited forever (A-4).
+- **Build artefacts live in `_build/<env>/lib/net_runner/priv`**, not a
+  top-level `priv/`. Delete a stale top-level `priv/` from older checkouts
+  (D1).
+
+### Changed
+
+- **`:kill_timeout` is honoured by `NetRunner.Daemon` and the `Stream` EOF
+  grace.** A Daemon's SIGTERM grace is `process_opts[:kill_timeout]` (default
+  still 3 000 ms), and `Daemon.child_spec/1` sizes the supervisor `shutdown:`
+  to match; a stream that reached EOF waits `:kill_timeout` (default still
+  1 000 ms). An early-halted stream keeps its fixed 200 ms (N-2).
+- **`NetRunner.Daemon` defaults to `pipe_size: :default`** (see Added): a
+  Daemon holds its pipes for its lifetime. Pass `pipe_size: :grown` in
+  `process_opts` for bulk-streaming daemons (PERF-1r).
+- **`Daemon.start_link/1` validates `:cmd` and `:on_output` in the caller**
+  (`ArgumentError`) instead of failing in `init/1` or logging a
+  `FunctionClauseError` per drained chunk; `on_output: nil` means
+  `:discard` (A-3).
+- **`NetRunner.Daemon.write/2` accepts iodata**, like `NetRunner.Process.write/2` (N-7).
+- **End of PTY output is `:eof`**, not `{:error, :eio}` (Linux) (A-4).
+- `NetRunner.Process.Stats` mutators are `@doc false`; the struct and type
+  stay public (A-6).
+- **A shepherd that exits normally without delivering the exit status is
+  reported as 255 (unknown), not 137**, and nothing is killed: it already
+  reaped the child, so the old orphan kill could hit a reused process group.
+  A shepherd killed by a signal is still settled with a group SIGKILL and 137.
+- **The `:input` writer stops at the first failed write**, so a child that
+  exits early no longer keeps a lazy input running until a grace timeout;
+  `run/2`'s join with the writer never runs past `:timeout`. A malformed list
+  `:input` raises before anything is spawned.
+- The handshake gives each connection up to 2 s to present its token (a
+  silent impostor costs at most that, not the 10 s accept deadline).
+
+### Added
+
+- **`pipe_size: :grown | :default`** spawn option (`run/2`, `stream/2`,
+  `Process`, Daemon `process_opts`) to opt out of Linux pipe growth and its
+  per-user pipe budget. `:default` measured at 35–65% of `:grown`
+  throughput on Linux (docs/backpressure.md) (PERF-1r).
+
+### Fixed
+
+- **The orphan path never signals the leader by pid number.** After a
+  shepherd crash the BEAM signals the group by pgid (not reused while any
+  member lives) and, where one exists, the leader's pidfd; it can no longer
+  fall back to a probe-then-kill on a recyclable pid (N-1).
+- **Teardown reaches a leader that left its process group.** The shepherd
+  SIGKILLs the group *and* the leader, and directly SIGKILLs a leader still
+  alive after the reap wait, instead of reporting 137 for a live process
+  (S-13).
+- **An over-long or non-Latin-1 signal atom** returns
+  `{:error, :unknown_signal}` instead of crashing the Process GenServer
+  (and its child) (S-08).
+- **An unknown shepherd frame is sticky on the BEAM side too**: nothing after
+  it is parsed (N-4).
+- **A silent same-uid connection** costs the real spawn at most 250 ms
+  instead of the whole 10 s accept deadline (S-07).
+- **A split `MSG_CHILD_STARTED`** during the handshake is completed rather
+  than misread (A-15).
+- **Closing the shepherd Port tears the child down**: the shepherd now watches
+  its port channel (fd 3), not only the UDS (S-15/F-08).
+- **cgroup exit latency.** Removal retries back off from 1 ms instead of
+  sleeping 100 ms, so exits of commands that leave background processes
+  behind are no longer delayed by ~100 ms one time in ~14 (PERF-9).
+- **A shepherd killed with a cgroup no longer leaks its leaf**: the BEAM
+  `cgroup.kill`s and removes it, so the path stays reusable (S-06).
+- **A nested `cgroup_path`** under another spawn's live leaf is refused
+  instead of being killed by that spawn's recursive teardown (S-14).
+
+### Security
+
+- The shepherd refuses a UDS listener not owned by its own uid before
+  sending the handshake token (S-15).
+- Received fds are close-on-exec in the BEAM (`MSG_CMSG_CLOEXEC` on Linux,
+  `FD_CLOEXEC` in `nif_create_fd`, `F_DUPFD_CLOEXEC` for the PTY dup) (S-04).
+- Compiler hardening flags, each probed: `-fstack-clash-protection`,
+  `-fcf-protection` / `-mbranch-protection=standard`, `_FORTIFY_SOURCE=3`
+  (S-11).
+- CI: `persist-credentials: false`, pinned Alpine packages, `HEX_API_KEY`
+  scoped to the publish steps, `--check-locked`, `mix deps.audit` (D4, D5,
+  D9, D10).
+
+### Performance
+
+- A lazy `:input` is copied into one process, not two: `run/2` starts the
+  writer from the caller. List-backed lazy input +29% (PERF-2).
+- The retained stderr tail appends in O(chunk): a 1 MiB tail drains 64%
+  faster, at parity with the 8 KiB default (PERF-3).
+- A `max_output_size` partial no longer pins the read buffer (a 1000-byte
+  partial held 64 KiB) (PERF-5).
+- One write engine; an EAGAIN ends the parked-writer pass instead of every
+  parked writer retrying a full pipe (A-8, PERF-6).
+
 ## [1.6.0] - 2026-10-31
 
 Shepherd hardening from a six-slice audit of 1.5.0 (static security review,
@@ -52,8 +164,9 @@ Fixed, H2); use `setsid` for jobs that must.
   launcher ignored or blocked (erts: SIGFPE; `nohup`/`+Bi`: SIGHUP/SIGINT).
 - **The shepherd is non-dumpable on Linux**, so a same-uid child cannot read
   its memory or environment through `/proc` without `CAP_SYS_PTRACE`.
-- **Unknown opcodes on the shepherd socket** discard the rest of the buffer
-  (logged once) instead of resynchronising byte by byte.
+- **Unknown opcodes on the shepherd socket** are sticky: all further input on
+  that connection is ignored (logged once) instead of resynchronising byte by
+  byte.
 
 ### Fixed
 
@@ -88,8 +201,9 @@ Fixed, H2); use `setsid` for jobs that must.
   so a same-path respawn (Daemon restart) right after `await_exit/2` works.
 - **H7: the child leads its process group before it is reported.** The pipe
   mode parent now also calls `setpgid(child, child)` and PTY mode waits for
-  the child's `setsid()`; the BEAM's orphan kill falls back to a direct kill
-  of the leader if the group kill finds no group.
+  the child's `setsid()`; the BEAM's orphan kill is a group SIGKILL, plus a
+  pidfd signal to the leader where a pidfd exists; no direct kill by pid
+  number.
 - **H11: shepherd failure paths report the reaped status** when the socket is
   still usable, instead of reaping silently and leaving the BEAM to `killpg` a
   recyclable pgid.
@@ -257,7 +371,7 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
   (`1..60_000`) and `:cgroup_path` rejects NUL bytes and non-binaries, so a
   bad value raises `ArgumentError` instead of a silent 10 s
   `:shepherd_connect_timeout`.
-- **`NetRunner.Process.Protocol.kill/1`** rejects signal numbers outside
+- **NetRunner.Process.Protocol.kill/1** (internal) rejects signal numbers outside
   `1..255` instead of truncating them to one byte.
 - **macOS test flake.** Timeout tests built a `sleep` duration from
   `System.unique_integer/1`, which crossed `INT32_MAX` late in a full run;
@@ -290,7 +404,7 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
 
 ### Changed
 
-- **`NetRunner.Process.Nif` renamed to `NetRunner.Nif`** (internal,
+- **NetRunner.Process.Nif renamed to NetRunner.Nif** (internal,
   `@moduledoc false`, but referenced in tests/benches).
 - **Option-validation convention unified.** Malformed options (unknown keys,
   bad values for `:stderr`, `:stderr_tail_bytes`, `:cgroup_path`, `:env`,
@@ -298,14 +412,14 @@ the 2026-10-07 review of that cycle (14 findings, C security/perf audit).
   runtime spawn failures keep `{:error, reason}` returns, and `stream!/2`
   uniformly wraps spawn-stage reasons as
   `%NetRunner.Error{reason: {:spawn_failed, reason}}`.
-- **Wire protocol centralized** in `NetRunner.Process.Protocol` (constants,
+- **Wire protocol centralized** in NetRunner.Process.Protocol (constants,
   parser, encoders); no inline frame bytes remain in `Process`/`Exec`.
 - **`Daemon.os_pid/1`** answers from cached daemon state instead of a
   blocking double GenServer hop.
 - **Docs corrected**: `--token-fd` handshake (never argv), Watcher's
   deliberate single-SIGTERM/no-escalation design, Layer-3 cleanup via the
   NIF owner monitor (not GC), write-budget loop exit in `backpressure.md`;
-  `Process.read/2` documents the 1 MiB cap and non-FIFO reader wakeup.
+  `NetRunner.Process.read/2` documents the 1 MiB cap and non-FIFO reader wakeup.
 - **CI supply chain**: Dependabot now covers GitHub Actions; every workflow
   action is SHA-pinned; `.credo.exs` committed; `mix deps.unlock
   --check-unused` gate added; musl container pinned by digest; the Linux
@@ -412,7 +526,7 @@ cycle below (numbers are medians on an Apple M1 Max, OTP 29 / erts 17.0.3,
 
 ### Added
 
-- **`:env` option** (`run/2`, `stream!/2`, `Process.start/3`): a map of
+- **`:env` option** (`run/2`, `stream!/2`, `NetRunner.Process.start/3`): a map of
   environment variables for the child; a binary value sets, `nil` unsets.
   PATH resolution happens before `:env` applies — pass absolute command
   paths when overriding `PATH`.
@@ -457,7 +571,7 @@ cycle below (numbers are medians on an Apple M1 Max, OTP 29 / erts 17.0.3,
   command"}}` / raise `NetRunner.Error` instead of `FunctionClauseError`.
 - **`:input` accepts any `Enumerable`** of iodata chunks (`File.stream!`,
   `Range`, function streams), not just binaries, lists and `%Stream{}`.
-- **`Process.write/2` normalises iodata to a binary at the API boundary**;
+- **`NetRunner.Process.write/2` normalises iodata to a binary at the API boundary**;
   the NIF now accepts binaries only.
 - **Stdin writes are bounded per scheduling slice**: a fast-draining child no
   longer keeps the write loop occupying the GenServer for the whole payload —

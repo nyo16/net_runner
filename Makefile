@@ -1,14 +1,22 @@
 # Makefile for NetRunner native code
 #
-# Builds these files in PRIV_DIR, which defaults to priv/:
+# Builds these files in PRIV_DIR:
 #   shepherd       - persistent child-process shepherd binary
 #   net_runner_nif - NIF shared library for async I/O
+#
+# PRIV_DIR is $(MIX_APP_PATH)/priv, the directory :code.priv_dir(:net_runner)
+# resolves to, so every Mix build (env, target, deps checkout) gets its own
+# binaries and the source tree is never written. elixir_make exports
+# MIX_APP_PATH; when make is run by hand it falls back to this checkout's
+# build for MIX_ENV (dev by default), the one `iex -S mix` loads.
 #
 # Only a value on the make command line overrides PRIV_DIR. It is assigned
 # with = so that an unrelated PRIV_DIR in the environment cannot move the
 # output.
 
-PRIV_DIR = priv
+MIX_ENV ?= dev
+MIX_APP_PATH ?= _build/$(MIX_ENV)/lib/net_runner
+PRIV_DIR = $(MIX_APP_PATH)/priv
 C_SRC_DIR = c_src
 
 # Erlang NIF include paths
@@ -35,15 +43,35 @@ ifeq ($(WERROR),1)
 	WARNINGS += -Werror
 endif
 
+# Hardening flags are probed, not assumed: support depends on the compiler and
+# the target (-fcf-protection is x86-only, -mbranch-protection arm64-only, and
+# Apple clang has no -fstack-clash-protection on arm64). Probing every flag
+# against $(CC) keeps cross builds right too. The probe compiles rather than
+# preprocesses (-E): clang accepts -fcf-protection under -E on arm64 and only
+# rejects it at code generation. -Werror turns "unused argument" warnings into
+# a failed probe, so a flag that passes here is warning-free under WERROR=1.
+cc_supports = $(shell printf 'int x;\n' | $(CC) -Werror $(1) -c -x c -o /dev/null - >/dev/null 2>&1 && echo '$(1)')
+
+HARDEN_FLAGS := $(strip -fstack-protector-strong \
+	$(call cc_supports,-fstack-clash-protection) \
+	$(call cc_supports,-fcf-protection) \
+	$(call cc_supports,-mbranch-protection=standard))
+
+# Level 3 needs glibc >= 2.34 or a recent Apple libc; the headers reject or
+# warn about levels they do not know, so probe with a libc header included.
+# -include, not a piped "#include" line: GNU make >= 4.3 passes a backslash
+# in '\#' through to printf, so the header was never actually read.
+FORTIFY_LEVEL := $(if $(shell printf 'int x;\n' | $(CC) -Werror -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -include string.h -E -x c - >/dev/null 2>&1 && echo y),3,2)
+
 ifeq ($(SANITIZE),1)
 	# _FORTIFY_SOURCE is incompatible with ASan (ASan already intercepts
 	# memcpy/etc.). Disable optimisation to -O1 and skip FORTIFY.
 	SAN_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer -g
-	CFLAGS_BASE = -O1 $(WARNINGS) -std=c99 -fstack-protector-strong $(SAN_FLAGS)
+	CFLAGS_BASE = -O1 $(WARNINGS) -std=c99 $(HARDEN_FLAGS) $(SAN_FLAGS)
 else
 	# -U first: some toolchains predefine _FORTIFY_SOURCE and a bare -D
 	# redefinition is itself a warning (fatal under -Werror).
-	CFLAGS_BASE = -O2 $(WARNINGS) -std=c99 -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
+	CFLAGS_BASE = -O2 $(WARNINGS) -std=c99 $(HARDEN_FLAGS) -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=$(FORTIFY_LEVEL)
 endif
 
 ifeq ($(UNAME_S),Darwin)
@@ -78,11 +106,19 @@ endif
 
 # -fvisibility=hidden: only nif_init needs to be exported, and ERL_NIF_INIT
 # already marks it default-visible.
-NIF_CFLAGS = $(CFLAGS) -I$(ERTS_INCLUDE_DIR) -fPIC -fvisibility=hidden
+NIF_CFLAGS = $(CFLAGS) -I"$(ERTS_INCLUDE_DIR)" -fPIC -fvisibility=hidden
 
 SHEPHERD_CFLAGS = $(CFLAGS) -fPIE
 
-# Targets
+# Targets. PRIV_DIR is an absolute path from elixir_make and may contain
+# spaces ("My Projects", iCloud's "Mobile Documents", a path dependency
+# anywhere). GNU make splits target names on whitespace, so every path used
+# as a target or prerequisite goes through `esc` (space -> "\ "), while
+# recipes use the plain path, quoted ($@ arrives unescaped).
+empty :=
+space := $(empty) $(empty)
+esc = $(subst $(space),\$(space),$(1))
+
 SHEPHERD = $(PRIV_DIR)/shepherd
 NIF_LIB = $(PRIV_DIR)/net_runner_nif$(NIF_EXT)
 
@@ -93,37 +129,47 @@ HEADERS = $(C_SRC_DIR)/protocol.h $(C_SRC_DIR)/utils.h
 
 .PHONY: all clean asan bench bench-perf bench-claims bench-deadlock bench-spawn bench-exec
 
-all: $(SHEPHERD) $(NIF_LIB)
+all: $(call esc,$(SHEPHERD)) $(call esc,$(NIF_LIB))
 
 # Convenience: force a sanitizer rebuild. Same as SANITIZE=1 make clean all.
 asan:
 	$(MAKE) clean
 	$(MAKE) SANITIZE=1 all
 
-$(PRIV_DIR):
-	mkdir -p $(PRIV_DIR)
+# Builds before 1.7 wrote to a top-level priv/, which Mix symlinks into the
+# app path. Once that directory is deleted the symlink dangles and mkdir -p
+# fails on it, so replace a dangling link with a real directory.
+$(call esc,$(PRIV_DIR)):
+	@if [ -L "$@" ] && [ ! -e "$@" ]; then rm -f "$@"; fi
+	mkdir -p "$@"
 
-$(SHEPHERD) $(NIF_LIB): | $(PRIV_DIR)
+$(call esc,$(SHEPHERD)) $(call esc,$(NIF_LIB)): | $(call esc,$(PRIV_DIR))
 
 # Each binary has one source file, so each rule compiles and links it in one
-# command.
-$(SHEPHERD): $(SHEPHERD_SRC) $(HEADERS)
-	$(CC) $(SHEPHERD_CFLAGS) $(SHEPHERD_LDFLAGS) $(LDFLAGS) -o $@ $<
+# command; there are no intermediate objects.
+$(call esc,$(SHEPHERD)): $(SHEPHERD_SRC) $(HEADERS)
+	$(CC) $(SHEPHERD_CFLAGS) $(SHEPHERD_LDFLAGS) $(LDFLAGS) -o "$@" $<
 
-$(NIF_LIB): $(NIF_SRC) $(HEADERS)
-	$(CC) $(NIF_CFLAGS) $(NIF_LDFLAGS) $(LDFLAGS) -o $@ $<
+$(call esc,$(NIF_LIB)): $(NIF_SRC) $(HEADERS)
+	$(CC) $(NIF_CFLAGS) $(NIF_LDFLAGS) $(LDFLAGS) -o "$@" $<
 
 clean:
-	rm -f $(SHEPHERD) $(NIF_LIB)
+	rm -f "$(SHEPHERD)" "$(NIF_LIB)"
 
 # --- Benchmarks (repo-only; see bench/README.md) ---
 #
 # MIX_ENV=prod is not optional: the BEAM side compiles differently in dev and
 # dev-mode numbers are not comparable to anything published.
 BENCH_ENV = MIX_ENV=prod
+BENCH_TARGETS = bench-perf bench-claims bench-deadlock bench-spawn bench-exec
 
-bench: bench-perf bench-claims bench-deadlock bench-spawn bench-exec
+bench: $(BENCH_TARGETS)
 
+ifeq ($(wildcard bench/perf.exs),)
+# The Hex package does not ship bench/.
+$(BENCH_TARGETS):
+	@echo "$@: bench/ is not in this tree (it is not shipped in the Hex package); run benchmarks from a git checkout"
+else
 bench-perf:
 	$(BENCH_ENV) mix run bench/perf.exs
 
@@ -138,3 +184,4 @@ bench-spawn:
 
 bench-exec:
 	$(BENCH_ENV) mix run bench/exec_baseline.exs
+endif

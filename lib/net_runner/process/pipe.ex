@@ -3,9 +3,10 @@ defmodule NetRunner.Process.Pipe do
 
   alias NetRunner.Nif
 
-  defstruct [:resource]
+  # eio_is_eof: set on a PTY master's read side (see read/2).
+  defstruct [:resource, eio_is_eof: false]
 
-  @type t :: %__MODULE__{resource: reference() | nil}
+  @type t :: %__MODULE__{resource: reference() | nil, eio_is_eof: boolean()}
 
   @doc """
   Creates a new pipe by wrapping a raw FD in a NIF resource.
@@ -31,6 +32,15 @@ defmodule NetRunner.Process.Pipe do
   single source of truth for the read size, and a second default here would
   drift from it silently.
   """
+  def read(%__MODULE__{resource: res, eio_is_eof: true}, max_bytes) do
+    case Nif.nif_read(res, max_bytes) do
+      # A PTY master reports the slave side hanging up (child exited) as EIO,
+      # not EOF; to the caller it is the end of output.
+      {:error, :eio} -> :eof
+      other -> other
+    end
+  end
+
   def read(%__MODULE__{resource: res}, max_bytes) do
     Nif.nif_read(res, max_bytes)
   end

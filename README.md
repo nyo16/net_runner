@@ -5,7 +5,7 @@
 
 Safe OS process execution for Elixir. Zero zombie processes, NIF-based backpressure, PTY support, and cgroup isolation.
 
-NetRunner combines NIF-based async I/O (`enif_select`) with a persistent **shepherd binary** that watches over child processes. Three layers of cleanup guarantee zero zombies under every failure mode — BEAM crash, GenServer crash, or resource leak.
+NetRunner combines NIF-based async I/O (`enif_select`) with a persistent **shepherd binary** that watches over child processes. Four cleanup mechanisms guarantee zero zombies under every failure mode — BEAM crash, shepherd crash, GenServer crash, or resource leak.
 
 ## Installation
 
@@ -434,7 +434,11 @@ Isolate child processes in a cgroup v2 hierarchy for resource control:
 )
 ```
 
-The shepherd creates the cgroup directory (and its `net_runner/` parent if missing), moves the child into it *before* `execvp`, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the leaf — including any sub-cgroups — before the exit status is reported, so an immediate respawn on the same path succeeds; the shared parent is left in place). Spawns fail closed with `{:error, {:shepherd_error, msg}}` when the parent or leaf cannot be created, the leaf already exists, the migration is refused, or `cgroup.kill` (Linux ≥ 5.14) is unavailable. No-op on macOS.
+The shepherd creates the cgroup directory (and its `net_runner/` parent if missing), moves the child into it *before* `execvp`, and cleans up on exit (kills all processes via `cgroup.kill`, then removes the leaf — including any sub-cgroups — before the exit status is reported, so an immediate respawn on the same path succeeds; the shared parent is left in place). Spawns fail closed with `{:error, {:shepherd_error, msg}}` when the parent or leaf cannot be created, the leaf already exists, the migration is refused, `cgroup.kill` (Linux ≥ 5.14) is unavailable, or an existing parent component of the path holds live processes. If the shepherd itself is killed (SIGKILL, OOM), the BEAM kills and removes the leaf, so the path stays reusable.
+
+`cgroup_path` values must not nest: `net_runner/a/b` while a spawn is live in `net_runner/a` is refused, because `a`'s teardown `cgroup.kill` is recursive and would kill the nested child.
+
+Linux only: off Linux, `:cgroup_path` raises `ArgumentError` rather than running the child unconfined.
 
 Requirements: cgroup v2, with `/sys/fs/cgroup` writable by the BEAM's user (root, or a delegated root), plus write access to the `cgroup.procs` of the nearest common ancestor of the BEAM's cgroup and the target (usually the root) so the child can be migrated. If an administrator pre-creates and delegates `/sys/fs/cgroup/net_runner` instead, only that subtree needs to be writable.
 
@@ -546,9 +550,10 @@ end, max_concurrency: 20)
 | `:env` | map \| list of pairs \| `{:replace, map \| list}` | `nil` | Child environment changes. A binary sets a variable. `nil` removes it. `{:replace, environment}` removes all unselected variables. The child resolves its executable against the modified `PATH`; `env:` must come from trusted input (see [Environment](#environment)). |
 | `:pty` | boolean | `false` | Use pseudo-terminal |
 | `:kill_timeout` | integer | `5000` | SIGTERM→SIGKILL escalation timeout in ms |
-| `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only) under a `net_runner/` prefix, under 256 bytes; unprefixed paths are prefixed (deprecated) |
+| `:cgroup_path` | string | `nil` | cgroup v2 path (Linux only; raises elsewhere) under a `net_runner/` prefix, not nested under another live spawn's path, under 256 bytes; unprefixed paths are prefixed (deprecated) |
 | `:cwd` | string | `nil` | Child working directory. Defaults to the BEAM working directory. |
-| `:no_new_privs` | boolean | `false` | Set `PR_SET_NO_NEW_PRIVS` in the child before exec, so setuid/setgid binaries and file capabilities cannot raise its privileges (Linux only; accepted and ignored elsewhere). See [Security model](#security-model). |
+| `:no_new_privs` | boolean | `false` | Set `PR_SET_NO_NEW_PRIVS` in the child before exec, so setuid/setgid binaries and file capabilities cannot raise its privileges (Linux only; `true` raises `ArgumentError` elsewhere). See [Security model](#security-model). |
+| `:pipe_size` | `:grown` \| `:default` | `:grown` (`Daemon`: `:default`) | Linux pipe sizing. `:grown` grows stdout to 1 MiB and stdin/stderr to 256 KiB for throughput, charged to the user's `pipe-user-pages-soft` budget while the pipes live; `:default` keeps the kernel's 64 KiB. No effect off Linux. See [docs/backpressure.md](docs/backpressure.md). |
 
 Unknown options raise `ArgumentError` (`Keyword.validate!/2`) instead of being
 silently ignored. `stream!/2` accepts the same options minus `:timeout`,
@@ -568,7 +573,7 @@ callers that manage processes directly.
 ```
 BEAM Process (NetRunner.Process GenServer)
     |
-    |-- Port.open("priv/shepherd", [:nouse_stdio, :exit_status])
+    |-- Port.open(:code.priv_dir(:net_runner) <> "/shepherd", [:nouse_stdio, :exit_status])
     |     |
     |     v
     |   Shepherd Binary (stays alive for child's lifetime)
@@ -576,8 +581,9 @@ BEAM Process (NetRunner.Process GenServer)
     |     |            parked on an exec gate)
     |     |-- Passes pipe FDs (+ a pidfd on Linux) to BEAM via UDS + SCM_RIGHTS,
     |     |   reports the pid, then releases the gate → execvp
-    |     |-- poll() loop: watches UDS + signal pipe (SIGCHLD, SIGTERM/INT/HUP/QUIT)
-    |     |-- BEAM dies (POLLHUP) or shepherd is told to stop
+    |     |-- poll() loop: watches UDS + port channel (fd 3) + signal pipe
+    |     |     (SIGCHLD, SIGTERM/INT/HUP/QUIT)
+    |     |-- BEAM dies (UDS POLLHUP, or fd-3 EOF/HUP) or shepherd is told to stop
     |     |     → SIGTERM group → SIGKILL group → reap → cgroup cleanup
     |     |-- Child dies (SIGCHLD) → SIGKILL leftover group members → reap
     |     |     → cgroup cleanup → notify BEAM, exit
@@ -587,15 +593,15 @@ BEAM Process (NetRunner.Process GenServer)
     |
     v
 NetRunner.Watcher (belt-and-suspenders with shepherd)
-    |-- Monitors GenServer, kills OS process if GenServer crashes
+    |-- Monitors GenServer; on a crash sends one SIGTERM probe (no escalation)
 ```
 
-**Layers of zombie prevention:**
+**Zombie prevention — four mechanisms:**
 
-1. **Shepherd** — detects BEAM death via POLLHUP on UDS (after executing any commands still queued on it) or its own SIGTERM/SIGINT/SIGHUP/SIGQUIT, and always ends with a SIGKILL of the child's process group; also sweeps the group whenever the child exits on its own
-2. **Process GenServer** — detects shepherd death via its Port exit; if no exit status arrived, SIGKILLs the orphaned child's process group and, via the pidfd on Linux, the child itself (on Linux the child also dies via `PR_SET_PDEATHSIG`)
-3. **Watcher** — detects GenServer crash via `Process.monitor`, kills child via NIF
-4. **NIF owner monitor** — closes FDs when the owning process dies, child sees EOF/broken pipe
+1. **Shepherd** — detects BEAM death via POLLHUP on UDS (after executing any commands still queued on it), EOF/HUP on its fd-3 port channel, or its own SIGTERM/SIGINT/SIGHUP/SIGQUIT, and always ends with a SIGKILL of the child's process group; also sweeps the group whenever the child exits on its own. On Linux the child additionally carries `PR_SET_PDEATHSIG(SIGKILL)`, so it dies with the shepherd
+2. **`Process` orphan kill** — detects shepherd death via its Port exit; if no exit status arrived, SIGKILLs the orphaned child's process group by pgid (`killpg`; a pgid is not reused while any member lives), plus a pidfd signal to the leader where a pidfd exists (Linux); the leader is never signalled directly by pid number
+3. **Watcher** — detects GenServer crash via `Process.monitor` and sends a single SIGTERM probe via NIF (no escalation; that is the shepherd's job)
+4. **NIF owner monitor** — `io_resource_down` closes the BEAM's FDs when the owning process dies. The child sees broken pipe on stdout/stderr; it sees stdin EOF only once both the BEAM and the shepherd have closed their write ends (`close_stdin/1` → `CMD_CLOSE_STDIN`, ADR-18), which on the owner-death path happens when the shepherd tears down
 
 ## Security model
 
@@ -625,8 +631,8 @@ What *is* contained, for a child that is merely careless:
   attach to it without `CAP_SYS_PTRACE`.
 - **Opt-in `no_new_privs`.** `no_new_privs: true` stops the child and
   everything it execs from gaining privileges through setuid/setgid binaries
-  or file capabilities. Linux only: on macOS the option is accepted but has
-  no effect, so it is not a security boundary there.
+  or file capabilities. Linux only: elsewhere `no_new_privs: true` raises
+  `ArgumentError`, so code that relies on it cannot silently run without it.
 
 ```elixir
 NetRunner.run(["./untrusted_build_step"], no_new_privs: true, cgroup_path: "net_runner/build")
@@ -675,20 +681,24 @@ relying on them.
 
 ## Requirements
 
-- Elixir ~> 1.17
-- Erlang/OTP 27+
+- Elixir ≥ 1.17, Erlang/OTP ≥ 27 (tested floor: Elixir 1.17.3 / OTP 27.2)
 - C compiler (`gcc` or `clang`)
 - `make`
 - Linux or macOS
 
 ### Building for another target
 
-`make` writes the shepherd and NIF to `priv/`, or to the directory given as
-`PRIV_DIR` on its command line, and writes nothing else. A release for another
+Under Mix, `make` writes the shepherd and NIF to the app's build directory,
+`_build/<env>/lib/net_runner/priv` (`$MIX_APP_PATH/priv`, the directory
+`:code.priv_dir(:net_runner)` resolves to). Run by hand, it writes to the same
+place for `MIX_ENV`, `dev` by default. A `PRIV_DIR` on its command line
+overrides that, and the build writes nothing else. A release for another
 target, such as one that ships a musl BEAM to glibc hosts, can build into its
 own `priv`. The NIF must be built against the ERTS that will load it. Run the
 build on a Linux host, because the Makefile selects its platform flags from the
-host's `uname`.
+host's `uname`. Hardening flags (`-fstack-clash-protection`, `-fcf-protection`
+or `-mbranch-protection=standard`, `_FORTIFY_SOURCE=3`) are each probed against
+`CC` and used only where that compiler accepts them for its target.
 
 ```sh
 make -B all \

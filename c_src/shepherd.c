@@ -4,7 +4,8 @@
  * Lifecycle:
  *   1. BEAM opens this binary via Port.open with :nouse_stdio
  *   2. Shepherd reads the handshake token from fd 3, connects to the BEAM's
- *      UDS listener (path passed as argv[1]) and echoes the token
+ *      UDS listener (path passed as argv[1]), checks that the listener runs
+ *      as its own uid (SO_PEERCRED / getpeereid) and echoes the token
  *   3. Shepherd forks the child. The child takes its own process group (pipe
  *      mode) or session (PTY mode), resets its signal state and parks on the
  *      exec gate
@@ -15,10 +16,12 @@
  *   5. Enters a poll() loop watching:
  *      - UDS for commands from BEAM (KILL, CLOSE_STDIN, SET_WINSIZE)
  *      - Signal pipe for SIGCHLD (child death) and termination signals
+ *      - The port channel (fd 3): EOF/HUP means the Port was closed
  *   6. On child death: sweep the child's process group, reap, clean up the
  *      cgroup, send MSG_CHILD_EXITED, exit
- *   7. On BEAM death (UDS hangup) or a termination signal: SIGTERM the
- *      group, wait up to kill_timeout, SIGKILL the group, reap, clean up
+ *   7. On BEAM death (UDS hangup or port-channel EOF) or a termination
+ *      signal: SIGTERM the group and leader, wait up to kill_timeout, SIGKILL
+ *      both, reap, clean up
  *
  * The shepherd NEVER calls execvp on itself - it stays alive as a watchdog.
  */
@@ -298,8 +301,26 @@ static int remaining_ms(int64_t deadline, int budget_ms, int *spent) {
 #define UDS_WRITE_TIMEOUT_MS 5000
 
 /* Upper bound on waiting for the handshake token on fd 3; matches the BEAM's
- * accept deadline, after which the spawn is abandoned anyway. */
+ * accept deadline, after which the spawn is abandoned anyway. Tests shorten
+ * it with the hidden --token-timeout flag. */
 #define TOKEN_READ_TIMEOUT_MS 10000
+static int token_timeout_ms = TOKEN_READ_TIMEOUT_MS;
+
+/* 1 if the connected UDS peer runs as our effective uid, 0 otherwise
+ * (including when the credentials cannot be read: fail closed). */
+static int peer_is_same_uid(int fd) {
+#ifdef __linux__
+    struct ucred cred;
+    socklen_t len = sizeof(cred);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) return 0;
+    return cred.uid == geteuid();
+#else
+    uid_t uid;
+    gid_t gid;
+    if (getpeereid(fd, &uid, &gid) != 0) return 0;
+    return uid == geteuid();
+#endif
+}
 
 /*
  * Absolute deadline for one bounded POLLOUT wait, initialised lazily so a
@@ -502,6 +523,24 @@ static int cgroup_owned = 0;
 
 #define CGROUP_ROOT "/sys/fs/cgroup/"
 
+/* 1 if the cgroup directory dir holds processes of its own, 0 if not, -1 if
+ * its cgroup.procs cannot be read. */
+static int cgroup_has_procs(const char *dir) {
+    char procs[576];
+    int n = snprintf(procs, sizeof(procs), "%s/cgroup.procs", dir);
+    if (n < 0 || (size_t)n >= sizeof(procs)) return -1;
+    int fd = open(procs, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    char c;
+    ssize_t r;
+    do {
+        r = read(fd, &c, 1);
+    } while (r < 0 && errno == EINTR);
+    close(fd);
+    if (r < 0) return -1;
+    return r > 0;
+}
+
 /* Create every ancestor of the leaf (the shared net_runner/ parent and any
  * intermediate components) on demand. EEXIST is success: concurrent spawns
  * into sibling leaves race on the same mkdir, and an ancestor created by an
@@ -510,7 +549,11 @@ static int cgroup_owned = 0;
  * not weaken the ownership guard, which stays on the leaf. 0755 so a
  * delegated user other than the creator can still traverse it. Failure gets
  * its own message so "no permission for cgroups at all" (EACCES on a
- * non-delegated root) is distinguishable from a leaf collision. */
+ * non-delegated root) is distinguishable from a leaf collision.
+ *
+ * An existing ancestor that holds processes is refused: it is another
+ * spawn's live leaf (a nested cgroup_path), whose teardown cgroup.kill is
+ * recursive and would SIGKILL our child and remove our leaf. */
 static int cgroup_create_ancestors(char *full_path) {
     char *rel = full_path + strlen(CGROUP_ROOT);
     for (char *p = strchr(rel, '/'); p != NULL && p[1] != '\0';
@@ -518,14 +561,24 @@ static int cgroup_create_ancestors(char *full_path) {
         *p = '\0';
         int rc = mkdir(full_path, 0755);
         int err = errno;
+        int populated = (rc != 0 && err == EEXIST) ? cgroup_has_procs(full_path) : 0;
         *p = '/';
+        int rel_len = (int)(p - rel);
         if (rc != 0 && err != EEXIST) {
-            int rel_len = (int)(p - rel);
             ERROR_LOG("mkdir(%.*s) failed: %s", (int)(p - full_path), full_path,
                       strerror(err));
             snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
                      "cgroup_setup: cannot create parent cgroup %.*s: %s",
                      rel_len > 160 ? 160 : rel_len, rel, strerror(err));
+            return -1;
+        }
+        if (populated != 0) {
+            snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+                     populated > 0
+                         ? "cgroup_setup: parent cgroup %.*s has live processes "
+                           "(nested cgroup_path)"
+                         : "cgroup_setup: cannot read parent cgroup %.*s",
+                     rel_len > 160 ? 160 : rel_len, rel);
             return -1;
         }
     }
@@ -686,10 +739,13 @@ static void cgroup_cleanup(void) {
                   strerror(errno));
     }
 
-    /* Poll for removal rather than a fixed sleep — the kernel needs a
-     * moment to reap the killed processes. Bail after ~1s (10 * 100ms). */
+    /* Poll for removal: the kernel needs a moment to reap the killed
+     * processes, usually well under a millisecond. Exponential backoff (1, 2,
+     * 4 ... 512 ms) keeps the common case fast — a fixed 100 ms sleep
+     * delayed MSG_CHILD_EXITED by 100 ms whenever the first rmdir raced the
+     * kill — and gives up after the same ~1 s total as before. */
     int err = 0;
-    for (int i = 0; i < 10; i++) {
+    for (useconds_t delay_us = 1000; delay_us <= 512000; delay_us *= 2) {
         if (cgroup_rmdir_tree(full_path, sizeof(full_path)) == 0 ||
             errno == ENOENT) {
             cgroup_owned = 0;
@@ -697,14 +753,30 @@ static void cgroup_cleanup(void) {
         }
         err = errno;
         if (err != EBUSY && err != ENOTEMPTY) break; /* real error */
-        usleep(100000);
+        usleep(delay_us);
+    }
+    if (err == EBUSY || err == ENOTEMPTY) {
+        /* Last attempt after the final sleep. */
+        if (cgroup_rmdir_tree(full_path, sizeof(full_path)) == 0 ||
+            errno == ENOENT) {
+            cgroup_owned = 0;
+            return;
+        }
+        err = errno;
     }
     ERROR_LOG("cgroup_cleanup: %s not removed: %s", full_path, strerror(err));
 }
 #else
+/* Fail closed: a cgroup the caller explicitly asked for cannot be set up
+ * here, and silently running the child unconfined is worse than failing the
+ * spawn (the BEAM already rejects :cgroup_path off Linux; this is the
+ * backstop for a shepherd launched some other way). */
 static int cgroup_setup(pid_t child_pid) {
     (void)child_pid;
-    return 0;
+    if (cgroup_path[0] == '\0') return 0;
+    snprintf(cgroup_errmsg, sizeof(cgroup_errmsg),
+             "cgroup_setup: cgroups are only supported on Linux");
+    return -1;
 }
 static void cgroup_cleanup(void) {}
 #endif
@@ -776,15 +848,33 @@ static int encode_wait_status(int status) {
 }
 
 /* Signal the child's process group, falling back to the child itself when
- * the group does not exist (yet). */
+ * the group does not exist (yet). Used for caller-requested CMD_KILL, which
+ * means "this signal to the group". */
 static void signal_group(pid_t child_pid, int sig) {
     if (kill(-child_pid, sig) != 0) (void)kill(child_pid, sig);
 }
 
+/* Teardown signal: the group AND, if it left it, the leader. A leader that
+ * moved itself into another group (setpgid(0, other)) is not reached by
+ * kill(-pid) while its original group still has members, and signal_group's
+ * fallback only fires on an empty group. The leader is signalled directly
+ * only when it is no longer in its own group: one still in it already got
+ * the group signal, and a second, separate SIGTERM makes some programs
+ * (e.g. Go controller-runtime) skip their graceful shutdown. getpgid runs
+ * after the group kill, so a leader in the group at that moment was
+ * reached. child_pid is our unreaped child, so no recycled pid is hit. */
+static void signal_group_and_leader(pid_t child_pid, int sig) {
+    (void)kill(-child_pid, sig);
+    if (getpgid(child_pid) != child_pid) (void)kill(child_pid, sig);
+}
+
 /* Reap child_pid after it was sent SIGKILL. Bounded — a child wedged in
  * uninterruptible kernel sleep (D-state) never exits, and we must not hang
- * the shepherd on it; the kernel completes the SIGKILL later, so that case
- * reports 128 + SIGKILL. */
+ * the shepherd on it. Every caller has either signalled the leader itself
+ * (signal_group_and_leader) or observed its exit, so 128 + SIGKILL is only
+ * ever reported for a leader with a SIGKILL pending, which the kernel
+ * completes once it leaves D-state. A second SIGKILL and wait would only
+ * stretch a wedged teardown. */
 static int reap_killed_child(pid_t child_pid) {
     (void)wait_for_exit(child_pid, REAP_TIMEOUT_MS);
     int status;
@@ -797,17 +887,18 @@ static int reap_killed_child(pid_t child_pid) {
 }
 
 /*
- * Teardown ladder: SIGTERM the group, wait up to kill_timeout for the leader
- * to exit (without reaping), then ALWAYS SIGKILL the group — members that
- * ignore SIGTERM must not outlive a leader that obeyed it — reap, and clean
+ * Teardown ladder: SIGTERM the group and the leader, wait up to kill_timeout
+ * for the leader to exit (without reaping), then ALWAYS SIGKILL both —
+ * members that ignore SIGTERM must not outlive a leader that obeyed it, and
+ * a leader that left its group must not outlive the group — reap, and clean
  * up the cgroup. Returns the leader's status for MSG_CHILD_EXITED.
  */
 static int kill_child(pid_t child_pid) {
     int status = EXIT_STATUS_UNKNOWN;
     if (child_pid > 0) {
-        signal_group(child_pid, SIGTERM);
+        signal_group_and_leader(child_pid, SIGTERM);
         (void)wait_for_exit(child_pid, kill_timeout_ms);
-        signal_group(child_pid, SIGKILL);
+        signal_group_and_leader(child_pid, SIGKILL);
         status = reap_killed_child(child_pid);
     }
     cgroup_cleanup();
@@ -953,17 +1044,35 @@ static int teardown(int uds_fd, pid_t child_pid, int report) {
     return -1;
 }
 
+/* Drain the BEAM port channel (fd 3). The BEAM writes only the token there,
+ * so anything after it is discarded; EOF or an error means the port was
+ * closed (BEAM death, or Port.close without the UDS going down). Returns 1
+ * while the channel is open, 0 once it is gone. */
+static int port_channel_open(int port_fd) {
+    char buf[64];
+    for (;;) {
+        ssize_t n = read(port_fd, buf, sizeof(buf));
+        if (n > 0) return 1;
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 1;
+        return 0;
+    }
+}
+
 /*
  * Main event loop using poll().
  *
  * Watches:
  *   - UDS socket for BEAM commands and hangup (BEAM death)
  *   - Signal pipe for SIGCHLD (child death) and termination signals
+ *   - The BEAM port channel (port_fd, fd 3; -1 = not watched): hangup means
+ *     the port was closed, which tears down like a UDS hangup
  *
  * Returns 0 after a normal child exit, -1 after a teardown.
  */
-static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
-    struct pollfd fds[2];
+static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w, int port_fd) {
+    struct pollfd fds[3];
+    nfds_t nfds = port_fd >= 0 ? 3 : 2;
     struct command_buffer cb;
     cb.used = 0;
 
@@ -971,9 +1080,12 @@ static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
     fds[0].events = POLLIN;
     fds[1].fd = signal_pipe[0];
     fds[1].events = POLLIN;
+    fds[2].fd = port_fd;
+    fds[2].events = POLLIN;
+    fds[2].revents = 0;
 
     for (;;) {
-        int ret = poll(fds, 2, -1);
+        int ret = poll(fds, nfds, -1);
         if (ret < 0) {
             if (errno == EINTR) continue;
             ERROR_LOG("poll failed: %s", strerror(errno));
@@ -1003,6 +1115,13 @@ static int event_loop(int uds_fd, pid_t child_pid, int *stdin_w) {
                 return teardown(uds_fd, child_pid, 1);
             }
         }
+
+        if (nfds == 3 && (fds[2].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+            if ((fds[2].revents & POLLNVAL) || !port_channel_open(port_fd)) {
+                DEBUG_LOG("BEAM port closed, killing child %d", child_pid);
+                return teardown(uds_fd, child_pid, 1);
+            }
+        }
     }
 }
 
@@ -1015,11 +1134,21 @@ struct options {
     const char *child_cwd;
     int token_from_fd;
     int no_new_privs;
+    int default_pipe_size;
     char **cmd_args; /* cmd + args, NULL-terminated by the OS */
 };
 
+/* Parse a 1..60000 ms argument into *out. Returns 0, or -1 if invalid. */
+static int parse_ms(const char *arg, int *out) {
+    char *endptr;
+    long val = strtol(arg, &endptr, 10);
+    if (*endptr != '\0' || endptr == arg || val <= 0 || val > 60000) return -1;
+    *out = (int)val;
+    return 0;
+}
+
 /*
- * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] [--cgroup-path <rel>] [--cwd <dir>] [--replace-env <count> <names...>] [--no-new-privs] [--] <cmd> [args...]
+ * Usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] [--cgroup-path <rel>] [--cwd <dir>] [--replace-env <count> <names...>] [--no-new-privs] [--default-pipe-size] [--] <cmd> [args...]
  *
  *   uds_path:       Absolute path to the UDS listener socket created by the BEAM
  *   --kill-timeout:  SIGTERM->SIGKILL escalation timeout in ms (default 5000)
@@ -1030,6 +1159,8 @@ struct options {
  *   --replace-env:  Count followed by the environment names the child keeps
  *   --no-new-privs: set PR_SET_NO_NEW_PRIVS in the child before exec (Linux;
  *                   accepted and ignored elsewhere)
+ *   --default-pipe-size: keep the kernel's default pipe sizes instead of
+ *                   growing stdin/stdout/stderr (Linux; no-op elsewhere)
  *   cmd:            Command to execute
  *   args:           Arguments for the command
  *
@@ -1040,7 +1171,7 @@ static int parse_args(int argc, char *argv[], struct options *opts) {
         fprintf(stderr,
                 "usage: shepherd <uds_path> [--kill-timeout <ms>] [--token-fd] [--pty] "
                 "[--cgroup-path <rel>] [--cwd <dir>] [--replace-env <count> <names...>] "
-                "[--no-new-privs] [--] <cmd> [args...]\n");
+                "[--no-new-privs] [--default-pipe-size] [--] <cmd> [args...]\n");
         return -1;
     }
 
@@ -1057,13 +1188,19 @@ static int parse_args(int argc, char *argv[], struct options *opts) {
 
     while (cmd_idx < argc && argv[cmd_idx][0] == '-') {
         if (strcmp(argv[cmd_idx], "--kill-timeout") == 0 && cmd_idx + 1 < argc) {
-            char *endptr;
-            long val = strtol(argv[cmd_idx + 1], &endptr, 10);
-            if (*endptr != '\0' || endptr == argv[cmd_idx + 1] || val <= 0 || val > 60000) {
+            if (parse_ms(argv[cmd_idx + 1], &kill_timeout_ms) != 0) {
                 fprintf(stderr, "error: --kill-timeout must be 1-60000 ms\n");
                 return -1;
             }
-            kill_timeout_ms = (int)val;
+            cmd_idx += 2;
+        } else if (strcmp(argv[cmd_idx], "--token-timeout") == 0 &&
+                   cmd_idx + 1 < argc) {
+            /* Undocumented: tests shorten the token wait instead of
+             * sitting out the 10 s default. */
+            if (parse_ms(argv[cmd_idx + 1], &token_timeout_ms) != 0) {
+                fprintf(stderr, "error: --token-timeout must be 1-60000 ms\n");
+                return -1;
+            }
             cmd_idx += 2;
         } else if (strcmp(argv[cmd_idx], "--pty") == 0) {
             pty_mode = MODE_PTY;
@@ -1077,6 +1214,9 @@ static int parse_args(int argc, char *argv[], struct options *opts) {
             cmd_idx += 1;
         } else if (strcmp(argv[cmd_idx], "--no-new-privs") == 0) {
             opts->no_new_privs = 1;
+            cmd_idx += 1;
+        } else if (strcmp(argv[cmd_idx], "--default-pipe-size") == 0) {
+            opts->default_pipe_size = 1;
             cmd_idx += 1;
         } else if (strcmp(argv[cmd_idx], "--cwd") == 0 && cmd_idx + 1 < argc) {
             if (argv[cmd_idx + 1][0] == '\0') {
@@ -1155,13 +1295,13 @@ static void ensure_std_fds(void) {
 static int read_token(char *token) {
     size_t got = 0;
     int64_t deadline = monotonic_ms();
-    if (deadline >= 0) deadline += TOKEN_READ_TIMEOUT_MS;
+    if (deadline >= 0) deadline += token_timeout_ms;
     while (got < TOKEN_HEX_LEN) {
         if (term_signal != 0) {
             fprintf(stderr, "error: terminated by signal %d\n", (int)term_signal);
             return -1;
         }
-        int wait_ms = TOKEN_READ_TIMEOUT_MS;
+        int wait_ms = token_timeout_ms;
         if (deadline >= 0) {
             int64_t now = monotonic_ms();
             wait_ms = (now < 0 || now >= deadline) ? 0 : (int)(deadline - now);
@@ -1284,6 +1424,17 @@ static int connect_and_authenticate(const struct options *opts,
     }
 
     set_cloexec(uds_fd);
+
+    /* Authenticate the listener before handing it the token: the socket's
+     * owner must be our own effective uid. The 0700 base directory already
+     * keeps other uids out; this catches a misconfigured or swapped TMPDIR
+     * where it would not. No MSG_ERROR: the peer is not the BEAM, and the
+     * BEAM learns of the failure from the port's exit status. */
+    if (!peer_is_same_uid(uds_fd)) {
+        fprintf(stderr, "error: UDS listener is not owned by our uid\n");
+        close(uds_fd);
+        return -1;
+    }
 
     /* Writes to the UDS are non-blocking + bounded (see write_fully). The
      * event-loop reads already tolerate EAGAIN. */
@@ -1448,7 +1599,7 @@ static void fail_spawn(const struct spawn_state *s, const char *msg) {
     if (s->gate_w >= 0) close(s->gate_w);
     int status = EXIT_STATUS_UNKNOWN;
     if (s->child_pid > 0) {
-        signal_group(s->child_pid, SIGKILL);
+        signal_group_and_leader(s->child_pid, SIGKILL);
         status = reap_killed_child(s->child_pid);
     }
     cgroup_cleanup();
@@ -1639,10 +1790,15 @@ static pid_t spawn_pipe(int uds_fd, const struct options *opts,
      * about 22% slower; stdout-only growth cost 35-56% on those rows
      * (bench/LINUX_VERIFICATION.md). Best effort: the kernel caps sizes at
      * /proc/sys/fs/pipe-max-size and may refuse growth, in which case the
-     * default stands. macOS has no equivalent knob. */
-    (void)fcntl(stdout_pipe[0], F_SETPIPE_SZ, 1 << 20);
-    (void)fcntl(stderr_pipe[0], F_SETPIPE_SZ, 1 << 18);
-    (void)fcntl(stdin_pipe[1], F_SETPIPE_SZ, 1 << 18);
+     * default stands. macOS has no equivalent knob. --default-pipe-size
+     * (pipe_size: :default, the Daemon default) skips growth entirely for
+     * long-lived low-volume children that would otherwise hold 384 pages
+     * of the uid's budget for their whole lifetime. */
+    if (!opts->default_pipe_size) {
+        (void)fcntl(stdout_pipe[0], F_SETPIPE_SZ, 1 << 20);
+        (void)fcntl(stderr_pipe[0], F_SETPIPE_SZ, 1 << 18);
+        (void)fcntl(stdin_pipe[1], F_SETPIPE_SZ, 1 << 18);
+    }
 #endif
 
     struct child_plan plan = {
@@ -1707,7 +1863,8 @@ int main(int argc, char *argv[]) {
     /* Enter event loop. stdin_w is passed by pointer so a CMD_CLOSE_STDIN
      * handled inside the loop is visible here — otherwise the fd would be
      * closed a second time below, racing whatever recycled the number. */
-    int result = event_loop(uds_fd, child_pid, &stdin_w);
+    int result = event_loop(uds_fd, child_pid, &stdin_w,
+                            opts.token_from_fd ? 3 : -1);
 
     if (stdin_w >= 0) close(stdin_w);
     close(uds_fd);

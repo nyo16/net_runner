@@ -16,32 +16,39 @@ defmodule NetRunner.TestHelpers do
   `GenServer.call` racing a Process mid-teardown exits with `:noproc` (or
   `:timeout` while the server is briefly wedged) — exactly the in-between
   states this helper exists to ride out. Any other exit propagates.
+
+  A `:timeout` exit means the attempt itself blocked for its call timeout, so
+  it is re-polled only while another attempt that long still fits before the
+  deadline: the helper overshoots `timeout_ms` by at most one call timeout.
+  Polled calls should pass a timeout well under `timeout_ms`.
   """
   def eventually(fun, timeout_ms \\ 2_000) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     poll(fun, deadline)
   end
 
-  # The on_expiry closures passed to retry_or_flunk/3 deliberately never
+  defp poll(fun, deadline), do: attempt(fun, deadline, System.monotonic_time(:millisecond))
+
+  # The on_expiry closures passed to retry_or_flunk/4 deliberately never
   # return (flunk/reraise/exit); dialyzer flags the closure creation site.
-  @dialyzer {:nowarn_function, poll: 2}
-  defp poll(fun, deadline) do
+  @dialyzer {:nowarn_function, attempt: 3}
+  defp attempt(fun, deadline, started) do
     result = fun.()
 
     if result do
       result
     else
-      retry_or_flunk(fun, deadline, fn ->
+      retry_or_flunk(fun, deadline, 0, fn ->
         ExUnit.Assertions.flunk("eventually/2: condition still falsy after deadline")
       end)
     end
   rescue
     e in [ExUnit.AssertionError] ->
-      retry_or_flunk(fun, deadline, fn -> reraise e, __STACKTRACE__ end)
+      retry_or_flunk(fun, deadline, 0, fn -> reraise e, __STACKTRACE__ end)
   catch
     :exit, reason ->
       if transient_exit?(reason) do
-        retry_or_flunk(fun, deadline, fn -> exit(reason) end)
+        retry_or_flunk(fun, deadline, blocked_ms(reason, started), fn -> exit(reason) end)
       else
         exit(reason)
       end
@@ -53,13 +60,30 @@ defmodule NetRunner.TestHelpers do
   defp transient_exit?({:timeout, _}), do: true
   defp transient_exit?(_), do: false
 
-  defp retry_or_flunk(fun, deadline, on_expiry) do
-    if System.monotonic_time(:millisecond) < deadline do
+  # How long the next attempt can be expected to block: a timed-out call
+  # will most likely time out again, after just as long.
+  defp blocked_ms(:timeout, started), do: System.monotonic_time(:millisecond) - started
+  defp blocked_ms({:timeout, _}, started), do: System.monotonic_time(:millisecond) - started
+  defp blocked_ms(_reason, _started), do: 0
+
+  defp retry_or_flunk(fun, deadline, next_attempt_ms, on_expiry) do
+    if System.monotonic_time(:millisecond) + next_attempt_ms < deadline do
       Process.sleep(10)
       poll(fun, deadline)
     else
       on_expiry.()
     end
+  end
+
+  @doc """
+  Median wall time of `samples` calls to `fun`, in microseconds. Latency
+  bounds compare this against a quiet twin measured in the same test instead
+  of an absolute constant, so ambient load from sibling async tests scales
+  both sides.
+  """
+  def median_us(fun, samples \\ 11) do
+    times = for _ <- 1..samples, do: elem(:timer.tc(fun), 0)
+    times |> Enum.sort() |> Enum.at(div(samples, 2))
   end
 
   @doc """
@@ -137,5 +161,67 @@ defmodule NetRunner.TestHelpers do
     :ok = File.mkdir(dir)
     ExUnit.Callbacks.on_exit(fn -> File.rm_rf(dir) end)
     dir
+  end
+
+  @doc """
+  Number of live `sleep <marker>` processes (see `sleep_marker/0`).
+
+  Anchored to the exact argv: the wrapping `sh -c` (and a forked subshell,
+  until it execs) carries the marker in its own cmdline, so an unanchored
+  `pgrep -f` counts the shell as "the sleep is up" before it exists.
+  """
+  def pgrep_count(marker) do
+    case System.cmd("pgrep", ["-f", "^sleep #{marker}$"], stderr_to_stdout: true) do
+      {out, 0} -> out |> String.split("\n", trim: true) |> length()
+      _ -> 0
+    end
+  end
+
+  @doc """
+  Reports a positive-path test that could not run (no cgroup delegation,
+  missing helper binary, ...). On the CI leg that delegates
+  `/sys/fs/cgroup/net_runner` (`NR_CGROUP_DELEGATED=1`) it is a hard failure,
+  so the positive path cannot silently stop executing; elsewhere it is a
+  logged, expected downgrade.
+  """
+  def degraded(message) do
+    if System.get_env("NR_CGROUP_DELEGATED") == "1" do
+      ExUnit.Assertions.flunk("positive path did not run on a delegated CI leg: " <> message)
+    else
+      degraded_note(message)
+    end
+  end
+
+  @doc "Logs a `[degraded]` note without ever failing the test."
+  def degraded_note(message) do
+    require Logger
+    Logger.warning("[degraded] " <> message)
+  end
+
+  @doc """
+  A connected pair of local stream sockets, `{server, client}`, closed on
+  test exit. Stands in for the BEAM <-> shepherd UDS in parser and handshake
+  tests.
+  """
+  def uds_pair do
+    path = Path.join(System.tmp_dir!(), "nr_test_#{System.unique_integer([:positive])}.sock")
+
+    {:ok, listener} = :socket.open(:local, :stream)
+    :ok = :socket.bind(listener, %{family: :local, path: path})
+    :ok = :socket.listen(listener)
+
+    {:ok, client} = :socket.open(:local, :stream)
+    :ok = :socket.connect(client, %{family: :local, path: path})
+    {:ok, server} = :socket.accept(listener, 5_000)
+
+    :socket.close(listener)
+    File.rm(path)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      :socket.close(client)
+      :socket.close(server)
+    end)
+
+    {server, client}
   end
 end

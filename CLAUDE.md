@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 mix deps.get              # Fetch dependencies
 mix compile               # Compile Elixir + C code (via elixir_make)
-mix test                  # Run full test suite (~250 tests)
+mix test                  # Run full test suite (~330 tests: macOS 326, Linux 337)
 mix test test/process_test.exs          # Run a single test file
 mix test test/process_test.exs:10       # Run a single test at line
 mix format                # Auto-format code
@@ -15,7 +15,7 @@ mix format --check-formatted            # Check formatting (CI)
 mix compile --warnings-as-errors        # Compile with strict warnings
 mix credo --strict        # Lint with credo
 mix dialyzer              # Static type analysis
-make clean && make all    # Rebuild C code only
+make clean && make all    # Rebuild C code only, into _build/$MIX_ENV/lib/net_runner/priv (MIX_ENV defaults to dev)
 ```
 
 ## Architecture
@@ -26,37 +26,45 @@ NetRunner is a safe OS process execution library for Elixir with NIF-based backp
 
 **Elixir Layer** (`lib/`) — GenServer-based process management, stream API, daemon mode.
 
-**NIF Layer** (`c_src/net_runner_nif.c`) — Wraps FDs in NIF resources with `enif_select` for async I/O on dirty IO schedulers. On EAGAIN, registers with BEAM's epoll/kqueue; the GenServer parks callers in an operations queue and retries when `{:select, _, _, :ready_input/:ready_output}` arrives.
+**NIF Layer** (`c_src/net_runner_nif.c`) — Wraps FDs in NIF resources with `enif_select` for async I/O. All NIFs run on normal schedulers (flags 0; every syscall is bounded non-blocking — ADR-6). On EAGAIN, registers with BEAM's epoll/kqueue; the GenServer parks callers in an operations queue and retries when `{:select, _, _, :ready_input/:ready_output}` arrives.
 
 **Shepherd Layer** (`c_src/shepherd.c`) — Persistent C binary spawned per command via `Port.open`. Forks the child, passes pipe FDs to BEAM via SCM_RIGHTS over a UDS socket, then enters a `poll()` loop. Detects BEAM death via POLLHUP and escalates SIGTERM→SIGKILL on the child's process group.
 
-### Zero Zombie Prevention (3 layers)
+### Zero Zombie Prevention (4 mechanisms)
 
-1. **Shepherd** — detects BEAM death (POLLHUP on UDS), kills child process group
-2. **Watcher GenServer** — monitors Process GenServer, kills OS process on DOWN
-3. **NIF owner monitor** — `io_resource_down` closes FDs when the owning process dies (the destructor only runs for resources with no live `enif_select`)
+1. **Shepherd** — `PR_SET_PDEATHSIG` (Linux) plus BEAM-death detection (POLLHUP on UDS, or EOF/HUP on its fd-3 port channel), then a SIGTERM→SIGKILL ladder on the child's process group
+2. **`Process` orphan kill** — `kill_orphan/2` when the shepherd exits without reporting an exit status (not on GenServer termination): SIGKILL to the child's process group by pgid (`killpg`; safe because a pgid is not reused while any member lives) plus a pidfd signal to the leader where a pidfd exists; no direct kill of the leader by pid number (ADR-15)
+3. **Watcher GenServer** — monitors the Process GenServer; on DOWN sends a single SIGTERM probe by pid number (ADR-16 residual); escalation is the shepherd's job
+4. **NIF owner monitor** — `io_resource_down` closes FDs when the owning process dies (the destructor only runs for resources with no live `enif_select`)
 
 ### Spawn Sequence
 
-1. BEAM creates UDS listener at random temp path
-2. `Port.open` launches shepherd with UDS path as argv[1]
-3. Shepherd connects, forks child, sends pipe FDs via SCM_RIGHTS
-4. Shepherd sends `MSG_CHILD_STARTED(pid)` over UDS
-5. GenServer wraps FDs in NIF resources, registers with Watcher
+1. BEAM creates a UDS listener at a random private temp path and a random 32-hex token
+2. `Port.open` (`:nouse_stdio`) launches shepherd with the UDS path as argv[1] and `--token-fd`; BEAM writes the token over fd 3
+3. Shepherd connects, checks that the listener's owner (the UDS peer) runs as its own effective uid (SO_PEERCRED / getpeereid, fail-closed), then echoes the token as the first frame (BEAM rejects unauthenticated connects)
+4. Shepherd forks the child, which blocks on the exec gate; shepherd sends pipe FDs (plus a Linux pidfd when `pidfd_open` succeeds) via SCM_RIGHTS, then `MSG_CHILD_STARTED(pid)`
+5. Shepherd writes `'G'` to the exec gate; only then does the child `execvp`
+6. GenServer wraps FDs (and pidfd) in NIF resources, registers with Watcher
 
 ### Key Module Relationships
 
 - `NetRunner` — top-level API (`run/2`, `stream!/2`, `stream/2`)
 - `NetRunner.Process` — GenServer owning the OS process lifecycle
-- `NetRunner.Process.Exec` — spawn logic (UDS, Port, SCM_RIGHTS, Pipe creation)
+- `NetRunner.Process.Exec` — spawn mechanics (UDS listener, Port, token auth, SCM_RIGHTS, Pipe creation)
+- `NetRunner.Process.Options` — spawn-option contract: key list, validation, env/cgroup normalisation, `default_kill_timeout/0`
 - `NetRunner.Nif` — NIF stubs (`nif_read`, `nif_write`, `nif_close`, `nif_create_fd`, `nif_kill`, `nif_kill_group`, `nif_pidfd_send_signal`, …)
-- `NetRunner.Process.Protocol` — shepherd wire protocol: frame constants, parser, command encoders
-- `NetRunner.Process.Pipe` — struct wrapping a NIF resource with owner/type metadata
+- `NetRunner.Process.Protocol` — shepherd wire format: frame constants, parser, command encoders, shepherd argv grammar, fd layout
+- `NetRunner.Process.Cgroup` — BEAM-side cgroup leaf removal when the shepherd dies without cleaning up
+- `NetRunner.Process.Pipe` — thin struct around a NIF FD resource
 - `NetRunner.Process.Operations` — pending operation queue (park on EAGAIN, retry on select)
 - `NetRunner.Stream` — `Stream.resource` wrapper with concurrent input writer Task
 - `NetRunner.Daemon` — supervised long-running process with output draining
 - `NetRunner.Watcher` — belt-and-suspenders process monitor
-- `NetRunner.Signal` — signal atom to platform number resolution via NIF
+- `NetRunner.InputWriter` — internal; owns the `:input` writer Task lifecycle for `run/2` and `Stream`
+- `NetRunner.Command` — reusable command templates with default args/options
+- `NetRunner.Error` — exception raised by the bang variants
+- `NetRunner.Process.Stats` — I/O and lifecycle stats returned by `NetRunner.Process.stats/1`
+- `NetRunner.Signal` — internal; signal atom to platform number resolution via NIF
 
 ### Shepherd Protocol (`c_src/protocol.h`)
 
@@ -65,14 +73,14 @@ Shepherd→BEAM: `MSG_CHILD_STARTED(pid)`, `MSG_CHILD_EXITED(status)`, `MSG_ERRO
 
 ## C Code
 
-- C99, compiled with `-Wall -Wextra -Werror`
+- C99, compiled with `-Wall -Wextra -Wformat-security -Wvla -Wshadow`; `-Werror` is opt-in via `WERROR=1` (CI sets it)
 - Platform detection in Makefile: `-D_GNU_SOURCE` (Linux) or `-D_DARWIN_C_SOURCE` (macOS)
-- Two build artifacts: `priv/shepherd` (executable) and `priv/net_runner_nif.so` (shared lib)
-- NIF functions run on dirty IO schedulers to avoid blocking BEAM
+- Two build artifacts in `$MIX_APP_PATH/priv` (`_build/<env>/lib/net_runner/priv`, what `:code.priv_dir(:net_runner)` resolves to): `shepherd` (executable) and `net_runner_nif.so` (shared lib). There is no top-level `priv/`
+- NIF functions run on normal schedulers (no dirty flags, ADR-6); every syscall they reach is bounded
 
 ## Conventions
 
-- Elixir ~> 1.17, CI tests against 1.17 and 1.18 on OTP 27
+- Elixir ≥ 1.17, OTP ≥ 27; CI matrix: Elixir/OTP 1.17.3/27.2, 1.18.3/27.2, 1.19.7/28.3.3, 1.20.2/28.3.3, 1.20.2/29.0 (plus a `--cover` leg) on ubuntu x86, 1.20.2/29.0 on ubuntu arm and macOS, plus Alpine (musl, OTP 27) and ASan/UBSan legs
 - All public API functions have `@doc` and `@spec`
 - Tests are async where possible (`async: true`)
 - Credo strict mode enforced: max cyclomatic complexity 9, max nesting depth 2
@@ -84,14 +92,17 @@ Shepherd→BEAM: `MSG_CHILD_STARTED(pid)`, `MSG_CHILD_EXITED(status)`, `MSG_ERRO
   (~20 ms per boundary for a 200k-cons list, and the refc bump per binary
   is paid per element). Reduce to a few flat refc binaries in the sender
   first — binaries cross process boundaries for free. See
-  `InputWriter.prepare/1` for the pattern; bisect suspect cases by running
+  `InputWriter.start/3` (its list clause coalesces in the caller before
+  `Task.async`) for the pattern; bisect suspect cases by running
   the same code inline vs spawned.
 - **Verify achievable batch size before batching syscalls/messages.** The
   cap is `pipe_capacity / read_size`: macOS pipes (64 KiB = read size)
   yield 1-chunk batches, Linux (1 MiB shepherd-grown) up to 16. Instrument
   with a batch-size histogram probe before trusting a message-count
   projection, and bench on the platform the optimization targets.
-- **Bench discipline**: `MIX_ENV=prod mix run bench/perf.exs`, ≥3 runs,
+- **Bench discipline**: `MIX_ENV=prod mix run bench/perf.exs` (Linux-only
+  claims — `pipe_size:` throughput, cgroup exit latency — via
+  `bench/linux_ab.exs`), ≥3 runs,
   compare medians, ~11% run-to-run spread is the noise floor; measure
   BEFORE a fix lands so the gain is measured, not asserted; A/B on the
   same machine state when a gate reads ambiguous. `@default_read_size`

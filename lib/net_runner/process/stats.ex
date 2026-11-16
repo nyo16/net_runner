@@ -41,6 +41,11 @@ defmodule NetRunner.Process.Stats do
           shepherd_error: binary() | nil
         }
 
+  # The mutators below are internal: NetRunner.Process folds its I/O into the
+  # struct with them. Only the type and the struct are public.
+
+  @doc false
+  @spec new() :: t()
   def new do
     %__MODULE__{started_at: System.monotonic_time(:millisecond)}
   end
@@ -48,10 +53,14 @@ defmodule NetRunner.Process.Stats do
   # `count` is the number of read(2) calls the bytes took (a batched read
   # folds its whole pass into one update without changing what `read_count`
   # means).
+  @doc false
+  @spec record_read(t(), non_neg_integer(), non_neg_integer()) :: t()
   def record_read(%__MODULE__{} = stats, bytes, count \\ 1) do
     %{stats | bytes_out: stats.bytes_out + bytes, read_count: stats.read_count + count}
   end
 
+  @doc false
+  @spec record_read_stderr(t(), non_neg_integer()) :: t()
   def record_read_stderr(%__MODULE__{} = stats, bytes) do
     %{stats | bytes_err: stats.bytes_err + bytes}
   end
@@ -59,14 +68,20 @@ defmodule NetRunner.Process.Stats do
   # `count` is the number of write(2) calls the bytes took, so a partial-write
   # loop can fold its whole run into one struct update without changing what
   # `write_count` means.
+  @doc false
+  @spec record_write(t(), non_neg_integer(), non_neg_integer()) :: t()
   def record_write(%__MODULE__{} = stats, bytes, count \\ 1) do
     %{stats | bytes_in: stats.bytes_in + bytes, write_count: stats.write_count + count}
   end
 
+  @doc false
+  @spec record_shepherd_error(t(), binary()) :: t()
   def record_shepherd_error(%__MODULE__{} = stats, msg) when is_binary(msg) do
     %{stats | shepherd_error: msg}
   end
 
+  @doc false
+  @spec finalize(t(), non_neg_integer()) :: t()
   def finalize(%__MODULE__{} = stats, exit_status) do
     now = System.monotonic_time(:millisecond)
     duration = if stats.started_at, do: now - stats.started_at, else: 0

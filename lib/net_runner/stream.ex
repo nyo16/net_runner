@@ -12,10 +12,11 @@ defmodule NetRunner.Stream do
   alias NetRunner.Process, as: Proc
 
   # A stream that reached :eof has a child which already closed stdout, so it is
-  # on its way out and a short grace suffices. A consumer that halted early
-  # (`stream!(~w(yes)) |> Enum.take(1)`) leaves a child that is probably still
-  # running and no longer wanted, so escalate straight away rather than stalling
-  # the consumer for seconds.
+  # on its way out and a short grace suffices; a caller-supplied :kill_timeout
+  # replaces it. A consumer that halted early (`stream!(~w(yes)) |>
+  # Enum.take(1)`) leaves a child that is probably still running and no longer
+  # wanted, so it escalates after a fixed 200 ms: an abandoned consumer must not
+  # be blocked for a long :kill_timeout.
   @eof_grace_ms 1_000
   @halted_grace_ms 200
 
@@ -23,6 +24,15 @@ defmodule NetRunner.Stream do
   Creates a stream that writes `input` to stdin and reads stdout chunks.
 
   Returns `{:ok, stream}` or `{:error, reason}`.
+
+  ## Teardown
+
+  When the stream ends, the child gets SIGTERM, then SIGKILL after a grace:
+
+    * stdout reached EOF: stdin is closed and the grace is `:kill_timeout`
+      when given, otherwise 1 000 ms.
+    * the consumer halted early (e.g. `Enum.take/2`): a fixed 200 ms, so an
+      abandoned consumer is never blocked for a long `:kill_timeout`.
   """
   # :timeout / :max_output_size are run/2-only: a lazy stream has no single
   # wall-clock or collected size to bound, so they are rejected here rather
@@ -38,16 +48,20 @@ defmodule NetRunner.Stream do
     :cwd,
     :env,
     :no_new_privs,
+    :pipe_size,
     :owner,
     :name
   ]
 
+  @spec stream(String.t(), [String.t()], keyword()) :: {:ok, Enumerable.t()} | {:error, term()}
   def stream(cmd, args, opts) do
     opts = Keyword.validate!(opts, @stream_opts)
-    input = Keyword.get(opts, :input, nil)
+    # Eager lists are coalesced and validated before the spawn (as in run/2).
+    input = InputWriter.prepare(Keyword.get(opts, :input, nil))
     input_buffer = InputWriter.validate_buffer!(Keyword.get(opts, :input_buffer, 0))
+    eof_grace = Keyword.get(opts, :kill_timeout, @eof_grace_ms)
     # Pass the caller as :owner so the Process GenServer stops (and kills the OS
-    # process) if nothing ever consumes the stream. build_stream/2 re-registers
+    # process) if nothing ever consumes the stream. build_stream/4 re-registers
     # the real consumer as owner once iteration starts.
     process_opts =
       opts
@@ -56,7 +70,7 @@ defmodule NetRunner.Stream do
 
     case Proc.start(cmd, args, process_opts) do
       {:ok, pid} ->
-        stream = build_stream(pid, input, input_buffer)
+        stream = build_stream(pid, input, input_buffer, eof_grace)
         {:ok, stream}
 
       {:error, _} = error ->
@@ -67,6 +81,7 @@ defmodule NetRunner.Stream do
   @doc """
   Like `stream/3` but raises on error.
   """
+  @spec stream!(String.t(), [String.t()], keyword()) :: Enumerable.t()
   def stream!(cmd, args, opts) do
     case stream(cmd, args, opts) do
       {:ok, s} -> s
@@ -74,7 +89,7 @@ defmodule NetRunner.Stream do
     end
   end
 
-  defp build_stream(pid, input, input_buffer) do
+  defp build_stream(pid, input, input_buffer, eof_grace) do
     Stream.resource(
       fn ->
         # Re-register the owner here: this fun runs in the consumer, whereas the
@@ -90,12 +105,12 @@ defmodule NetRunner.Stream do
       fn
         {:done, writer} ->
           InputWriter.reap(writer, :done)
-          cleanup_process(pid, :eof)
+          cleanup_process(pid, :eof, eof_grace)
 
         {:reading, writer} ->
           # The consumer halted mid-stream.
           InputWriter.reap(writer, :halted)
-          cleanup_process(pid, :halted)
+          cleanup_process(pid, :halted, eof_grace)
       end
     )
   end
@@ -130,38 +145,26 @@ defmodule NetRunner.Stream do
     end
   end
 
-  # :eof — the child closed stdout on its own, so wait briefly for it to reap.
-  defp cleanup_process(pid, :eof) do
-    reap_child(pid, :eof)
-    Proc.stop(pid)
-  end
-
-  # Halted early — the child is still producing output nobody will read, so
-  # signal it immediately and keep the wait short.
-  defp cleanup_process(pid, :halted) do
-    reap_child(pid, :halted)
-    Proc.stop(pid)
-  end
-
+  # :eof: the child closed stdout on its own, so close stdin and give it the
+  # EOF grace (the caller's :kill_timeout when given) to exit before SIGKILL.
+  # :halted: the child is still producing output nobody will read, so it gets
+  # the fixed short grace.
+  #
   # Proc.stop/1 is the answer to the teardown question cycle 1 left open: the
   # after-fun used to leave the server running and rely on the owner monitor,
   # which only fires when the *consumer* dies. A long-lived consumer — a
   # GenServer or LiveView streaming many commands — accumulated one Process
   # GenServer, one Watcher, a UDS socket and three pipe FDs per stream.
-  defp reap_child(pid, :eof) do
-    if Process.alive?(pid) do
-      Proc.close_stdin(pid)
-      Proc.shutdown(pid, @eof_grace_ms, 0)
-    end
-
-    :ok
-  catch
-    :exit, _ -> :ok
+  defp cleanup_process(pid, reason, eof_grace) do
+    reap_child(pid, reason, eof_grace)
+    Proc.stop(pid)
   end
 
-  defp reap_child(pid, :halted) do
+  defp reap_child(pid, reason, eof_grace) do
     if Process.alive?(pid) do
-      Proc.shutdown(pid, @halted_grace_ms, 0)
+      if reason == :eof, do: Proc.close_stdin(pid)
+      grace = if reason == :eof, do: eof_grace, else: @halted_grace_ms
+      Proc.shutdown(pid, grace, 0)
     end
 
     :ok

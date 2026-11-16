@@ -21,16 +21,6 @@ defmodule NetRunner.ShepherdHardeningTest do
     ~s|(trap "" TERM; exec sleep #{marker}) & exec sleep 100|
   end
 
-  # Anchored: the wrapping `sh -c` (and its forked subshell, until it execs)
-  # carries the marker in its cmdline too. Only the exec'd `sleep <marker>` —
-  # which by then has SIGTERM ignored — may count as "the member is up".
-  defp pgrep(marker) do
-    case System.cmd("pgrep", ["-f", "^sleep #{marker}$"]) do
-      {out, 0} -> String.split(out, "\n", trim: true)
-      {_, _} -> []
-    end
-  end
-
   # A failed assertion must not leave the marker running for the VM's
   # lifetime (it would also poison later pgrep-based tests).
   defp reap_marker_on_exit(marker) do
@@ -59,22 +49,6 @@ defmodule NetRunner.ShepherdHardeningTest do
     value
   end
 
-  # Mirrors cgroup_test.exs: on the CI leg that delegates
-  # /sys/fs/cgroup/net_runner (NR_CGROUP_DELEGATED=1) a cgroup positive path
-  # that cannot run is a hard failure; elsewhere a logged downgrade.
-  defp degraded(message) do
-    if System.get_env("NR_CGROUP_DELEGATED") == "1" do
-      flunk("cgroup positive path did not run on a delegated CI leg: " <> message)
-    else
-      degraded_note(message)
-    end
-  end
-
-  defp degraded_note(message) do
-    require Logger
-    Logger.warning("[degraded] " <> message)
-  end
-
   defp cgroup_leaf(prefix) do
     path = "net_runner/#{prefix}_#{:rand.uniform(1_000_000)}"
     full = "/sys/fs/cgroup/" <> path
@@ -87,17 +61,34 @@ defmodule NetRunner.ShepherdHardeningTest do
     {path, full}
   end
 
+  # The library hands over `pidfd: nil` where pidfd_open is unavailable
+  # (pre-5.3 kernels, seccomp profiles that filter it), so a nil pidfd is a
+  # supported configuration. CI legs known to provide pidfds set
+  # NR_PIDFD_REQUIRED=1, which makes it mandatory.
+  defp assert_linux_pidfd(pidfd) do
+    cond do
+      System.get_env("NR_PIDFD_REQUIRED") == "1" ->
+        assert %Pipe{} = pidfd, "NR_PIDFD_REQUIRED=1 but the shepherd sent no pidfd"
+
+      pidfd == nil ->
+        degraded_note("no pidfd on this host; pidfd assertions skipped")
+
+      true ->
+        assert %Pipe{} = pidfd
+    end
+  end
+
   describe "H1/S-01: teardown SIGKILLs the group even when the leader died on SIGTERM" do
     test "Proc.stop" do
       marker = sleep_marker()
       reap_marker_on_exit(marker)
 
       {:ok, pid} = Proc.start("sh", ["-c", term_ignoring_member(marker)], kill_timeout: 300)
-      eventually(fn -> pgrep(marker) != [] end)
+      eventually(fn -> pgrep_count(marker) > 0 end)
 
       Proc.stop(pid)
 
-      eventually(fn -> pgrep(marker) == [] end, 3_000)
+      eventually(fn -> pgrep_count(marker) == 0 end, 3_000)
     end
 
     test "owner death" do
@@ -108,13 +99,13 @@ defmodule NetRunner.ShepherdHardeningTest do
       {:ok, pid} =
         Proc.start("sh", ["-c", term_ignoring_member(marker)], kill_timeout: 300, owner: owner)
 
-      eventually(fn -> pgrep(marker) != [] end)
+      eventually(fn -> pgrep_count(marker) > 0 end)
       ref = Process.monitor(pid)
 
       Process.exit(owner, :kill)
 
       assert_receive {:DOWN, ^ref, :process, ^pid, _}, 2_000
-      eventually(fn -> pgrep(marker) == [] end, 3_000)
+      eventually(fn -> pgrep_count(marker) == 0 end, 3_000)
     end
 
     test "run/2 timeout" do
@@ -128,7 +119,7 @@ defmodule NetRunner.ShepherdHardeningTest do
                  kill_timeout: 300
                )
 
-      eventually(fn -> pgrep(marker) == [] end, 3_000)
+      eventually(fn -> pgrep_count(marker) == 0 end, 3_000)
     end
   end
 
@@ -141,7 +132,7 @@ defmodule NetRunner.ShepherdHardeningTest do
       # saw EOF; now the shepherd SIGKILLs the group when the leader exits.
       assert {"", 0} = NetRunner.run(["sh", "-c", "sleep #{marker} & exit 0"], timeout: 5_000)
 
-      eventually(fn -> pgrep(marker) == [] end)
+      eventually(fn -> pgrep_count(marker) == 0 end)
     end
   end
 
@@ -168,20 +159,22 @@ defmodule NetRunner.ShepherdHardeningTest do
   end
 
   describe "H4: termination signals to the shepherd run the teardown ladder" do
-    test "SIGTERM to the shepherd delivers the child's real exit status" do
-      {:ok, pid} = Proc.start("sleep", ["100"], kill_timeout: 1_000)
-      os_pid = Proc.os_pid(pid)
-      shepherd = parent_pid!(os_pid)
+    test "TERM, INT, HUP and QUIT to the shepherd deliver the child's real exit status" do
+      for signal <- ~w(TERM INT HUP QUIT) do
+        {:ok, pid} = Proc.start("sleep", ["100"], kill_timeout: 1_000)
+        os_pid = Proc.os_pid(pid)
+        shepherd = parent_pid!(os_pid)
 
-      System.cmd("kill", ["-TERM", to_string(shepherd)])
-      # Default-action death reported nothing and the BEAM synthesised 137
-      # (finish_orphaned); the ladder SIGTERMs sleep and reports 128 + 15, so
-      # the status alone proves the real exit frame arrived. (No capture_log
-      # assertion: it collects every process's logs, and concurrent tests kill
-      # shepherds on purpose.)
-      assert {:ok, 143} = Proc.await_exit(pid, 5_000)
-      eventually(fn -> not os_pid_alive?(os_pid) end)
-      Proc.stop(pid)
+        System.cmd("kill", ["-#{signal}", to_string(shepherd)])
+        # Default-action death reported nothing and the BEAM synthesised 137
+        # (finish_orphaned); the ladder SIGTERMs sleep and reports 128 + 15, so
+        # the status alone proves the real exit frame arrived. (No capture_log
+        # assertion: it collects every process's logs, and concurrent tests kill
+        # shepherds on purpose.)
+        assert {:ok, 143} = Proc.await_exit(pid, 5_000), "SIG#{signal} to the shepherd"
+        eventually(fn -> not os_pid_alive?(os_pid) end)
+        Proc.stop(pid)
+      end
     end
 
     @tag :linux_only
@@ -284,11 +277,14 @@ defmodule NetRunner.ShepherdHardeningTest do
       %{pidfd: pidfd} = :sys.get_state(pid)
 
       if match?({:unix, :linux}, :os.type()) do
-        assert %Pipe{resource: resource} = pidfd
-        {:ok, sigcont} = Signal.resolve(:sigcont)
-        assert :ok = Nif.nif_pidfd_send_signal(resource, sigcont)
+        assert_linux_pidfd(pidfd)
       else
         assert pidfd == nil
+      end
+
+      with %Pipe{resource: resource} <- pidfd do
+        {:ok, sigcont} = Signal.resolve(:sigcont)
+        assert :ok = Nif.nif_pidfd_send_signal(resource, sigcont)
       end
 
       assert :ok = Proc.kill(pid, :sigkill)
@@ -301,17 +297,22 @@ defmodule NetRunner.ShepherdHardeningTest do
     @tag :linux_only
     test "a pidfd for a reaped child reports :esrch instead of hitting a reused pid" do
       {:ok, pid} = Proc.start("sleep", ["30"])
-      %Pipe{resource: resource} = :sys.get_state(pid).pidfd
-      # Detach the pidfd from the server so finish_exit does not close it.
-      :sys.replace_state(pid, &%{&1 | pidfd: nil})
+      %{pidfd: pidfd} = :sys.get_state(pid)
+      assert_linux_pidfd(pidfd)
 
-      assert :ok = Proc.kill(pid, :sigkill)
-      assert {:ok, 137} = Proc.await_exit(pid)
+      with %Pipe{resource: resource} <- pidfd do
+        # Detach the pidfd from the server so finish_exit does not close it.
+        :sys.replace_state(pid, &%{&1 | pidfd: nil})
 
-      {:ok, sigcont} = Signal.resolve(:sigcont)
-      assert {:error, :esrch} = Nif.nif_pidfd_send_signal(resource, sigcont)
+        assert :ok = Proc.kill(pid, :sigkill)
+        assert {:ok, 137} = Proc.await_exit(pid)
 
-      Nif.nif_close(resource)
+        {:ok, sigcont} = Signal.resolve(:sigcont)
+        assert {:error, :esrch} = Nif.nif_pidfd_send_signal(resource, sigcont)
+
+        Nif.nif_close(resource)
+      end
+
       Proc.stop(pid)
     end
   end
@@ -328,11 +329,6 @@ defmodule NetRunner.ShepherdHardeningTest do
       # the VM itself runs under no_new_privs, e.g. systemd NoNewPrivileges=).
       {without, 0} = NetRunner.run(["cat", "/proc/self/status"])
       assert status_field(without, "NoNewPrivs") == beam
-    end
-
-    test "is accepted on every platform" do
-      assert {"hi\n", 0} = NetRunner.run(["echo", "hi"], no_new_privs: true)
-      assert {"hi\n", 0} = NetRunner.run(["echo", "hi"], no_new_privs: false)
     end
 
     test "rejects non-booleans at every entry point" do

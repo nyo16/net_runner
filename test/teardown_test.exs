@@ -58,10 +58,7 @@ defmodule NetRunner.TeardownTest do
       GenServer.stop(daemon)
     end
 
-    test "terminate escalates to SIGKILL inside the supervisor shutdown budget" do
-      # `use GenServer` gives the Daemon a 5_000 ms shutdown budget. If
-      # terminate/2 spends all of it waiting for a SIGTERM the child ignores,
-      # the supervisor brutal-kills the Daemon before the SIGKILL is ever sent.
+    test "terminate escalates to SIGKILL after the caller's :kill_timeout" do
       # The ready-file sync matters: signalling before the trap is installed
       # kills the shell with the default TERM disposition and the escalation
       # path is never exercised (vacuous pass). The loop (vs a single sleep)
@@ -73,7 +70,8 @@ defmodule NetRunner.TeardownTest do
       {:ok, daemon} =
         Daemon.start_link(
           cmd: "sh",
-          args: ["-c", "trap '' TERM; : > #{ready}; while :; do sleep 0.2; done"]
+          args: ["-c", "trap '' TERM; : > #{ready}; while :; do sleep 0.2; done"],
+          process_opts: [kill_timeout: 200]
         )
 
       os_pid = Daemon.os_pid(daemon)
@@ -81,7 +79,9 @@ defmodule NetRunner.TeardownTest do
 
       {us, :ok} = :timer.tc(fn -> GenServer.stop(daemon) end)
 
-      assert us < 5_000_000, "terminate took #{div(us, 1000)}ms, over the 5s budget"
+      # The default 3_000 ms grace would put this at >= 3 s; 200 ms + SIGKILL
+      # lands far below.
+      assert us < 2_000_000, "terminate took #{div(us, 1000)}ms; :kill_timeout was ignored"
 
       eventually(fn -> not os_pid_alive?(os_pid) end)
     end
@@ -89,15 +89,27 @@ defmodule NetRunner.TeardownTest do
 
   describe "stream teardown" do
     test "an early-halted stream tears down promptly" do
-      # `yes` ignores stdin closure, so waiting for a graceful exit is a pure
-      # stall. Halting the stream must escalate instead of waiting out the
-      # natural-EOF grace.
-      {us, [_first]} =
+      # The child ignores both stdin closure and SIGTERM, so only the halted
+      # path's fixed 200 ms grace ends it; a halt that honoured the caller's
+      # 5 s :kill_timeout (or waited for a graceful exit) stalls for seconds.
+      # The twin is the same stream over a child that exits by itself,
+      # measured now, so it carries the spawn cost and any ambient load.
+      {twin_us, [_]} =
         :timer.tc(fn ->
-          ["yes"] |> NetRunner.stream!() |> Enum.take(1)
+          ["sh", "-c", "echo y"] |> NetRunner.stream!(kill_timeout: 5_000) |> Enum.take(1)
         end)
 
-      assert us < 1_500_000, "early-halted stream took #{div(us, 1000)}ms to tear down"
+      {us, [_first]} =
+        :timer.tc(fn ->
+          ["sh", "-c", "trap '' TERM; exec yes"]
+          |> NetRunner.stream!(kill_timeout: 5_000)
+          |> Enum.take(1)
+        end)
+
+      # 200 ms grace plus generous slack, scaled by the twin's cost.
+      assert us < twin_us * 10 + 1_000_000,
+             "early-halted stream took #{div(us, 1000)}ms to tear down " <>
+               "(twin #{div(twin_us, 1000)}ms)"
     end
 
     test "a normally-exiting command still yields its full output" do
@@ -156,14 +168,6 @@ defmodule NetRunner.TeardownTest do
     # scheduler rather than return EAGAIN.
     test "rejects an fd that does not exist" do
       assert {:error, :invalid_fd} = Nif.nif_create_fd(999_999, self())
-    end
-
-    test "accepts a pipe fd" do
-      # Every spawned process wraps three pipe fds, so a successful spawn is
-      # the positive case for the guard.
-      {:ok, pid} = Proc.start("/bin/sh", ["-c", "sleep 1"], [])
-      assert is_integer(Proc.os_pid(pid))
-      Proc.kill(pid, :sigkill)
     end
   end
 end

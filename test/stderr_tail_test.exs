@@ -44,10 +44,9 @@ defmodule NetRunner.StderrTailTest do
       assert Proc.stats(pid).bytes_err == @total_bytes
     end
 
-    # The steady-state branch: the cap is larger than a single read, so once
-    # the tail is full every chunk must splice `cap - size` retained bytes onto
-    # the new chunk. This is the branch Phase 4 rewrote to build the result at
-    # exactly `cap` in one pass instead of concatenating then re-slicing.
+    # The cap is larger than a single read, so once the tail is full every
+    # chunk drops whole chunks (and at most one partial chunk) from the front
+    # of the retained queue.
     test "retains exactly the last cap bytes when the cap exceeds one read" do
       total = 500_000
       cap = 200_000
@@ -117,6 +116,28 @@ defmodule NetRunner.StderrTailTest do
       # The whole point: O(1) retention vs O(n) throughput.
       assert Proc.stats(pid).bytes_err == 200_000
       assert byte_size(Proc.stderr_tail(pid)) == 8_192
+    end
+
+    # Retention is bounded in MEMORY, not just in bytes returned: what the tail
+    # holds must not pin read buffers or grow one queue cell per tiny read.
+    test "the retained tail pins at most ~2x its cap, however stderr arrives" do
+      # One large read against a small cap: the kept slice must be a copy, not
+      # a sub-binary pinning the whole 64 KiB read buffer.
+      big = start_proc("sh", ["-c", "head -c 65536 /dev/zero 1>&2"], stderr_tail_bytes: 1_000)
+      assert {:ok, 0} = Proc.await_exit(big)
+      assert retained_bytes(big) <= 2 * 1_000
+
+      # Thousands of 1-byte writes: entries are coalesced, not one per read.
+      tiny =
+        start_proc("sh", [
+          "-c",
+          "i=0; while [ $i -lt 3000 ]; do printf x 1>&2; i=$((i+1)); done"
+        ])
+
+      assert {:ok, 0} = Proc.await_exit(tiny)
+      assert Proc.stderr_tail(tiny) == String.duplicate("x", 3_000)
+      {queue, 3_000} = :sys.get_state(tiny).stderr_tail
+      assert :queue.len(queue) <= 2
     end
 
     # Issue #22: the exit status arrives over the UDS independently of the
@@ -230,5 +251,12 @@ defmodule NetRunner.StderrTailTest do
         2_000 -> acc
       end
     end
+  end
+
+  # Bytes of binary data the retained tail keeps alive (parents of any
+  # sub-binaries included).
+  defp retained_bytes(pid) do
+    {queue, _size} = :sys.get_state(pid).stderr_tail
+    queue |> :queue.to_list() |> Enum.map(&:binary.referenced_byte_size/1) |> Enum.sum()
   end
 end

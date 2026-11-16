@@ -45,6 +45,13 @@ defmodule NetRunner.InputWriter do
   iodata writes of up to that many bytes, trading stdin latency for
   throughput. Eager lists always coalesce: they are fully realised, so the
   granularity is unobservable.
+
+  Call it in the process that should own the writer (it is a linked
+  `Task.async`) and as early as possible: the task's closure copies `input`
+  into the writer's heap. A binary or the coalesced batches of an eager
+  list cost almost nothing to copy; a lazy enumerable copies its whole
+  captured environment (the list behind a `Stream.map/2`, say), so it should
+  cross exactly one process boundary on its way here.
   """
   @spec start(pid(), binary() | Enumerable.t() | nil, non_neg_integer()) :: Task.t() | nil
   def start(pid, input, buffer \\ 0)
@@ -70,14 +77,14 @@ defmodule NetRunner.InputWriter do
     batches = list_batches(list, @list_coalesce_bytes)
 
     Task.async(fn ->
-      Enum.each(batches, &Proc.write(pid, &1))
+      write_all(batches, pid)
       Proc.close_stdin(pid)
     end)
   end
 
   def start(pid, enumerable, 0) do
     Task.async(fn ->
-      Enum.each(enumerable, &Proc.write(pid, &1))
+      write_all(enumerable, pid)
       Proc.close_stdin(pid)
     end)
   end
@@ -90,18 +97,31 @@ defmodule NetRunner.InputWriter do
   end
 
   @doc """
-  Pre-coalesces an eager list input into flat batch binaries; every other
-  input shape passes through untouched.
+  Coalesces an eager list `:input` into flat batch binaries (validating every
+  element as iodata); any other input passes through unchanged.
 
-  `run/2` calls this in the *caller's* process before spawning its I/O task:
-  every `Task.async` closure that captures a raw list copies the whole list
-  structure into the task heap, and the input crosses two task boundaries on
-  the run path. Already-coalesced input re-entering `start/3` is a cheap
-  no-op-shaped pass (one batch per oversized element).
+  Call it BEFORE spawning the process: a malformed list raises
+  `ArgumentError` here, with nothing running yet. Raised inside `start/3`
+  instead, after the spawn, it left the child and its server behind for a
+  caller that rescued it. `start/3` on already-prepared input is a no-op
+  pass (each batch is one element).
   """
   @spec prepare(term()) :: term()
   def prepare(list) when is_list(list), do: list_batches(list, @list_coalesce_bytes)
   def prepare(other), do: other
+
+  # Writes every chunk, stopping at the first error: a child that exits (or
+  # closes stdin) before consuming its input makes every later write fail,
+  # and a lazy or infinite enumerable would otherwise keep producing chunks
+  # until the reap grace killed the writer.
+  defp write_all(enumerable, pid) do
+    Enum.reduce_while(enumerable, :ok, fn chunk, :ok ->
+      case Proc.write(pid, chunk) do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
 
   @doc """
   Validates an `:input_buffer` option value, raising `ArgumentError` on a
@@ -141,7 +161,7 @@ defmodule NetRunner.InputWriter do
         {acc, _n} -> {:cont, Enum.reverse(acc), {[], 0}}
       end
     )
-    |> Enum.each(&Proc.write(pid, &1))
+    |> write_all(pid)
   end
 
   # Eager twin of write_coalesced/3 for lists: batches the elements into flat
@@ -169,15 +189,14 @@ defmodule NetRunner.InputWriter do
 
   # A single-element batch that is already a binary passes through untouched:
   # `:erlang.iolist_to_binary/1` fast-paths a bare binary but memcpy's a
-  # single-binary LIST, and this is what makes re-entering `list_batches/2`
-  # with already-prepared input (run/2 calls prepare/1, then start/3's list
-  # clause coalesces again) a true no-op instead of a full second copy.
+  # single-binary LIST, so a list of large binaries (each its own batch) is
+  # never copied.
   defp flush_batch([bin]) when is_binary(bin), do: bin
   defp flush_batch(batch), do: IO.iodata_to_binary(batch)
 
   @doc """
-  Reaps a writer started by `start/2`. Must run in the process that called
-  `start/2`.
+  Reaps a writer started by `start/3`. Must run in the process that called
+  `start/3`.
 
   `Task.async` links, so an *abnormal* writer exit has already torn the caller
   down before this runs — the reap exists to stop a *live* writer leaking,
@@ -187,15 +206,19 @@ defmodule NetRunner.InputWriter do
     * `:halted` — the reader stopped early and the child is being killed
       anyway. There is nothing left to write, so do not wait for it.
   """
-  @spec reap(Task.t() | nil, :done | :halted) :: :ok
-  def reap(nil, _mode), do: :ok
+  @spec reap(Task.t() | nil, :done | :halted, timeout()) :: :ok
+  def reap(writer, mode, grace_ms \\ @reap_grace_ms)
 
-  def reap(writer, :done) do
-    Task.yield(writer, @reap_grace_ms) || Task.shutdown(writer, :brutal_kill)
+  def reap(nil, _mode, _grace_ms), do: :ok
+
+  # `grace_ms` caps the join below the default (run/2 passes what is left of
+  # its :timeout).
+  def reap(writer, :done, grace_ms) do
+    Task.yield(writer, min(grace_ms, @reap_grace_ms)) || Task.shutdown(writer, :brutal_kill)
     :ok
   end
 
-  def reap(writer, :halted) do
+  def reap(writer, :halted, _grace_ms) do
     Task.shutdown(writer, :brutal_kill)
     :ok
   end

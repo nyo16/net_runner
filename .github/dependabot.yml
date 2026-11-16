@@ -1,10 +1,16 @@
 version: 2
+# A 7-day cooldown lets the ecosystem flag a compromised or broken release
+# before it reaches CI, where dev dependencies run alongside the publish job.
 updates:
   - package-ecosystem: mix
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
