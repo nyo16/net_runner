@@ -40,7 +40,10 @@ defmodule NetRunnerTest do
                  NetRunner.run(["yes"], max_output_size: max)
 
         assert byte_size(partial) == max
-        assert :binary.referenced_byte_size(partial) == max
+
+        # Only a refc binary (> 64 bytes) can pin a read buffer. OTP 27
+        # reports a heap binary's referenced size in bits (1 byte -> 8).
+        if max > 64, do: assert(:binary.referenced_byte_size(partial) == max)
       end
     end
   end
