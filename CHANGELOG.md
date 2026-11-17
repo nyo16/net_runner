@@ -92,6 +92,11 @@ misbehaving. See Changed (breaking).
   `cgroup.kill`s and removes it, so the path stays reusable (S-06).
 - **A nested `cgroup_path`** under another spawn's live leaf is refused
   instead of being killed by that spawn's recursive teardown (S-14).
+- **A Daemon no longer loses stderr written just before its child exits.**
+  It stopped as soon as stdout reached EOF and the exit status arrived,
+  stopping the Process before its stderr drain had read the rest. It now
+  waits for the stderr drain to finish, at most 1 s (an `:on_output` handler
+  stalled on stderr cannot keep a Daemon over a dead child from stopping).
 
 ### Security
 

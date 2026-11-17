@@ -50,6 +50,9 @@ defmodule NetRunner.Daemon do
   @sigterm_grace_ms 3_000
   @sigkill_grace_ms 1_000
   @shutdown_margin_ms 1_000
+  # How long a Daemon whose child exited waits for the stderr drain to reach
+  # EOF (and deliver the rest of stderr) before stopping anyway.
+  @stderr_eof_grace_ms 1_000
 
   @daemon_opts [:cmd, :args, :on_output, :process_opts]
 
@@ -202,6 +205,9 @@ defmodule NetRunner.Daemon do
            sigterm_grace: sigterm_grace(opts),
            drain_ref: drain_ref,
            stderr_drain_ref: stderr_drain_ref,
+           # Set when the child has exited; the stop waits for stderr EOF.
+           stop_reason: nil,
+           stderr_done?: false,
            forwarder: forwarder,
            forwarder_ref: forwarder_ref
          }}
@@ -229,7 +235,9 @@ defmodule NetRunner.Daemon do
   def handle_info({ref, result}, state) when ref == state.drain_ref do
     # Stdout drain finished: EOF was reached AND the exit status observed.
     # Stop so the supervisor's restart strategy engages — a crashed daemon
-    # must not linger as a healthy-looking GenServer over a dead child.
+    # must not linger as a healthy-looking GenServer over a dead child. But
+    # not before the stderr drain has delivered the rest of stderr:
+    # terminate/2 stops the Proc, and anything still unread would be lost.
     Process.demonitor(ref, [:flush])
 
     reason =
@@ -238,13 +246,27 @@ defmodule NetRunner.Daemon do
         _ -> {:shutdown, :process_exited}
       end
 
-    {:stop, reason, state}
+    if state.stderr_done? do
+      {:stop, reason, state}
+    else
+      # Bounded: an on_output handler stalled on a stderr chunk must not keep
+      # a Daemon over a dead child from stopping (and being restarted).
+      Process.send_after(self(), :stderr_eof_grace, @stderr_eof_grace_ms)
+      {:noreply, %{state | stop_reason: reason}}
+    end
   end
 
   def handle_info({ref, _result}, state) when ref == state.stderr_drain_ref do
-    # Stderr drain completed (stderr EOF) — stdout drain owns the stop.
+    # Stderr drain completed (stderr EOF). Stdout drain owns the stop reason.
     Process.demonitor(ref, [:flush])
-    {:noreply, state}
+
+    if state.stop_reason,
+      do: {:stop, state.stop_reason, state},
+      else: {:noreply, %{state | stderr_done?: true}}
+  end
+
+  def handle_info(:stderr_eof_grace, %{stop_reason: reason} = state) when reason != nil do
+    {:stop, reason, state}
   end
 
   # A drain task went :DOWN abnormally (normal completion matches the
