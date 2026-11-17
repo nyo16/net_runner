@@ -218,6 +218,53 @@ defmodule NetRunner.StderrTailTest do
 
       assert_receive {:EXIT, ^daemon, {:shutdown, {:exit_status, 0}}}, 5_000
     end
+
+    # The first chunk stalls the handler, so the stderr drain is still busy
+    # when the child writes "b" and exits. The stdout drain sees EOF and the
+    # exit status first; the Daemon must not stop (and stop the Proc) until
+    # the stderr drain has reached EOF.
+    test "stderr still unread when the child exits is delivered before the stop" do
+      Process.flag(:trap_exit, true)
+      test_pid = self()
+
+      handler = fn data ->
+        if data == "a\n", do: Process.sleep(300)
+        send(test_pid, {:out, data})
+      end
+
+      {:ok, daemon} =
+        Daemon.start_link(
+          cmd: "sh",
+          args: ["-c", "echo a 1>&2; sleep 0.1; echo b 1>&2"],
+          on_output: handler
+        )
+
+      assert collect_output("a\nb\n") == "a\nb\n"
+      assert_receive {:EXIT, ^daemon, {:shutdown, {:exit_status, 0}}}, 5_000
+    end
+
+    # A handler stalled on a stderr chunk keeps the stderr drain from ever
+    # finishing. The Daemon still stops, after the bounded grace, instead of
+    # lingering over a dead child that its supervisor would never restart.
+    test "a stalled on_output handler delays the stop by at most the grace" do
+      Process.flag(:trap_exit, true)
+
+      handler = fn
+        "stall\n" -> receive(do: (:never -> :ok), after: (5_000 -> :ok))
+        _ -> :ok
+      end
+
+      {us, :ok} =
+        :timer.tc(fn ->
+          {:ok, daemon} =
+            Daemon.start_link(cmd: "sh", args: ["-c", "echo stall 1>&2"], on_output: handler)
+
+          assert_receive {:EXIT, ^daemon, {:shutdown, {:exit_status, 0}}}, 5_000
+          :ok
+        end)
+
+      assert us in 900_000..3_000_000, "Daemon took #{div(us, 1000)} ms to stop"
+    end
   end
 
   # Starts a process and registers cleanup so the GenServer (and its NIF FDs)
