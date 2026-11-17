@@ -55,8 +55,6 @@ misbehaving. See Changed (breaking).
   exits early no longer keeps a lazy input running until a grace timeout;
   `run/2`'s join with the writer never runs past `:timeout`. A malformed list
   `:input` raises before anything is spawned.
-- The handshake gives each connection up to 2 s to present its token (a
-  silent impostor costs at most that, not the 10 s accept deadline).
 
 ### Added
 
@@ -72,16 +70,17 @@ misbehaving. See Changed (breaking).
   member lives) and, where one exists, the leader's pidfd; it can no longer
   fall back to a probe-then-kill on a recyclable pid (N-1).
 - **Teardown reaches a leader that left its process group.** The shepherd
-  SIGKILLs the group *and* the leader, and directly SIGKILLs a leader still
-  alive after the reap wait, instead of reporting 137 for a live process
-  (S-13).
+  signals the group and, whenever the leader is no longer in it, the leader
+  directly, so a leader that moved itself to another group no longer
+  survives teardown (S-13).
 - **An over-long or non-Latin-1 signal atom** returns
   `{:error, :unknown_signal}` instead of crashing the Process GenServer
   (and its child) (S-08).
 - **An unknown shepherd frame is sticky on the BEAM side too**: nothing after
   it is parsed (N-4).
-- **A silent same-uid connection** costs the real spawn at most 250 ms
-  instead of the whole 10 s accept deadline (S-07).
+- **A silent same-uid connection** costs the real spawn at most 2 s (the
+  per-connection token bound) instead of the whole 10 s accept deadline
+  (S-07).
 - **A split `MSG_CHILD_STARTED`** during the handshake is completed rather
   than misread (A-15).
 - **Closing the shepherd Port tears the child down**: the shepherd now watches
