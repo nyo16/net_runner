@@ -6,7 +6,7 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [1.7.0] - Unreleased
+## [1.7.0] - 2026-11-16
 
 Remediation of the 2026-11-15 project-health audit: kill-path and teardown
 fixes, shepherd protocol and handshake hardening, cgroup lifecycle, API
