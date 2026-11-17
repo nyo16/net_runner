@@ -10,7 +10,7 @@ defmodule NetRunner.Process.Exec do
   alias NetRunner.Process.{Cgroup, Pipe, Protocol, State}
 
   @accept_timeout 10_000
-  # Per-connection bound on the token read; see verify_token/3.
+  # Per-connection bound on the token read; see verify_token/4.
   @token_recv_timeout_ms 2_000
   @uds_base_dir_key {__MODULE__, :uds_base_dir}
 
@@ -65,11 +65,11 @@ defmodule NetRunner.Process.Exec do
   # Accepts connections until one authenticates or the deadline expires. The
   # listener stays open across failed attempts: a rogue same-uid connect must
   # cost only that connection, not the whole spawn — each connection gets at
-  # most @token_recv_timeout_ms to present the token (verify_token/3), and the
+  # most @token_recv_timeout_ms to present the token (verify_token/4), and the
   # real shepherd's queued connect is still served on the next accept. On
-  # final failure the
-  # shepherd port is closed (the listener is closed by spawn_process's error
-  # path via cleanup_listener never running — close it here too).
+  # final failure the shepherd port is closed (the listener is closed by
+  # spawn_process's error path via cleanup_listener never running — close it
+  # here too).
   defp accept_authenticated(listen_socket, shepherd_port, shepherd_monitor, token, deadline) do
     case accept_or_shepherd_exit(listen_socket, shepherd_port, shepherd_monitor, deadline) do
       {:ok, conn_socket} ->
